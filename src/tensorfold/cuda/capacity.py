@@ -230,8 +230,10 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
           geometry: Geometry | Callable, transform: Callable, *, rank: int = 0, world: int = 1,
           gather: Callable | None = None, draft_dir: Path | None = None,
           draft_geometry: Geometry | Callable | None = None, startup_copies: int = 0,
-          extra_files: tuple[Path, ...] = (), files: list[Path] | None = None) -> dict:
-    """Reach the same refusal or capacity before either rank allocates model tensors."""
+          extra_files: tuple[Path, ...] = (), files: list[Path] | None = None,
+          draft_weights: Callable[[Path], Weights] | None = None) -> dict:
+    """Reach the same refusal or capacity before either rank allocates model tensors. ``draft_weights``: what the
+    draft model holds, from its folder (default: its checkpoint at 4 bytes a value, or more)."""
 
     error = None
     plan = None
@@ -245,8 +247,8 @@ def admit(model_dir: str | Path, requested: int | None, explicit: bool | None, t
                               weights.mapped + more.mapped)
         weights = Weights(weights.resident, weights.staging + startup_copies * weights.resident, weights.mapped)
         if draft_dir is not None:
-            draft = estimate_weights(draft_dir, lambda name, info: (math.prod(info["shape"]) *
-                                      max(4, itemsize(info, name)), 0))
+            draft = draft_weights(draft_dir) if draft_weights is not None else estimate_weights(
+                draft_dir, lambda name, info: (math.prod(info["shape"]) * max(4, itemsize(info, name)), 0))
             weights = Weights(weights.resident + draft.resident, weights.staging + draft.staging, weights.mapped)
             if draft_geometry is not None:
                 draft_geometry = draft_geometry(config(draft_dir)) if callable(draft_geometry) else draft_geometry

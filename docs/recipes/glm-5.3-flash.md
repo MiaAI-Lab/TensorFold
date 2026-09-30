@@ -53,6 +53,13 @@ conversation takes the attention caches, a kept prompt's rows are saved. Kept st
 when it is less, and the memory estimate includes it. It serves one request at a time. Both ranks finish a started
 reply after a client disconnects.
 
+DFlash2 attends only its 2,048-row sliding window: a block pass reads only the window's tiles, and the drafter keeps
+its context in a ring of that window, its block and a tile (2,176 rows, 21 MiB a rank whatever the window, instead
+of 10 KiB a rank for every token of the window). A kept prompt DFlash2 can resume from holds a copy of the window
+(20 MiB a rank, within `TF_GLM_CACHE_GIB`). The drafts are the same bits. `TF_GLM_DRAFT_RING=0` keeps the
+whole-window buffer instead (give both ranks the same value). The memory estimate counts the draft model as it is
+held (4-bit copies and its selector's codebooks, 0.63 GiB a rank), not at 4 bytes a checkpoint value.
+
 ### Long contexts: the latent cache
 
 The DSA layers are NoPE MLA: head h's key is `Wk_h c` and its value `Wv_h c`, with `c` the token's 512-wide
