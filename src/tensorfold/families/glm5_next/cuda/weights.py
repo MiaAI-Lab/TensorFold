@@ -240,8 +240,9 @@ class Weights:
         return total
 
 
-def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
-    """Read one of two ranks from a full checkpoint or rank folder, including MTP and its half of the vocabulary head."""
+def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
+    """Read one of two ranks from a full checkpoint or rank folder, including MTP (unless ``mtp`` is False: TF_GLM_MTP
+    off, whose tensors are then never read) and its half of the vocabulary head."""
 
     from .split import RankReader
 
@@ -319,8 +320,8 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
     def expert_names(i: int) -> list[str]:
         """Layer ``i``'s expert tensors in the order ``moe`` reads them (none for a dense layer; ``cfg.layers``: MTP)."""
 
-        mtp = i == cfg.layers and cfg.mtp_layers
-        if not mtp and (i >= cfg.layers or cfg.mlp_kinds[i] != "moe"):
+        mtp_layer = i == cfg.layers and cfg.mtp_layers and mtp
+        if not mtp_layer and (i >= cfg.layers or cfg.mlp_kinds[i] != "moe"):
             return []
         p, parts = PREFIX + f"layers.{i}.mlp.", ("trellis", "suh", "svh") if exl3 else ("weight", "scales", "biases")
         names = []
@@ -420,7 +421,7 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda") -> Weights:
             head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
                            hb[rank * vl:(rank + 1) * vl].to(dev))
         mtpw = None
-        if cfg.mtp_layers:
+        if cfg.mtp_layers and mtp:
             i = cfg.layers
             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))

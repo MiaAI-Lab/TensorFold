@@ -21,12 +21,19 @@ when those terms fit the intended use. The CLI uses it automatically once it has
 Without it, the engine uses MTP drafts; `--drafter none` explicitly selects MTP-only drafting.
 Give both ranks the same drafter setting. `--no-drafts` disables all drafting for the serial reference.
 A checkpoint with neither an MTP head nor a supplied DFlash2 model is refused unless drafts are disabled.
+`TF_GLM_MTP` (`auto` by default) decides whether the CUDA engine loads the MTP head: `auto` leaves it out when
+DFlash2 is loaded or drafts are disabled, `1` keeps it beside DFlash2 (so MTP policies and `auto`'s per-round choice
+stay available), `0` leaves it out. Left out, it saves each rank the head's weights (about 2 GiB for this checkpoint),
+its cache rows and decode buffers, and prompts skip its absorb; MTP policies (and `--mtp-drafts N`) then draft with
+DFlash2. Replies are the same either way. Give both ranks the same setting.
 
 ### Draft policies
 
-For the affine checkpoint, the default `auto` policy uses MTP for sampled requests. For greedy requests with DFlash2 available,
+For the affine checkpoint with its MTP head loaded, the default `auto` policy uses MTP for sampled requests.
+For greedy requests with DFlash2 loaded beside the head (`TF_GLM_MTP=1`),
 it compares committed tokens per estimated round time and chooses a drafter. It periodically probes
 the other drafter and discards its old rate after switching away, so later probes can change the choice.
+Without the head (`TF_GLM_MTP=auto` beside DFlash2, or `0`), `auto` drafts with DFlash2.
 Every policy verifies against the same target, and `"draft": false` selects the serial reference.
 A request can select a policy after `@` in its model ID, such as `bench@c3:0.35`, or with `tf_policy`.
 `--mtp-drafts N` selects a fixed depth at startup. With DFlash2 available, `--mtp-drafts 0` selects
