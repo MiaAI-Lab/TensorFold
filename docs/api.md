@@ -173,7 +173,10 @@ On a unified-memory GPU (the DGX Spark's GB10), the CUDA server's allocations co
 charged to a container's memory limit (`docker run --memory`, cgroup `memory.max`): the limit neither caps the
 model's weights and cache nor keeps them from crowding other work on the machine. The server sizes its window from the
 host's `MemAvailable` less a reserve (a tenth of RAM, at least 4 GiB); to leave room for other containers, start it
-with a smaller `--context` or `--parallel`.
+with a smaller `--context` or `--parallel`. `TENSORFOLD_MEMORY_RESERVE_GIB` replaces that reserve (at least 2 GiB)
+when you know the machine's headroom: a larger one leaves more for other work, a smaller one more for KV caches. The
+reserve also carries CUDA context, NCCL and workspace memory the estimate does not count, and exhausting a unified
+GPU's memory can freeze the host, so lower it only with room to spare.
 
 ## Responses
 
