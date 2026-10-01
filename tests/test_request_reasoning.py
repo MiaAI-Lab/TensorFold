@@ -25,6 +25,7 @@ class SamplingApp(FakeApp):
         ("medium", True, "medium"),
         ("high", True, "xhigh"),
         ("xhigh", True, "xhigh"),
+        ("max", True, "xhigh"),
     ],
 )
 def test_http_reasoning_controls(effort, thinking, normalized):
@@ -138,13 +139,17 @@ def test_explicit_thinking_overrides_none_and_preserves_default(default_effort, 
     ("{# 'xhigh' 'medium' 'low' #}", "low", "low"),
     ("{# 'xhigh' 'medium' 'low' #}", "medium", "medium"),
     ("{# 'xhigh' 'medium' 'low' #}", "xhigh", "xhigh"),
+    ("{# 'xhigh' 'medium' 'low' #}", "max", "xhigh"),        # no max either: its top level
     ("{# 'low' 'high' #}", "high", "high"),                  # GLM-5.3 names high: it renders High, not Max
     ("{# 'low' 'high' #}", "minimal", "low"),
     ("{# 'low' 'high' #}", "low", "low"),
     ("{# 'low' 'high' #}", "medium", "high"),                # medium is not a GLM name; Max was the silent result
     ("{# 'low' 'high' #}", "xhigh", "xhigh"),               # GLM renders xhigh as its own Max; leave the name
     ("{# 'low' 'high' #}", "none", "none"),
+    ("{# 'low' 'high' 'max' #}", "max", "max"),              # GLM-5.3's template names max, its default
+    ("{# 'low' 'high' 'max' #}", "medium", "high"),
     ("", "high", "xhigh"),
+    ("", "max", "xhigh"),
 ])
 def test_a_template_that_names_an_effort_is_given_that_effort(names, effort, want):
     app = make_app(enable_thinking=True)
@@ -169,14 +174,14 @@ def test_glm_omitted_effort_stays_the_template_default_and_a_medium_default_is_h
     source = ("{%- set effective_reasoning_effort = reasoning_effort if reasoning_effort is defined "
               "and reasoning_effort in ['low', 'high'] else 'max' -%}{{ effective_reasoning_effort }}")
     levels = effort_levels(source)
-    assert levels == frozenset({"low", "high"})
+    assert levels == frozenset({"low", "high", "max"})
     template = jinja2.Environment().from_string(source)
     assert template.render() == "max"
     assert template.render(reasoning_effort="medium") == "max"
-    for effort in ("minimal", "low", "medium", "high", "xhigh"):
+    for effort in ("minimal", "low", "medium", "high", "xhigh", "max"):
         heard = coerce_effort(effort, levels)
         assert template.render(reasoning_effort=heard) == {"minimal": "low", "low": "low", "medium": "high",
-                                                           "high": "high", "xhigh": "max"}[effort]
+                                                           "high": "high", "xhigh": "max", "max": "max"}[effort]
 
     app = make_app(enable_thinking=True, reasoning_effort="medium")
     app.tokenizer.chat_template = "{# 'low' 'high' #}"

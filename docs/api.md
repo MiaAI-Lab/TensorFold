@@ -34,7 +34,7 @@ Unsupported image input, audio, video and non-text output requests receive HTTP 
 | `response_format`, `guided_json`, `guided_regex`, `guided_choice`, `guided_grammar`, `structured_outputs` | A JSON schema, any JSON object, a regex, a choice or an EBNF grammar the reply must match | Both |
 | `ignore_eos` | Disable model end-of-sequence stopping; the reply limit still applies | Both |
 | `stop` | Stop at a string or any string in a list; omit the matched text from the response | Both |
-| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high` or `xhigh` | Both |
+| `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | Both |
 | `thinking_budget` | Token-count limit inside reasoning | Both |
 | `priority` | `background` yields to foreground requests | Both |
 
@@ -146,8 +146,8 @@ requests go on.
 
 On both backends, `reasoning_effort: none` disables thinking; other effort values enable it and reach the chat
 template. The server also reads it from `chat_template_kwargs.reasoning_effort`, where vLLM's clients send it; the
-top-level field wins. `high` maps to `xhigh`, and `minimal` maps to `low`, unless the template names them.
-GLM-5.3 lists `low` and `high`, so `medium` is heard as `high`. `xhigh` stays `xhigh`, and that template renders
+top-level field wins. `high` and `max` map to `xhigh`, and `minimal` maps to `low`, unless the template names them.
+GLM-5.3 lists `low`, `high` and `max`: `medium` is heard as `high`, and `xhigh` stays `xhigh`; that template renders
 it as Max. An omitted effort stays the template's own Max. An explicit `chat_template_kwargs.enable_thinking` takes
 precedence. A request without an effort gets `--reasoning-effort` when the server was started with one; otherwise
 the template renders its own default, as vLLM and mlx-lm render it (Qwen3.8's is `xhigh`, which adds an instruction
