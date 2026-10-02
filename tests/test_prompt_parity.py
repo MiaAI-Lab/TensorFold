@@ -42,7 +42,8 @@ CONVERSATIONS = {
 REQUESTS = [{}, {"reasoning_effort": "none"}, {"reasoning_effort": "minimal"}, {"reasoning_effort": "low"},
             {"reasoning_effort": "medium"}, {"reasoning_effort": "high"}, {"reasoning_effort": "xhigh"},
             {"chat_template_kwargs": {"enable_thinking": False}},
-            {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}}]
+            {"chat_template_kwargs": {"enable_thinking": True, "reasoning_effort": "high"}},
+            {"chat_template_kwargs": {"thinking": False}}, {"chat_template_kwargs": {"thinking": {"type": "enabled"}}}]
 
 
 def _folder(name):
