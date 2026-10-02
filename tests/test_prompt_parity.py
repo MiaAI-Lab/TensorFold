@@ -38,6 +38,13 @@ CONVERSATIONS = {
                {"role": "user", "content": "And Bergen?"}], WEATHER),
     "late system": ([{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"},
                      {"role": "system", "content": "Be brief."}, {"role": "user", "content": "Bye"}], None),
+    "earlier reasoning": ([{"role": "user", "content": "Weather in Oslo?"},
+                           {"role": "assistant", "content": "", "reasoning_content": "Ask the tool.", "tool_calls": [
+                               {"id": "call_1", "type": "function",
+                                "function": {"name": "get_weather", "arguments": json.dumps({"city": "Oslo"})}}]},
+                           {"role": "tool", "tool_call_id": "call_1", "content": "{\"celsius\": 12}"},
+                           {"role": "assistant", "content": "12 C.", "reasoning_content": "It is 12."},
+                           {"role": "user", "content": "And Bergen?"}], WEATHER),
 }
 REQUESTS = [{}, {"reasoning_effort": "none"}, {"reasoning_effort": "minimal"}, {"reasoning_effort": "low"},
             {"reasoning_effort": "medium"}, {"reasoning_effort": "high"}, {"reasoning_effort": "xhigh"},

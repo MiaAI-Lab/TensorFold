@@ -173,7 +173,11 @@ the template renders its own default, as vLLM and mlx-lm render it (Qwen3.8's is
 to the system prompt; `medium` adds none). The template hears an effort only while thinking, and both backends render
 the same prompt for the same request. Effort support depends on the checkpoint's template, and effort does not set a
 token budget. With thinking off, GLM-5.3's prompt is its thinking-off template's: no reasoning-effort line and an
-empty think block.
+empty think block. GLM-5.3 keeps every earlier assistant turn's reasoning in the prompt, as zai-org's template does by
+default (`clear_thinking` false), also on checkpoints whose template still clears it before the last user message, so
+a new user message leaves the earlier turns' tokens, and their kept prompt states, as they were. A request's
+`chat_template_kwargs.clear_thinking: true` drops it, as the model card advises for plain chat (on CUDA; on a Mac,
+`TF_GLM_CLEAR_THINKING=1` sets it for the server).
 
 A tool call written before the think block closes is the reply's tool call when the reply ends inside the block,
 on both backends; the reasoning stops where the call starts, and streamed reasoning never carries the call's markup.
