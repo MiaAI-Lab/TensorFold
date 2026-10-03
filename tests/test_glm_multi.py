@@ -512,6 +512,13 @@ def _sampling(kind: str, seed: int):
             "minp": Sampling(seed, 0.8, 12, 1.0, 0.05)}[kind]
 
 
+def _ops(msg: list[int]) -> list[tuple[int, list[int]]]:
+    """The ops of a message rank 0 sent, its sequence number and checksum (``multi.seal``) left off."""
+    from tensorfold.families.glm5_next.cuda.multi import MultiDecoder
+
+    return MultiDecoder.parse(msg[:-2])
+
+
 # -- settings ---------------------------------------------------------------------------------------------------------
 def test_the_settings(allocations, monkeypatch):  # noqa: F811
     from tensorfold.families.glm5_next.cuda.multi import (MTP_GREEDY, MTP_SAMPLED, fill_rows, fill_share, keep_point,
@@ -600,19 +607,19 @@ def test_one_message_an_iteration(fake):
     p = Pair(torch, streams=2)
     p.submit(_prompt(80, 7), 30, None)
     p.submit(_prompt(20, 8), 25, _sampling("topk", 3))
-    from tensorfold.families.glm5_next.cuda.multi import FILL, IDLE, MultiDecoder, ROUND
+    from tensorfold.families.glm5_next.cuda.multi import FILL, IDLE, ROUND
 
     kinds = []
     while p.d[0].lanes:
         before = len(p.sent)
         done = p.d[0].round()
         assert len(p.sent) - before == 1                     # the round's own message
-        ops = [op for op, _ in MultiDecoder.parse(p.sent[-1])]
+        ops = [op for op, _ in _ops(p.sent[-1])]
         assert ops[-1] in (FILL, ROUND)
         kinds.append(ops[-1])
         p.d[0].finish(done)
         extra = p.sent[before + 1:]
-        assert all([op for op, _ in MultiDecoder.parse(m)][-1] == IDLE for m in extra)
+        assert all([op for op, _ in _ops(m)][-1] == IDLE for m in extra)
         p.follow()
         if not p.d[0].outbox:
             p.check()
@@ -625,7 +632,7 @@ def test_cancelled_streams_end_at_the_next_round_on_both_ranks(fake):
     rank 1 in the next message, both ranks free its slot and extent (its prompt stays kept), and the other streams'
     replies are unchanged."""
 
-    from tensorfold.families.glm5_next.cuda.multi import CANCELLED, FINISH, MultiDecoder
+    from tensorfold.families.glm5_next.cuda.multi import CANCELLED, FINISH
 
     torch = fake
     p = Pair(torch, streams=3)
@@ -642,7 +649,7 @@ def test_cancelled_streams_end_at_the_next_round_on_both_ranks(fake):
             rounds_after, seen = a.rounds, len(log)
             assert a.sid not in p.d[0].lanes and a.sid in p.d[1].lanes      # rank 1 hears with the next message
         elif seen is not None and len(log) > seen:
-            first = MultiDecoder.parse(log[seen])[0]
+            first = _ops(log[seen])[0]
             assert first == (FINISH, [a.sid, CANCELLED])       # before anything else of that iteration
             assert a.sid not in p.d[1].lanes
         if rounds_after is not None:
@@ -656,7 +663,7 @@ def test_cancelled_streams_end_at_the_next_round_on_both_ranks(fake):
 
 
 def test_a_cancel_message_names_the_stream(fake):
-    from tensorfold.families.glm5_next.cuda.multi import CANCELLED, DONE, FINISH, MultiDecoder
+    from tensorfold.families.glm5_next.cuda.multi import CANCELLED, DONE, FINISH
 
     torch = fake
     p = Pair(torch, streams=2)
@@ -666,7 +673,7 @@ def test_a_cancel_message_names_the_stream(fake):
     real = p.g[0]._share
     p.g[0]._share = lambda values: (log.append(list(values)), real(values))[1]
     p.run()
-    finishes = [pl for m in log for op, pl in MultiDecoder.parse(m) if op == FINISH]
+    finishes = [pl for m in log for op, pl in _ops(m) if op == FINISH]
     assert [a.sid, CANCELLED] in finishes and [b.sid, DONE] in finishes
 
 
@@ -705,7 +712,7 @@ def test_growth_moves_extents_and_keeps_every_row(fake):
     """A pool fragmented by kept prompts: growing streams move (and the pool compacts), evicting kept prompts least
     recently used first; every reply is its solo one, and the moves copied the right rows (the fake reads them)."""
 
-    from tensorfold.families.glm5_next.cuda.multi import EVICT, MOVE, MultiDecoder
+    from tensorfold.families.glm5_next.cuda.multi import EVICT, MOVE
 
     torch = fake
     p = Pair(torch, streams=3, blocks=6, entries=8)
@@ -723,7 +730,7 @@ def test_growth_moves_extents_and_keeps_every_row(fake):
             (_prompt(1000, 32), 1200, _sampling("minp", 6))]
     streams = [p.submit(pr, n, sp, stop_eos=False) for pr, n, sp in reqs]
     p.run()
-    ops = [op for m in log for op, _ in MultiDecoder.parse(m)]
+    ops = [op for m in log for op, _ in _ops(m)]
     assert EVICT in ops and MOVE in ops
     for s, (pr, n, sp) in zip(streams, reqs):
         assert s.got == solo(torch, pr, n, sp, stop_eos=False)
@@ -914,7 +921,7 @@ def test_a_lone_stream_moves_home_and_a_second_one_joins(fake):
     alone: it moves into the one-stream graphs' home (SLOT, MOVE) and its rounds say so (ROUND's lone flag); a third
     stream joins it on the batched path. Every reply is its solo one and both ranks agree after every message."""
 
-    from tensorfold.families.glm5_next.cuda.multi import MOVE, ROUND, SLOT, MultiDecoder
+    from tensorfold.families.glm5_next.cuda.multi import MOVE, ROUND, SLOT
 
     from tensorfold.families.glm5_next.cuda.multi_tune import MultiSettings
 
@@ -931,7 +938,7 @@ def test_a_lone_stream_moves_home_and_a_second_one_joins(fake):
         p.step()
         if b.sid in p.d[0].lanes and a.done and c is None and len(b.out) > 60:
             c = p.submit(_prompt(150, 102), 40, None, stop_eos=False)
-    ops = [(op, pl) for m in log for op, pl in MultiDecoder.parse(m)]
+    ops = [(op, pl) for m in log for op, pl in _ops(m)]
     assert (SLOT, [b.sid, 0]) in ops and any(op == MOVE and pl[1] == 0 for op, pl in ops)
     flags = [pl[-1] for op, pl in ops if op == ROUND]
     assert 1 in flags                                                    # b's rounds alone, at home
