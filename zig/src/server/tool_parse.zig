@@ -1,11 +1,12 @@
 //! Tool calls in a finished reply, every family's markup, as OpenAI tool_calls (``tools.parse_tool_calls_from_content``).
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const ids = @import("ids.zig");
 const reply_text = @import("reply_text.zig");
 const tool_params = @import("tool_params.zig");
 const tool_specs = @import("tool_specs.zig");
 const tool_streaming = @import("tool_streaming.zig");
+const glm_keys = @import("glm_keys.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 const strip = reply_text.pyStrip;
@@ -278,7 +279,7 @@ fn payload(a: Allocator, block: []const u8, schemas: ?*const tool_params.Schemas
     if (try functionBlock(a, block, schemas, complete)) |c| return c;
     if (decoded == null) {
         const lead = std.mem.trimStart(u8, block, " \t\r\n\x0b\x0c");
-        if (lead.len == 0 or (lead[0] != '{' and lead[0] != '[' and lead[0] != '<')) return glmCall(a, block, schemas, complete);
+        if (lead.len == 0 or (lead[0] != '{' and lead[0] != '[' and lead[0] != '<')) return glmCall(a, if (glm_keys.enabled) try glm_keys.repair(a, block) else block, schemas, complete);
     }
     return null;
 }

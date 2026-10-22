@@ -31,6 +31,8 @@ pub const Engine = engine.Engine;
 pub const Config = config.Config;
 pub const Model = config.Model;
 pub const Stream = stream.Stream;
+pub const Media = stream.Media;
+pub const MediaItem = stream.MediaItem;
 pub const Sampling = sampling.Sampling;
 pub const SuffixLookup = proposer.SuffixLookup;
 pub const LogprobRow = logprob.Row;
@@ -40,6 +42,7 @@ test {
     _ = @import("engine_test.zig");
     _ = @import("gpu_full_test.zig");
     _ = @import("drafted_test.zig");
+    _ = @import("loop_recipe.zig");
 }
 
 pub const learned_disk = @import("learned_disk.zig");

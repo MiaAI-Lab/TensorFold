@@ -1,6 +1,6 @@
 //! Anthropic's Messages routes over the chat handler: typed SSE events, tool_use blocks, count_tokens.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const http_body = @import("http_body.zig");
 const fields = @import("fields.zig");
@@ -30,7 +30,7 @@ fn errorValue(a: Allocator, message: []const u8, status: u16) Allocator.Error!Va
     const kind = switch (status) {
         400 => "invalid_request_error",
         404 => "not_found_error",
-        503 => "overloaded_error",
+        429, 503 => "overloaded_error",
         else => "api_error",
     };
     const inner = try json.newObject(a);
@@ -73,7 +73,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator) void {
         };
         const chat = translate(&cx, body, count) catch return sendError(conn, a, cx.message, cx.status());
         if (count) {
-            const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) 503 else 400);
+            const n = countTokens(srv, &cx, chat) catch return sendError(conn, a, cx.message, if (cx.kind == .capacity) errors.capacity_status else 400);
             const o = json.newObject(a) catch return;
             o.put(a, "input_tokens", json.intValue(a, n) catch return) catch return;
             return routes.sendValue(conn, a, 200, .{ .object = o });

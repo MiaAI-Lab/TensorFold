@@ -153,6 +153,8 @@ pub const Api = struct {
     cuCtxSetCurrent: *const fn (Context) callconv(.c) R,
     cuCtxGetCurrent: *const fn (*Context) callconv(.c) R,
     cuCtxSynchronize: *const fn () callconv(.c) R,
+    cuProfilerStart: *const fn () callconv(.c) R,
+    cuProfilerStop: *const fn () callconv(.c) R,
     cuMemGetInfo_v2: *const fn (*usize, *usize) callconv(.c) R,
     cuMemAlloc_v2: *const fn (*DevicePtr, usize) callconv(.c) R,
     cuMemFree_v2: *const fn (DevicePtr) callconv(.c) R,
@@ -167,6 +169,7 @@ pub const Api = struct {
     cuMemcpyHtoDAsync_v2: *const fn (DevicePtr, CPtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoHAsync_v2: *const fn (Ptr, DevicePtr, usize, Stream) callconv(.c) R,
     cuMemcpyDtoDAsync_v2: *const fn (DevicePtr, DevicePtr, usize, Stream) callconv(.c) R,
+    cuMemcpy2DAsync_v2: *const fn (*const Memcpy2D, Stream) callconv(.c) R,
     cuMemsetD8_v2: *const fn (DevicePtr, u8, usize) callconv(.c) R,
     cuMemsetD32_v2: *const fn (DevicePtr, c_uint, usize) callconv(.c) R,
     cuMemsetD8Async: *const fn (DevicePtr, u8, usize, Stream) callconv(.c) R,
@@ -220,3 +223,23 @@ comptime {
     std.debug.assert(@sizeOf(KernelNodeParams) == 72 and @offsetOf(KernelNodeParams, "params") == 40);
     std.debug.assert(@sizeOf(ExecUpdateResultInfo) == 24);
 }
+
+/// CUDA_MEMCPY2D (cuda.h): a pitched copy; both sides device memory here (memory type 2).
+pub const Memcpy2D = extern struct {
+    src_x_bytes: usize = 0,
+    src_y: usize = 0,
+    src_type: c_uint = 2,
+    src_host: ?*const anyopaque = null,
+    src_device: DevicePtr = 0,
+    src_array: ?*anyopaque = null,
+    src_pitch: usize,
+    dst_x_bytes: usize = 0,
+    dst_y: usize = 0,
+    dst_type: c_uint = 2,
+    dst_host: ?*anyopaque = null,
+    dst_device: DevicePtr = 0,
+    dst_array: ?*anyopaque = null,
+    dst_pitch: usize,
+    width_bytes: usize,
+    height: usize,
+};

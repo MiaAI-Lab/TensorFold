@@ -1,7 +1,7 @@
 //! tool_choice "required" or a named function as a grammar: calls in the template's markup, arguments in their schema.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const prompt = @import("prompt.zig");
 const tool_specs = @import("tool_specs.zig");
@@ -36,7 +36,10 @@ pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, th
     const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
     var scratch: Cx = .{ .a = cx.a };
     const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
-    const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object), and this one does not: send \"auto\"");
+    const s = style(rendered) orelse return cx.refuse(if (srv.config.recipe.glm)
+        "tool_choice \"required\" or a named function is not served for GLM-5.3 on the Zig engine yet (the recipe gates the call's first token, which this engine has no gate for): send \"auto\""
+    else
+        "tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object), and this one does not: send \"auto\"");
     const text = try build(cx.a, s, tools, parallel);
     return srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
 }

@@ -1,6 +1,6 @@
 //! POST /v1/chat/completions and /v1/completions, JSON or SSE, as ``server.http`` answers them.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const chat = @import("chat.zig");
@@ -17,6 +17,9 @@ const sse = @import("sse.zig");
 const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
 const warm = @import("warm.zig");
+const admission = @import("admission.zig");
+const glm_reply = @import("glm_reply.zig");
+const glm_history = @import("glm_history.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
@@ -41,7 +44,7 @@ pub const Out = struct {
 /// POST /v1/chat/completions or /v1/completions, read from the client and answered to it.
 pub fn post(srv: *Server, conn: *Conn, a: Allocator, is_chat: bool) void {
     var cx: Cx = .{ .a = a };
-    const body = http_body.readJson(conn, &cx) catch {
+    const body = http_body.readJsonUpTo(conn, &cx, http_body.chatLimit(srv.config.recipe.glm)) catch {
         const err = errorBody(a, &cx, if (is_chat) "messages" else "prompt") catch return;
         return routes.sendValue(conn, a, cx.status(), wrapError(a, err) catch return);
     };
@@ -124,8 +127,14 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const logprobs = try fields.probabilityOptions(cx, body, exact_bytes);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
-    if (is_chat) {
-        input.messages = try messages.normalize(cx, body.get("messages"), "system", srv.needs_user_after_tool);
+    if (is_chat and srv.vision != null and messages.hasVisual(body.get("messages"))) {
+        // picture and clip parts: split, rendered and prepared by the vision backend (prompt.prepareMedia)
+        input.media = body.get("messages");
+        input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
+    } else if (is_chat) {
+        // the recipe: a tool result's pictures render as the template's reminder (0056); a user's are refused below
+        const sent: ?Value = if (srv.config.recipe.glm and body.get("messages") != null) try glm_history.toolMedia(cx.a, body.get("messages").?) else body.get("messages");
+        input.messages = try messages.normalize(cx, sent, "system", srv.needs_user_after_tool);
         input.tools = try tool_specs.active(cx, body.get("tools"), body.get("tool_choice"));
     } else if (body.get("messages")) |m| if (m == .array and m.array.len > 0) {
         input.messages = try messages.normalize(cx, m, "system", srv.needs_user_after_tool);
@@ -143,13 +152,14 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
         input.temperature = if (t == .float) t.float else std.fmt.parseFloat(f64, t.int) catch 0;
     };
     const sampling = try json.newObject(cx.a);
-    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
+    for ([_][]const u8{ "temperature", "top_p", "top_k", "min_p", "seed", "priority", "draft", "thinking_budget", "ignore_eos", "stop", "return_token_ids" } ++ grammar.fields) |k| if (body.get(k)) |v| try sampling.put(cx.a, k, v);
     try grammar.refusal(cx, body);
     if (input.tools.len > 0 and try tool_specs.choiceRequiresCall(cx.a, body.get("tool_choice"))) try sampling.put(cx.a, "tool_call_required", .{ .bool = true });
     if (body.field("parallel_tool_calls")) |p| if (p == .bool and !p.bool) try sampling.put(cx.a, "tool_call_single", .{ .bool = true });
     const thinking = try fields.thinkingFields(cx, body, srv.effort_levels);
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
+    if (body.field("chat_template_kwargs")) |kw| if (kw == .object) if (kw.get("clear_thinking")) |c| try sampling.put(cx.a, "clear_thinking", c);
     input.fields = .{ .object = sampling };
     const streamed = if (body.get("stream")) |s| s.truthy() else false;
     if (logprobs != null) {
@@ -314,6 +324,13 @@ const Run = struct {
     fn attachCalls(r: *Run, reply: *chat.Reply) Allocator.Error!?[]Value {
         const tools = r.plan.input.tools;
         if (tools.len == 0) return null;
+        if (reply.glm_done) { // settled with the streamer's calls (chat.finish): nothing to parse again
+            reply.content = try r.plan.policy.content(r.a, reply.content);
+            // the calls' reasoning, for a client that will not send it back (TF_GLM_KEEP_REASONING)
+            if (reply.calls != null and std.mem.eql(u8, reply.finish_reason, "tool_calls")) if (r.srv.kept_reasoning) |k|
+                try k.remember(r.a, r.plan.input.messages, reply.calls.?, reply.reasoning);
+            return reply.calls;
+        }
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());
         const calls = parsed.calls orelse {
             if (r.plan.policy.single) reply.content = try r.plan.policy.parsedContent(r.a, parsed.content);
@@ -329,7 +346,7 @@ const Run = struct {
         const a = r.a;
         const kind_ok = cx.kind != .other and cx.kind != .server;
         const body = (if (kind_ok) errorBody(a, cx, field) else errorOther(a, cx.message)) catch return;
-        r.out.vt.reply(r.out.ctx, if (kind_ok) 400 else 500, wrapError(a, body) catch return);
+        r.out.vt.reply(r.out.ctx, if (cx.kind == .capacity) errors.capacity_status else if (kind_ok) 400 else 500, wrapError(a, body) catch return);
     }
 
     /// A reply that ended before anything was sent: a refusal's 400, a failure's 500, nothing when the client left.
@@ -389,7 +406,9 @@ const Run = struct {
         if (r.is_chat) {
             const message = try json.newObject(a);
             try message.put(a, "role", .{ .string = "assistant" });
-            try message.put(a, "content", if (calls != null) .null else .{ .string = reply.content });
+            // the recipe keeps the text before a call, and answers null for none (`result["content"] or None`)
+            const keep = if (reply.glm) reply.content.len > 0 else calls == null;
+            try message.put(a, "content", if (keep) .{ .string = reply.content } else .null);
             if (reply.reasoning) |t| if (t.len > 0) try message.put(a, "reasoning_content", .{ .string = t });
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
@@ -416,6 +435,10 @@ const Run = struct {
             const r = s.run;
             if (!s.tools) {
                 if (!r.is_chat and delta != .string) return; // completions stream text only
+                return r.emit(r.chunk(delta, null) catch return error.Closed);
+            }
+            if (r.srv.glm_calls and delta == .object and delta.object.count() == 0) { // the recipe's keepalive while a call is held
+                try r.prose();
                 return r.emit(r.chunk(delta, null) catch return error.Closed);
             }
             const filtered = r.policyDelta(delta) catch return error.Closed;
@@ -465,11 +488,11 @@ const Run = struct {
         // a context-window refusal is reported inside the stream; every other refusal is still a 400 before it opens
         var compaction: ?compact.Stamp = null;
         const prepared = if (r.srv.config.compact_at == null) chat.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-            if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+            if (e == error.Refused and cx.kind == .context_length and !r.srv.config.recipe.glm) return r.streamedContext(&cx, tools, field); // the recipe answers 400 before a stream opens
             return r.unsent(&cx, e, field);
         } else blk: {
             const ready = compact.prepare(r.srv, &cx, r.plan.input, gone) catch |e| {
-                if (e == error.Refused and cx.kind == .context_length) return r.streamedContext(&cx, tools, field);
+                if (e == error.Refused and cx.kind == .context_length and !r.srv.config.recipe.glm) return r.streamedContext(&cx, tools, field); // the recipe answers 400 before a stream opens
                 return r.unsent(&cx, e, field);
             };
             compaction = ready.stamp;
@@ -477,6 +500,8 @@ const Run = struct {
         };
         var handed = false; // generate gives the preparing count back from here on
         defer if (!handed) chat.release(r.srv, prepared.preparing);
+        // a full server answers 429 here, before the stream's 200 (patch 0095), not a 200 and an error event
+        admission.check(r.srv, &cx, prepared.request.background) catch |e| return r.unsent(&cx, e, field);
         r.out.vt.open(r.out.ctx) catch return;
         if (!tools and r.is_chat) r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
         var sink_state: StreamSink = .{ .run = r, .tools = tools };
@@ -513,8 +538,12 @@ const Run = struct {
             }
             if (calls != null and !reply.tool_calls_streamed) {
                 r.emit(r.chunk(roleDelta(a) catch return, null) catch return) catch return;
-                const deltas = tool_parse.deltas(a, calls.?) catch return;
-                for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
+                if (reply.glm) { // the recipe sends a call whole: header and arguments in one delta
+                    for (calls.?, 0..) |call, i| r.emit(r.chunk(glm_reply.wholeDelta(a, i, call) catch return, null) catch return) catch return;
+                } else {
+                    const deltas = tool_parse.deltas(a, calls.?) catch return;
+                    for (deltas) |d| r.emit(r.chunk(d, null) catch return) catch return;
+                }
             } else if (reply.content.len > 0 and !r.streamed_prose) {
                 r.emit(r.chunk(.{ .string = reply.content }, null) catch return) catch return;
             } else if (r.plan.policy.kept(reply.content, r.prose_sent.items)) |rest| {

@@ -1,0 +1,252 @@
+{
+ "user_image": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is this?"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,iVBORw0KGgo="
+      }
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": false,
+  "nonce": "ca370be52eb4e1a3",
+  "marked": "[gMASK]<sop><|user|>What is this?\u0000tf-media-ca370be52eb4e1a3:0\u0000<|begin_of_image|><|image|><|end_of_image|><|assistant|><think></think>",
+  "text": "[gMASK]<sop><|user|>What is this?<|begin_of_image|><|image|><|end_of_image|><|assistant|><think></think>",
+  "order": [
+   0
+  ],
+  "template_messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "What is this?"
+     },
+     {
+      "type": "image",
+      "detail": "auto",
+      "tf_mark": "\u0000tf-media-ca370be52eb4e1a3:0\u0000"
+     }
+    ]
+   }
+  ]
+ },
+ "system_two_images_thinking": {
+  "messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,iVBORw0KGgo=",
+       "detail": "low"
+      }
+     },
+     {
+      "type": "text",
+      "text": "and"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,iVBORw0KGgo="
+      }
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": true,
+  "nonce": "5e79fa58d1ee80e6",
+  "marked": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>Be brief.<|user|>\u0000tf-media-5e79fa58d1ee80e6:0\u0000<|begin_of_image|><|image|><|end_of_image|>and\u0000tf-media-5e79fa58d1ee80e6:1\u0000<|begin_of_image|><|image|><|end_of_image|><|assistant|><think>",
+  "text": "[gMASK]<sop><|system|>Reasoning Effort: Max<|system|>Be brief.<|user|><|begin_of_image|><|image|><|end_of_image|>and<|begin_of_image|><|image|><|end_of_image|><|assistant|><think>",
+  "order": [
+   0,
+   1
+  ],
+  "template_messages": [
+   {
+    "role": "system",
+    "content": "Be brief."
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "image",
+      "detail": "low",
+      "tf_mark": "\u0000tf-media-5e79fa58d1ee80e6:0\u0000"
+     },
+     {
+      "type": "text",
+      "text": "and"
+     },
+     {
+      "type": "image",
+      "detail": "auto",
+      "tf_mark": "\u0000tf-media-5e79fa58d1ee80e6:1\u0000"
+     }
+    ]
+   }
+  ]
+ },
+ "tool_result_image": {
+  "messages": [
+   {
+    "role": "user",
+    "content": "take a screenshot"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "shot",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": [
+     {
+      "type": "text",
+      "text": "done"
+     },
+     {
+      "type": "image_url",
+      "image_url": {
+       "url": "data:image/png;base64,iVBORw0KGgo="
+      }
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "describe it"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "shot",
+     "description": "screenshot",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "thinking": false,
+  "nonce": "2f600710029eaa43",
+  "marked": "[gMASK]<sop><|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"shot\", \"description\": \"screenshot\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>take a screenshot<|assistant|><think></think><tool_call>shot</tool_call><|observation|><tool_response>done\u0000tf-media-2f600710029eaa43:0\u0000<|begin_of_image|><|image|><|end_of_image|></tool_response><|user|>describe it<|assistant|><think></think>",
+  "text": "[gMASK]<sop><|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"shot\", \"description\": \"screenshot\", \"parameters\": {\"type\": \"object\", \"properties\": {}}}\n</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call><|user|>take a screenshot<|assistant|><think></think><tool_call>shot</tool_call><|observation|><tool_response>done<|begin_of_image|><|image|><|end_of_image|></tool_response><|user|>describe it<|assistant|><think></think>",
+  "order": [
+   0
+  ],
+  "template_messages": [
+   {
+    "role": "user",
+    "content": "take a screenshot"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "shot",
+       "arguments": "{}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": [
+     {
+      "type": "text",
+      "text": "done"
+     },
+     {
+      "type": "image",
+      "detail": "auto",
+      "tf_mark": "\u0000tf-media-2f600710029eaa43:0\u0000"
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": "describe it"
+   }
+  ]
+ },
+ "video_and_quote": {
+  "messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "the marker <|image|> is a token"
+     },
+     {
+      "type": "video_url",
+      "video_url": {
+       "url": "data:video/mp4;base64,AAAA"
+      }
+     }
+    ]
+   }
+  ],
+  "tools": null,
+  "thinking": false,
+  "nonce": "1807c66dbcde1d4f",
+  "marked": "[gMASK]<sop><|user|>the marker <|image|> is a token\u0000tf-media-1807c66dbcde1d4f:0\u0000<|begin_of_video|><|video|><|end_of_video|><|assistant|><think></think>",
+  "text": "[gMASK]<sop><|user|>the marker <|image|> is a token<|begin_of_video|><|video|><|end_of_video|><|assistant|><think></think>",
+  "order": [
+   0
+  ],
+  "template_messages": [
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "the marker <|image|> is a token"
+     },
+     {
+      "type": "video",
+      "tf_mark": "\u0000tf-media-1807c66dbcde1d4f:0\u0000"
+     }
+    ]
+   }
+  ]
+ }
+}

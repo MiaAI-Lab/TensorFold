@@ -1,7 +1,7 @@
 //! One reply, as ``ChatApp.chat`` makes it: render, submit to the engine, stream text, reasoning and calls.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const fields_mod = @import("fields.zig");
 const reply_text = @import("reply_text.zig");
@@ -13,6 +13,10 @@ const ids = @import("ids.zig");
 const clock = @import("clock.zig");
 const Server = @import("server.zig").Server;
 const chunk_plan = @import("chunk_plan.zig");
+const admission = @import("admission.zig");
+const glm_calls = @import("glm_calls.zig");
+const glm_reply = @import("glm_reply.zig");
+const playout_mod = @import("playout.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -32,6 +36,8 @@ pub const Input = struct {
     id: []const u8 = "",
     /// ``logprobs: true`` with this many ``top_logprobs``; null: not asked.
     logprobs: ?u8 = null,
+    /// The request's own messages when they hold picture or clip parts (--vision): prompt.prepareMedia renders them.
+    media: ?Value = null,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -57,6 +63,11 @@ pub const Reply = struct {
     effort: ?[]const u8 = null,
     /// ``choices[0].logprobs`` (``{"content": [...]}``) for a request that asked; null otherwise.
     logprobs: ?Value = null,
+    /// The GLM recipe (tool calls, patches 0036-0055): `glm` is on for the checkpoint; `glm_done` says `calls` and
+    /// `content` are settled here (the streamer's calls plus the end parser's), so the route parses nothing more.
+    glm: bool = false,
+    glm_done: bool = false,
+    calls: ?[]Value = null,
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -159,6 +170,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     if (gone.check()) return error.Cancelled;
     var thinking = flag(f, "enable_thinking") orelse srv.config.enable_thinking;
     if (input.prompt != null) thinking = false;
+    if (f.get("clear_thinking")) |v| cx.clear_thinking = v.truthy(); // chat_template_kwargs.clear_thinking, for every render
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
     const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
     if (gone.check()) return error.Cancelled;
@@ -167,11 +179,19 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     const n: i64 = @intCast(rendered.ids.len);
     if (window > 0) {
         const room = window - n;
-        if (room < 1) return cx.fail(.context_length, "{s} {d} tokens{s}, but the rendered prompt has {d} tokens and leaves no room for a reply, which exceeds the context window. Compact or shorten the conversation.", .{ errors.context_limit, window, if (srv.info.context_fitted) ", the most this server's memory budget fits" else "", n });
-        if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
+        if (srv.config.recipe.glm) {
+            // the recipe's GlmApp.check (patch 0044): a request that sets max_tokens must fit whole, one that does not
+            // gets the default budget cut to what the window has left, never refused
+            const asked: i64 = if (input.max_tokens) |m| m else 0;
+            const need = n + (if (asked != 0) asked else 1);
+            if (need > window) return cx.fail(.context_length, "{s} {d} tokens: this request needs a {d}-token context ({s}), which exceeds the context window this server was started for; shorten the prompt or reply", .{ errors.context_limit, window, need, if (asked != 0) try std.fmt.allocPrint(a, "{d} prompt tokens plus max_tokens {d}", .{ n, asked }) else try std.fmt.allocPrint(a, "a {d}-token prompt", .{n}) });
+        } else {
+            if (room < 1) return cx.fail(.context_length, "{s} {d} tokens{s}, but the rendered prompt has {d} tokens and leaves no room for a reply, which exceeds the context window. Compact or shorten the conversation.", .{ errors.context_limit, window, if (srv.info.context_fitted) ", the most this server's memory budget fits" else "", n });
+            if (input.max_tokens != null and limit > room) return cx.fail(.context_length, "{s} {d} tokens, but the rendered prompt has {d} tokens and requests {d} reply tokens, which exceeds the context window. Reduce the prompt to at most {d} prompt tokens or request at most {d} reply tokens, including chat template and thinking tokens.", .{ errors.context_limit, window, n, limit, @max(0, window - limit), room });
+        }
         limit = @min(limit, room);
     }
-    const system_len: usize = if (input.prompt != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
     var shared: std.ArrayList(u32) = .empty;
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
         if (cut >= 512) try shared.append(a, @intCast(cut));
@@ -191,6 +211,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .shared_prefixes = shared.items,
         .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk), // a cut before the conversation's own text: fresh sessions resume their whole harness
         .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids), // from the tokens alone, for every request: cached states are keyed by tokens
+        .media = rendered.media,
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
         .decide = if (input.prompt == null and !background) prompt_mod.decideOf(srv, rendered.ids) else null,
     };
@@ -199,6 +220,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         const budget_field = f.get("thinking_budget");
         const budget: i64 = if (budget_field != null and budget_field.?.truthy()) budget_field.?.int64() orelse 0 else srv.config.thinking_budget;
         if (srv.think_close.len > 0) request.loop_guard = srv.config.loop_guard;
+        request.loop_recipe = request.loop_guard and srv.config.recipe.glm;
         if ((budget > 0 or request.loop_guard) and srv.think_close.len > 0) {
             if (budget > 0) request.think_budget = @intCast(@min(budget, std.math.maxInt(u32)));
             request.think_close = srv.think_close;
@@ -236,6 +258,20 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     var box: Mailbox = .{ .io = io, .gpa = srv.gpa };
     defer box.deinit();
     const id = srv.next_id.fetchAdd(1, .monotonic);
+    var slot = try admission.enter(srv, cx, request.background); // TF_GLM_MAX_QUEUED: past the lanes plus the cap, 429
+    defer slot.leave();
+    // TF_GLM_STREAM_SMOOTH=1: a streamed reply's tokens go out one event each at a steady pace from a short playout buffer
+    // (playout.zig), so drafted bursts and other requests' prompt fills do not show
+    var playout: playout_mod.Playout = undefined;
+    var smoothing = false;
+    var left = Left(@TypeOf(gone)){ .gone = gone };
+    var wrapped = sink;
+    if (sink != null and srv.config.recipe.glm and srv.config.recipe.stream_smooth) {
+        playout.start(srv.gpa, io, srv.config.recipe.stream_smooth_ms, sink.?, .{ .ctx = &left, .check = Left(@TypeOf(gone)).check }) catch return cx.fail(.server, "the stream's playout could not start", .{});
+        smoothing = true;
+        wrapped = playout.sink();
+    }
+    defer if (smoothing) playout.abort(); // a no-op once closed
     if (srv.keepalive) |k| k.begin(); // the GPU is busy: the idle ticker holds its commits
     defer if (srv.keepalive) |k| k.end();
     srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
@@ -245,13 +281,31 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .logprobs = request.logprobs != null };
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = wrapped, .smooth = if (smoothing) &playout else null, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .logprobs = request.logprobs != null, .return_ids = if (input.fields.get("return_token_ids")) |v| v.truthy() else false };
     defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
-        if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
+        if (srv.glm_calls and input.tools.len > 0) {
+            // GLM's calls go out whole while they are written (one call a delta), those in the think block when the
+            // reply ends on them; one call at most under parallel_tool_calls: false, which only the end parser reads
+            const single = if (input.fields.get("tool_call_single")) |x| x.truthy() else false;
+            const streams = sink != null and !single;
+            gen.glm = .{
+                .think = if (gen.thinking) .{ .a = a, .hold = if (streams) glm_calls.think_call_hold else null } else null,
+                .streamer = if (streams) glm_calls.CallStreamer.init(a, input.tools) catch |e| break :blk e else null,
+                .single = single,
+                .quiet_since = nowNs(io),
+            };
+        } else if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
         gen.loop(gone) catch |e| break :blk e;
-        break :blk gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
+        const finished = gen.finish(cx, prepared.prompt_len, received, thinking, effort, prepared.sampled, prepared.drafts);
+        if (smoothing) { // what is still queued goes out now, before the reply's end
+            if (finished) |_| playout.close() else |_| playout.abort();
+            if (playout.gone) {
+                if (finished) |_| break :blk error.Cancelled else |_| {}
+            }
+        }
+        break :blk finished;
     };
     if (result) |_| {} else |e| logEnded(input.id, e, cx.message, prepared.prompt_len, gen.collected.items.len, seconds(nowNs(io) - received));
     return result;
@@ -308,6 +362,35 @@ const Shown = struct {
     }
 };
 
+/// Whether a client who has left ends the request now: always, except under TF_GLM_PROMPT_STOP=0 while its prompt is still
+/// filling (every prompt then fills to its end).
+fn leaves(r: @import("recipe.zig").Recipe, box: *Mailbox) bool {
+    if (!r.glm or r.prompt_stop) return true;
+    box.mutex.lockUncancelable(box.io);
+    defer box.mutex.unlock(box.io);
+    return box.prefilled_ns != null or box.finished;
+}
+
+/// A client that left, asked from the playout's writer thread.
+fn Left(comptime G: type) type {
+    return struct {
+        gone: G,
+
+        fn check(ctx: *anyopaque) bool {
+            const l: *@This() = @ptrCast(@alignCast(ctx));
+            return l.gone.check();
+        }
+    };
+}
+
+/// What the recipe's GLM tool-call handling keeps while a reply streams.
+const GlmState = struct {
+    think: ?glm_calls.ThinkSplit,
+    streamer: ?glm_calls.CallStreamer,
+    single: bool,
+    quiet_since: i96, // the last event sent while a call is held (an empty delta every `keepalive_s` meanwhile)
+};
+
 /// The token loop and the text it streams.
 const Generation = struct {
     srv: *Server,
@@ -322,6 +405,10 @@ const Generation = struct {
     max_tokens: u32,
     tools: []const Value,
     calls: ?tool_stream.Streamer = null,
+    glm: ?GlmState = null,
+    smooth: ?*playout_mod.Playout = null,
+    return_ids: bool = false, // return_token_ids: the reply's ids come back in the "tensorfold" block
+    string_stop: bool = false, // a stop string, not the model's end token, ended the reply
     collected: std.ArrayList(u32) = .empty,
     visible: reply_text.Incremental = .{},
     hidden: std.ArrayList(u8) = .empty, // reused for the answer without its call blocks
@@ -368,6 +455,7 @@ const Generation = struct {
                 g.reason = "stop";
             } else if (try g.stopHit()) {
                 g.reason = "stop";
+                g.string_stop = true;
                 g.srv.engine.cancel(g.id); // the engine ends EOS and length itself; a stop string is the server's
             } else if (g.collected.items.len >= g.max_tokens) g.reason = "length";
         }
@@ -389,27 +477,47 @@ const Generation = struct {
         const text = g.stops.visible(all, true);
         if (g.visible.pending()) return; // a character still split across tokens
         var answer = text;
+        var wrote = false;
         if (g.thinking) {
-            const split = try reply_text.splitThinking(g.a, text, false, g.srv.markers);
+            const split = if (g.glm) |*gl| (if (gl.think) |*t| try t.split(text, false) else try reply_text.splitThinking(g.a, text, false, g.srv.markers)) else try reply_text.splitThinking(g.a, text, false, g.srv.markers);
             const piece = g.streamed_reasoning.after(split.reasoning, true);
             if (piece.len > 0) {
                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
                 try g.emit(sink, try deltaOf(g.a, "reasoning_content", piece));
+                wrote = true;
             }
             answer = split.answer;
         }
-        const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
-        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
+        const hiding = g.calls != null or g.glm != null;
+        const shown = if (hiding) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
+        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), hiding);
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
         const delta = g.streamed.after(vis, !copied);
         if (delta.len > 0) {
             try g.streamed.set(g.a, vis, delta);
             try g.emit(sink, .{ .string = delta });
+            wrote = true;
         }
+        if (g.glm) |*gl| if (gl.streamer) |*cs| try g.streamGlmCalls(sink, gl, cs, text, wrote);
         if (g.calls) |*c| {
             var out: std.ArrayList(Value) = .empty;
             try c.feed(answer, &out); // never the reasoning: a call it mentions is not made
             for (out.items) |d| try g.emit(sink, d);
+        }
+    }
+
+    /// The calls that became whole in this round, each as one delta; while one is held, an empty delta every
+    /// `keepalive_s` keeps an idle client waiting (past the idle cut of LiteLLM and Node's fetch).
+    fn streamGlmCalls(g: *Generation, sink: Sink, gl: *GlmState, cs: *glm_calls.CallStreamer, text: []const u8, wrote: bool) Failure!void {
+        const feed_text = if (gl.think) |t| (if (t.stream_from) |from| text[from..] else "") else text;
+        const parts = try cs.feed(feed_text);
+        const now = nowNs(g.srv.io);
+        for (parts) |d| try g.emit(sink, d);
+        if (parts.len > 0 or wrote) {
+            gl.quiet_since = now;
+        } else if (cs.open and seconds(now - gl.quiet_since) >= glm_calls.keepalive_s) {
+            try g.emit(sink, .{ .object = try json.newObject(g.a) });
+            gl.quiet_since = now;
         }
     }
 
@@ -458,12 +566,20 @@ const Generation = struct {
                 g.engine_done = true;
                 return;
             }
-            if (gone.check()) {
+            if (gone.check() and leaves(g.srv.config.recipe, m)) {
                 g.cancel();
                 return error.Cancelled;
             }
             const tokens = chunk orelse continue;
-            if (g.reason == null) try g.commit(tokens);
+            if (g.smooth) |p| {
+                // token by token into the playout queue, unless the reply ends in this round (then the queue is
+                // flushed: the end is never later)
+                for (tokens) |t| {
+                    if (g.reason != null) break;
+                    try g.commit(&.{t});
+                    if (g.reason != null) p.flush();
+                }
+            } else if (g.reason == null) try g.commit(tokens);
         }
     }
 
@@ -481,17 +597,36 @@ const Generation = struct {
         const content_tokens = if (g.ignore_eos) g.collected.items else reply_text.stripTrailing(g.collected.items, g.srv.eos);
         const raw = try g.srv.text.decode(a, content_tokens);
         const visible = g.stops.visible(raw, false);
+        // the model's end token ended the reply (not a stop string, the token limit or ignore_eos)
+        const ended = g.collected.items.len > 0 and g.eos(g.collected.items[g.collected.items.len - 1]) and !g.string_stop;
         // closed before the think split, so a call ending an unclosed think block is the answer
-        const close = try g.closeCall(visible);
+        const close = if (g.glm != null) (if (ended) try glm_calls.closeCall(a, visible, g.tools) else "") else try g.closeCall(visible);
         const text = if (close.len > 0) try std.mem.concat(a, u8, &.{ visible, close }) else visible;
+        const recipe_glm = g.srv.config.recipe.glm;
         var content: []const u8 = text;
         var reasoning: ?[]const u8 = null;
-        if (g.thinking) {
+        var settled: ?glm_reply.Result = null;
+        if (g.glm) |*gl| {
+            const r = try glm_reply.finalize(a, .{
+                .text = text,
+                .tools = g.tools,
+                .thinking = g.thinking,
+                .markers = g.srv.markers,
+                .think = if (gl.think) |*t| t else null,
+                .streamer = if (gl.streamer) |*cs| cs else null,
+                .single = gl.single,
+                .ended = ended,
+            });
+            settled = r;
+            content = r.content;
+            reasoning = if (r.reasoning.len > 0) r.reasoning else null;
+        } else if (g.thinking) {
             const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
-            const r = reply_text.pyStrip(split.reasoning);
+            // the recipe's server returns the reasoning as the model wrote it
+            const r = if (recipe_glm) split.reasoning else reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
             content = split.answer;
-        } else {
+        } else if (!recipe_glm) {
             const h = reply_text.parseHarmony(text);
             content = h.content;
             reasoning = h.reasoning;
@@ -500,15 +635,23 @@ const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
-            const sent = g.streamed.text.items;
-            if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
-            if (g.calls) |*c| if (close.len > 0) {
-                // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
-                var out: std.ArrayList(Value) = .empty;
-                try c.feed(if (g.thinking) content else text, &out);
-                for (out.items) |d| try g.emit(sink, d);
-            };
+            if (settled) |r| {
+                const sent = g.streamed.text.items;
+                if (std.mem.startsWith(u8, r.content, sent) and r.content.len > sent.len) try g.emit(sink, .{ .string = r.content[sent.len..] });
+                for (r.call_deltas) |d| try g.emit(sink, d); // the calls that became whole at the end
+                // under parallel_tool_calls: false the route sends the one call, the stream filter drops it here
+                if (r.calls) |all| if (!g.glm.?.single) for (all[r.streamed..], r.streamed..) |call, i| try g.emit(sink, try glm_reply.wholeDelta(a, i, call));
+            } else {
+                const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
+                const sent = g.streamed.text.items;
+                if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
+                if (g.calls) |*c| if (close.len > 0) {
+                    // the streamer reads the closers as markup the model wrote, so the call ends with the same deltas
+                    var out: std.ArrayList(Value) = .empty;
+                    try c.feed(if (g.thinking) content else text, &out);
+                    for (out.items) |d| try g.emit(sink, d);
+                };
+            }
         }
         const prefilled = m.prefilled_ns;
         const decode_s: f64 = if (prefilled) |p| @max(0, seconds(finished_ns - p)) else 0;
@@ -532,10 +675,17 @@ const Generation = struct {
         const sha = @import("tokens.zig").tokenSha(g.collected.items);
         try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
         try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
+        if (g.return_ids) { // the reply's ids in the "tensorfold" block, for exactness checks (tools/end_of_turn.py)
+            const list = try a.alloc(Value, g.collected.items.len);
+            for (g.collected.items, list) |t, *slot| slot.* = try json.intValue(a, t);
+            try runtime.put(a, "token_ids", .{ .array = list });
+        }
         if (m.stats.loop_period) |period| {
             const loop_field = try json.newObject(a);
             try loop_field.put(a, "period", try json.intValue(a, period));
             try runtime.put(a, "loop", .{ .object = loop_field });
+            // the think block collapsed and was closed (TF_GLM_LOOP_GUARD): `usage.tensorfold.loop_guard` counts it
+            if (recipe_glm) try runtime.put(a, "loop_guard", .{ .int = "1" });
         }
         const s = m.stats;
         const spec = try json.newObject(a);
@@ -550,8 +700,11 @@ const Generation = struct {
             .content = content,
             .stop_sequence = g.stops.matched(raw),
             .reasoning = reasoning,
-            .tool_calls_streamed = g.calls != null and g.calls.?.streamed,
-            .finish_reason = reason,
+            .tool_calls_streamed = if (settled) |r| (r.calls != null and !g.glm.?.single) else g.calls != null and g.calls.?.streamed,
+            .glm = recipe_glm,
+            .glm_done = settled != null,
+            .calls = if (settled) |r| r.calls else null,
+            .finish_reason = if (settled) |r| (if (r.calls != null and !r.cut) "tool_calls" else reason) else reason,
             .prompt_tokens = prompt_len,
             .cached_tokens = m.cached orelse 0,
             .completion_tokens = g.collected.items.len,
@@ -596,4 +749,14 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });
     return .{ .object = o };
+}
+
+test "a client that left ends the request at once, or after its prompt under TF_GLM_PROMPT_STOP=0" {
+    var box: Mailbox = .{ .io = std.testing.io, .gpa = std.testing.allocator };
+    defer box.deinit();
+    try std.testing.expect(leaves(.{}, &box)); // not the recipe's checkpoint
+    try std.testing.expect(leaves(.{ .glm = true }, &box)); // the default: the prompt stops at its next chunk
+    try std.testing.expect(!leaves(.{ .glm = true, .prompt_stop = false }, &box)); // filling: it fills to its end
+    box.prefilled_ns = 1;
+    try std.testing.expect(leaves(.{ .glm = true, .prompt_stop = false }, &box)); // decoding: the reply stops
 }

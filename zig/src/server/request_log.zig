@@ -1,10 +1,10 @@
-//! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images redacted, for replays.
+//! TENSORFOLD_REQUEST_LOG: each chat and completion body appended as one JSON line, images and videos redacted, for replays.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
-/// The body with every image part's URL replaced, the rest kept.
+/// The body with every image and video part's URL replaced, the rest kept.
 fn redact(a: Allocator, v: Value) Allocator.Error!Value {
     switch (v) {
         .array => |items| {
@@ -13,13 +13,13 @@ fn redact(a: Allocator, v: Value) Allocator.Error!Value {
             return .{ .array = out };
         },
         .object => |o| {
-            if (v.typeIs("image_url")) {
+            for ([_][]const u8{ "image_url", "video_url" }) |kind| if (v.typeIs(kind)) {
                 const copy = try json.copyObject(a, o);
                 const url = try json.newObject(a);
                 try url.put(a, "url", .{ .string = "<redacted>" });
-                try copy.put(a, "image_url", .{ .object = url });
+                try copy.put(a, kind, .{ .object = url });
                 return .{ .object = copy };
-            }
+            };
             const out = try json.newObject(a);
             for (o.keys(), o.values()) |k, item| try out.put(a, k, try redact(a, item));
             return .{ .object = out };

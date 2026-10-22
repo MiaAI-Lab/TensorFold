@@ -1,6 +1,6 @@
 //! Chat messages as the template sees them: leading instructions merged, text parts joined, call arguments as objects.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const Value = json.Value;
@@ -21,8 +21,30 @@ fn withField(cx: *Cx, o: *const json.Object, key: []const u8, value: Value) !*js
     return copy;
 }
 
+/// ``has_images``: a message whose content holds an image_url or video_url part.
+pub fn hasVisual(messages: ?Value) bool {
+    const list = messages orelse return false;
+    if (list != .array) return false;
+    for (list.array) |m| {
+        const content = m.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array) |part| if (part.typeIs("image_url") or part.typeIs("video_url")) return true;
+    }
+    return false;
+}
+
+fn isVisualPart(part: Value) bool {
+    return part.typeIs("image_url") or part.typeIs("image") or part.typeIs("video_url") or part.typeIs("video");
+}
+
 /// ``normalize_messages`` (text only): leading system and developer text merged, later ones as ``late_system``; a template that needs a user query gains one user turn after a trailing tool run.
 pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool) errors.Refused!Value {
+    return normalizeWith(cx, messages, late_system, needs_user_after_tool, false);
+}
+
+/// ``normalize_messages``; `allow_media` (``allow_images``): a user or tool message with picture or clip parts keeps its
+/// parts list for the template.
+pub fn normalizeWith(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_after_tool: bool, allow_media: bool) errors.Refused!Value {
     const list = messages orelse return cx.refuse("messages must be a non-empty list");
     if (list != .array or list.array.len == 0) return cx.refuse("messages must be a non-empty list");
     var out: std.ArrayList(Value) = .empty;
@@ -34,6 +56,22 @@ pub fn normalize(cx: *Cx, messages: ?Value, late_system: []const u8, needs_user_
         if (fields.hasMedia(message)) return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
         const content = message.get("content");
         var item: *json.Object = message.object;
+        const visual = allow_media and content != null and content.? == .array and for (content.?.array) |part| {
+            if (part == .object and isVisualPart(part)) break true;
+        } else false;
+        if (visual) {
+            const r = role.?.string;
+            if (!std.mem.eql(u8, r, "user") and !std.mem.eql(u8, r, "tool")) return cx.refuse("images and videos are supported only in user and tool messages");
+            for (content.?.array) |part| {
+                if (part != .object or !(part.typeIs("text") or isVisualPart(part))) return cx.refuse("image messages may contain text and image_url (or video_url) parts only");
+                if (part.typeIs("text")) {
+                    const t = part.get("text");
+                    if (t == null or t.? != .string) return cx.refuse("a text content part must contain a text string");
+                }
+            }
+            try out.append(cx.a, message);
+            continue;
+        }
         if (content != null and content.? == .array) {
             var text: std.ArrayList(u8) = .empty;
             for (content.?.array) |part| {

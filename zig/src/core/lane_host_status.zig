@@ -27,7 +27,18 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         .preemptions = 0,
         .streams = n,
         .generation_tokens = h.live_generated,
+        .kept = h.kept_view,
     };
+    if (h.extra_status) |source| source.read(source.ctx, out);
+}
+
+/// The store's numbers for /health, copied under the lock (the store itself is the engine thread's alone).
+pub fn noteKept(h: *LaneHost) void {
+    const store = h.cache orelse return;
+    const view = store.keptStats();
+    h.mutex.lockUncancelable(h.io);
+    defer h.mutex.unlock(h.io);
+    h.kept_view = view;
 }
 
 /// `n` tokens delivered now; marks older than the window drop.

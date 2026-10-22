@@ -1,15 +1,21 @@
 //! Prompt ids from a request, as ``prepare_prompt`` and ``render_prompt_ids`` make them.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const messages_mod = @import("messages.zig");
 const model_text = @import("model_text.zig");
 const chat = @import("chat.zig");
+const glm_history = @import("glm_history.zig");
 const Server = @import("server.zig").Server;
+const api = @import("engine_api");
+const vision = @import("vision");
+const helper_mod = @import("vision_helper.zig");
+const vision_server = @import("vision_server.zig");
+const log = @import("log.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 
-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0 };
+pub const Rendered = struct { ids: []const u32, history_len: usize = 0, rewind_len: usize = 0, media: ?*const api.Media = null };
 
 /// Where lessons decide to act on a reply: the row before the generation prompt's `<think>`, else before its last.
 pub fn decideOf(srv: *const Server, ids: []const u32) u32 {
@@ -27,9 +33,12 @@ pub const isTitle = messages_mod.isTitleRequest;
 
 /// ``render_prompt_ids``: messages normalized for this template, rendered, and a dangling ``<think>`` closed.
 pub fn renderIds(srv: *Server, cx: *Cx, messages: Value, tools: []const Value, thinking: bool, effort: ?[]const u8, generation: bool) errors.Refused![]const u32 {
-    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, messages, srv.late_system, srv.needs_user_after_tool));
+    // the recipe's history repairs, on the messages as the client sent them (glm_history.zig)
+    const sent = if (srv.config.recipe.glm) try glm_history.agentHistory(cx.a, try glm_history.promoteReasoning(cx.a, if (srv.kept_reasoning) |k| try k.restore(cx.a, messages) else messages)) else messages;
+    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalize(cx, sent, srv.late_system, srv.needs_user_after_tool));
     var problem: []const u8 = "";
     const options: model_text.RenderOptions = .{
+        .clear_thinking = cx.clear_thinking,
         .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
         .add_generation_prompt = generation,
         .enable_thinking = thinking,
@@ -96,6 +105,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
         } },
         .ids => |ids| return .{ .ids = ids },
     };
+    if (input.media) |raw| return prepareMedia(srv, cx, raw, input.tools, thinking, effort);
     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
     var history_len: usize = 0;
@@ -104,6 +114,87 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
     const count = if (input.messages == .array) input.messages.array.len else 0;
     const rewind_len = if (srv.info.prompt_cache) rewindLen(srv, cx, input.messages, count, input.tools, prompt, thinking, effort) else 0; // one more render
     return .{ .ids = prompt, .history_len = history_len, .rewind_len = rewind_len };
+}
+
+/// ``prepare_images``: the messages split (image_url / video_url parts as the template's image / video parts, marked, the
+/// media in order), normalized with their parts, rendered, then the vision backend: the token ids and the media the
+/// engine takes. Such a prompt is neither kept nor resumed.
+fn prepareMedia(srv: *Server, cx: *Cx, raw: Value, tools: []const Value, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
+    const v = srv.vision orelse return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+    if (!srv.info.media) return cx.refuse("image input requires a supported vision checkpoint served with --vision");
+    var diag: vision.errors.Diag = .{};
+    const sp = vision.split.splitImages(cx.a, raw, v.fe.splitOptions(), &diag) catch |e| return mediaFailure(cx, e, &diag);
+    var nonce_raw: [8]u8 = undefined;
+    std.Io.random(srv.io, &nonce_raw);
+    const marks = try vision.split.MediaMarks.init(cx.a, sp.messages, nonce_raw);
+    const normalized = try messages_mod.toolArguments(cx, try messages_mod.normalizeWith(cx, sp.messages, srv.late_system, srv.needs_user_after_tool, true));
+    var problem: []const u8 = "";
+    const options: model_text.RenderOptions = .{
+        .tools = if (tools.len > 0) Value{ .array = @constCast(tools) } else null,
+        .add_generation_prompt = true,
+        .enable_thinking = thinking,
+        .reasoning_effort = if (thinking) effort else null,
+    };
+    const text = srv.text.render(cx.a, normalized, options, &problem) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Template => return cx.fail(.request, "the chat template rejected the request: {s}", .{problem}),
+    };
+    const window: ?usize = if (srv.info.context_window > 0) srv.info.context_window else null;
+    switch (v.backend) {
+        .python => {
+            const helper = v.helper orelse return cx.refuse("the vision helper is not running");
+            const list = try cx.a.alloc(helper_mod.Source, sp.sources.len);
+            for (sp.sources, list) |s, *slot| slot.* = switch (s) {
+                .image => |i| .{ .kind = .image, .url = i.url, .detail = @tagName(i.detail) },
+                .video => |x| .{ .kind = .video, .url = x.url },
+            };
+            const result = helper.prepare(cx.a, text, &marks.nonce, list, if (window) |w| @intCast(w) else null) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return cx.fail(.capacity, "image processing failed ({s}); retry shortly", .{@errorName(e)}),
+            };
+            switch (result) {
+                .refused => |r| {
+                    if (r.context) return cx.fail(.context_length, "{s}", .{r.message});
+                    return cx.fail(if (r.status == 503) .capacity else .request, "{s}", .{r.message});
+                },
+                .ok => |p| {
+                    log.line("vision (python): {d} image(s), {d} video(s): {d} visual tokens of {d} prompt tokens (prepare {d:.3}s, tower {d:.3}s, features {s})", .{ p.images, p.videos, p.visual_tokens, p.tokens.len, p.prepare_s, p.encode_s, if (p.features_sha.len >= 16) p.features_sha[0..16] else p.features_sha });
+                    return .{ .ids = p.tokens, .media = p.media };
+                },
+            }
+        },
+        .zig => {
+            const rd = marks.read(cx.a, text, true, &diag) catch |e| return mediaFailure(cx, e, &diag);
+            v.slots.acquire(srv.io, &diag) catch return cx.fail(.capacity, "{s}", .{diag.message()});
+            defer v.slots.release(srv.io);
+            const t0 = std.Io.Clock.awake.now(srv.io).toNanoseconds();
+            var media = v.fe.loadSources(cx.a, sp.sources, rd.order, &diag) catch |e| return mediaFailure(cx, e, &diag);
+            defer media.deinit(cx.a);
+            const ex = v.fe.expand(cx.a, rd.text, media.pictures, media.clips, &diag) catch |e| return mediaFailure(cx, e, &diag);
+            const ids = srv.text.encode(cx.a, ex.text, false) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.Template => return cx.fail(.server, "the tokenizer cannot encode this prompt", .{}),
+            };
+            const fin = v.fe.finish(cx.a, ids, v.image_token, ex.items, window, &diag) catch |e| return mediaFailure(cx, e, &diag);
+            const items = vision_server.engineItems(v, cx.a, ex.items, &diag) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                else => return mediaFailure(cx, e, &diag),
+            };
+            const m = try cx.a.create(api.Media);
+            m.* = .{ .rows = fin.positions, .items = items };
+            m.check(ids.len) catch return cx.fail(.server, "the picture rows do not fit the prompt", .{});
+            const t1 = std.Io.Clock.awake.now(srv.io).toNanoseconds();
+            log.line("vision: {d} image(s), {d} clip(s): {d} visual tokens of {d} prompt tokens (frontend {d:.3}s)", .{ media.pictures.len, media.clips.len, fin.positions.len, ids.len, @as(f64, @floatFromInt(t1 - t0)) / 1e9 });
+            return .{ .ids = ids, .media = m };
+        },
+    }
+}
+
+fn mediaFailure(cx: *Cx, e: anyerror, diag: *vision.errors.Diag) errors.Refused {
+    return switch (e) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => if (diag.isContextLimit()) cx.fail(.context_length, "{s}", .{diag.message()}) else cx.refuse(diag.message()),
+    };
 }
 
 /// Where the latest user message's text starts (of the first `real_count`): the prompt and a probe there agree to it.
@@ -119,7 +210,7 @@ pub fn rewindLen(srv: *Server, cx: *Cx, messages: Value, real_count: usize, tool
     const user = json.copyObject(cx.a, messages.array[user_index].object) catch return 0;
     user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
     list[user_index] = .{ .object = user };
-    var scratch: Cx = .{ .a = cx.a };
+    var scratch: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking };
     const probe = renderIds(srv, &scratch, .{ .array = list }, tools, thinking, effort, true) catch return 0;
     const i = std.mem.indexOfDiff(u32, prompt, probe) orelse return 0;
     return if (i < prompt.len) i else 0;
@@ -138,7 +229,7 @@ pub fn systemPrefixLen(srv: *Server, cx: *Cx, messages: Value, tools: []const Va
     user.put(cx.a, "role", .{ .string = "user" }) catch return 0;
     user.put(cx.a, "content", .{ .string = "\u{2063}probe" }) catch return 0;
     probe[first_user] = .{ .object = user };
-    var scratch: Cx = .{ .a = cx.a };
+    var scratch: Cx = .{ .a = cx.a, .clear_thinking = cx.clear_thinking };
     const other = renderIds(srv, &scratch, .{ .array = probe }, tools, thinking, effort, true) catch return 0;
     var shared: usize = 0;
     while (shared < @min(prompt_ids.len, other.len) and prompt_ids[shared] == other[shared]) shared += 1;

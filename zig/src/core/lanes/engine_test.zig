@@ -460,3 +460,110 @@ test "a family that keeps copies to shared rounds proposes none for a lone strea
         try std.testing.expectEqual(lone_copies, (try win.copyProposal(&engine, &s)).len >= 2);
     }
 }
+
+/// Every case's emitted tokens on the sliced-fill backend: the first `first_n` cases admitted together, the rest
+/// one at a time `gap` steps apart while the earlier ones decode (their prompts fill between those rounds).
+fn runSliced(cases: []const Case, first_n: usize, gap: usize, slice: usize, widest: *usize) ![][]u32 {
+    var cfg = try model();
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .slice = slice };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backendSliced(), clock.clock());
+    defer engine.deinit();
+    const Joined = struct {
+        n: usize = 0,
+        fn done(ptr: *anyopaque, _: *sm.Stream, err: ?anyerror) void {
+            const j: *@This() = @ptrCast(@alignCast(ptr));
+            if (err == null) j.n += 1;
+        }
+    };
+    var joined: Joined = .{};
+    engine.fill_hook = .{ .ptr = &joined, .done = Joined.done };
+    const streams = try gpa.alloc(sm.Stream, cases.len);
+    defer gpa.free(streams);
+    const proposers = try gpa.alloc(SuffixLookup, cases.len);
+    defer gpa.free(proposers);
+    for (cases, streams, proposers) |c, *s, *p| {
+        p.* = try SuffixLookup.init(gpa, .{ .min_match = 4 });
+        s.* = try sm.Stream.init(gpa, .{ .id = "s", .prompt = c.prompt, .max_new = c.max_new, .eos = &.{96}, .sampling = c.sampling, .drafts = c.drafts, .proposer = p.proposer(), .think_budget = c.think_budget, .think_close = &.{ 90, 91, 92 }, .think_end = 91 });
+    }
+    defer for (streams, proposers) |*s, *p| {
+        s.deinit(gpa);
+        p.deinit();
+    };
+    for (streams[0..first_n]) |*s| try std.testing.expect(try engine.beginStream(s));
+    var next = first_n;
+    var steps: usize = 0;
+    while (engine.activeCount() > 0 or engine.fillingCount() > 0 or next < streams.len) {
+        if (next < streams.len and steps % gap == 0) {
+            try std.testing.expect(try engine.beginStream(&streams[next]));
+            next += 1;
+        }
+        try engine.step();
+        steps += 1;
+    }
+    try std.testing.expectEqual(cases.len, joined.n);
+    widest.* = target.widest_fill;
+    const out = try gpa.alloc([]u32, cases.len);
+    for (out, streams) |*o, *s| o.* = try gpa.dupe(u32, s.emitted());
+    return out;
+}
+
+test "prompts filled in slices between rounds equal prefills at admission: together, and arriving while others decode" {
+    const cases = [_]Case{
+        .{ .prompt = &.{ 5, 9, 2, 6, 5, 3, 5, 8, 9, 7 }, .max_new = 40 },
+        .{ .prompt = &.{ 1, 4, 1, 4, 2 }, .max_new = 30, .sampling = .{ .seed = 7, .temperature = 0.8 } },
+        .{ .prompt = &.{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8, 4, 5, 9 }, .max_new = 35, .drafts = false },
+        .{ .prompt = &.{ 3, 3 }, .max_new = 20, .sampling = .{ .seed = 9 } },
+    };
+    // each alone, prefilled at admission
+    var solo: [cases.len][]u32 = undefined;
+    for (cases, &solo) |c, *o| {
+        const r = try run(&.{c});
+        o.* = r[0];
+        gpa.free(r);
+    }
+    defer for (solo) |o| gpa.free(o);
+    for ([_]struct { usize, usize, usize }{ .{ cases.len, 1, 3 }, .{ 1, 2, 2 }, .{ 2, 3, 1 }, .{ 1, 1, 50 } }) |shape| {
+        const first_n, const gap, const slice = shape;
+        var widest: usize = 0;
+        const got = try runSliced(&cases, first_n, gap, slice, &widest);
+        defer free(got);
+        for (solo, got) |a, b| try std.testing.expectEqualSlices(u32, a, b);
+        if (first_n > 1) try std.testing.expect(widest > 1); // prompts that arrived together filled in one call
+    }
+}
+
+test "a cancelled fill ends without its stream joining" {
+    var cfg = try model();
+    defer cfg.deinit(gpa);
+    var target: fake.Fake = .{ .gpa = gpa, .slice = 1 };
+    defer target.deinit();
+    var clock: fake.FixedClock = .{};
+    var engine = Engine.init(gpa, &cfg, target.backendSliced(), clock.clock());
+    defer engine.deinit();
+    const C = struct {
+        var flag = false;
+        fn check(_: *anyopaque) bool {
+            return flag;
+        }
+        var ended: ?anyerror = null;
+        fn done(_: *anyopaque, _: *sm.Stream, err: ?anyerror) void {
+            ended = err;
+        }
+    };
+    C.flag = false;
+    C.ended = null;
+    engine.fill_hook = .{ .ptr = &engine, .done = C.done };
+    var s = try sm.Stream.init(gpa, .{ .id = "c", .prompt = &.{ 1, 2, 3, 4, 5, 6 }, .max_new = 5, .cancel_check = .{ .ptr = &engine, .check = C.check } });
+    defer s.deinit(gpa);
+    try std.testing.expect(try engine.beginStream(&s));
+    try engine.step();
+    C.flag = true;
+    try engine.step();
+    try std.testing.expectEqual(@as(?anyerror, error.Cancelled), C.ended);
+    try std.testing.expectEqual(@as(usize, 0), engine.fillingCount());
+    try std.testing.expectEqual(@as(usize, 0), engine.activeCount());
+    try std.testing.expectEqual(@as(u32, 0), target.lanes.count());
+}

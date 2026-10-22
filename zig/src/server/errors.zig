@@ -15,6 +15,9 @@ pub const Kind = enum {
     server,
 };
 
+/// What a capacity refusal answers: 503 (the engine is busy), or 429 with `Retry-After: 5` under the GLM recipe (patch 0081).
+pub var capacity_status: u16 = 503;
+
 pub const context_limit = "This server's maximum context length is"; // OpenAI's wording, which clients match to compact
 
 pub const Refused = error{ Refused, OutOfMemory };
@@ -24,6 +27,8 @@ pub const Cx = struct {
     a: Allocator,
     kind: Kind = .request,
     message: []const u8 = "",
+    /// The request's own `chat_template_kwargs.clear_thinking` (null: the server's default), read by every render.
+    clear_thinking: ?bool = null,
 
     pub fn fail(cx: *Cx, kind: Kind, comptime fmt: []const u8, args: anytype) Refused {
         cx.kind = kind;
@@ -45,7 +50,7 @@ pub const Cx = struct {
 
     pub fn status(cx: *const Cx) u16 {
         return switch (cx.kind) {
-            .capacity => 503,
+            .capacity => capacity_status,
             .server => 500,
             else => 400,
         };

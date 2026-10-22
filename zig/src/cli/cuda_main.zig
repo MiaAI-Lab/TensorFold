@@ -11,7 +11,9 @@ const precision = @import("cuda_precision.zig");
 const shared_checks = @import("cuda_shared_checks.zig");
 const checkpoint_cli = @import("checkpoint_cli");
 const lanes_cli = @import("cuda_lanes.zig");
+const glm_cli = @import("glm_cuda.zig");
 const segments_cli = @import("cuda_segments.zig");
+const flashnext_cli = @import("flashnext_cuda.zig");
 const train_check = @import("cuda_train_check.zig");
 const decode = nemotron.decode;
 
@@ -68,6 +70,9 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("{s}", .{usage});
         return 2;
     }
+    // Flash Next (qwen4_exp) checkpoints take their own commands (flashnext_cuda.zig)
+    if (flashnext_cli.wants(gpa, init.io, args[2])) return flashnext_cli.main(init, args);
+    if (glm_cli.wants(gpa, init.io, args[2])) return glm_cli.main(init, args);
     var opts = Options{ .model = args[2] };
     var positional: std.ArrayList([]const u8) = .empty;
     defer positional.deinit(gpa);

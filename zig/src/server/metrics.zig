@@ -122,6 +122,16 @@ pub const Metrics = struct {
         try gauge(w, "prompt_tokens_total", "counter", "Prompt tokens of finished requests.", snap.prompt);
         const keeps = engine.info().prompt_cache;
         if (keeps) try gauge(w, "prompt_tokens_cached_total", "counter", "Prompt tokens of finished requests restored from kept prompt states.", snap.cached);
+        if (status.kept) |k| {
+            try gauge(w, "kept_prompts", "gauge", "Prompt states kept for reuse.", k.prompts);
+            try gauge(w, "kept_bytes", "gauge", "Device bytes the kept prompt states hold.", k.bytes);
+            if (k.spill_on) {
+                try gauge(w, "spill_entries", "gauge", "Kept prompt states stored on this rank's disk.", k.spill[0]);
+                try gauge(w, "spill_stored_bytes", "gauge", "Bytes the spill tier's files take.", k.spill[1]);
+                try gauge(w, "spill_writes_total", "counter", "Prompt states written to the spill tier.", k.spill[2]);
+                try gauge(w, "spill_reads_total", "counter", "Prompt states read back from the spill tier.", k.spill[4]);
+            }
+        }
         try gauge(w, "generation_tokens_total", "counter", "Generated tokens of finished requests.", snap.generation);
         const live = streams[0..@min(status.streams, streams.len)];
         try family(w, "kv_cache_usage_ratio", "gauge", "Tokens in a stream cache divided by that stream's context window.");

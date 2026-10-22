@@ -309,6 +309,7 @@ pub const Conn = struct {
         try c.addHeader("Content-Type", "application/json");
         var len: [24]u8 = undefined;
         try c.addHeader("Content-Length", try std.fmt.bufPrint(&len, "{d}", .{body.len}));
+        if (code == 429) try c.addHeader("Retry-After", "5"); // a capacity refusal tells its client when to come back (patch 0081)
         if (c.close) try c.addHeader("Connection", "close");
         try c.finish(body);
     }

@@ -2,16 +2,35 @@
 const std = @import("std");
 const tokenizer = @import("tokenizer");
 const template = @import("template");
-const json = @import("json.zig");
+const json = @import("json");
 const model_text = @import("model_text.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
+
+/// --vision: the checkpoint template's no-media reminder becomes GLM's picture and clip markers (Glm5NextProcessor's
+/// layout; ``glm5_next/cuda/app.py media_template``), a part's ``tf_mark`` going before them.
+pub var media_template: bool = false;
+const no_media = "{{- \"<reminder>You are unable to process this \" ~ media_type ~ \" because you don't have multi-modal input ability. Try different methods.</reminder>\" }}";
+const with_media = "{%- if item.tf_mark is defined -%}{{- item.tf_mark -}}{%- endif -%}" ++
+    "{%- if media_type == 'image' -%}<|begin_of_image|><|image|><|end_of_image|>" ++
+    "{%- elif media_type == 'video' -%}<|begin_of_video|><|video|><|end_of_video|>" ++
+    "{%- else -%}" ++ no_media ++ "{%- endif -%}";
+
+/// The template with its media branch swapped, or null when it has none TensorFold knows how to extend.
+pub fn swapMedia(a: Allocator, source: []const u8) Allocator.Error!?[]const u8 {
+    if (std.mem.count(u8, source, no_media) != 1) return null;
+    return try std.mem.replaceOwned(u8, a, source, no_media, with_media);
+}
 
 pub const HfText = struct {
     gpa: Allocator,
     arena: std.heap.ArenaAllocator,
     tok: tokenizer.Tokenizer,
     source: []const u8 = "",
+    glm: bool = false,
+    /// The recipe's TF_GLM_EFFORT_TAIL and TF_GLM_CLEAR_THINKING (recipe.zig), set after the load for a GLM checkpoint.
+    effort_tail: bool = false,
+    clear_thinking: bool = false,
     tool_source: []const u8 = "",
     compiled: ?template.Compiled = null,
     tool_compiled: ?template.Compiled = null,
@@ -34,6 +53,9 @@ pub const HfText = struct {
         errdefer t.tok.deinit();
         const config = readJson(io, a, dir, "tokenizer_config.json");
         const model_config = readJson(io, a, dir, "config.json");
+        if (model_config == .object) if (model_config.object.get("model_type")) |mt| {
+            t.glm = mt == .string and (std.mem.eql(u8, mt.string, "glm5_next") or std.mem.eql(u8, mt.string, "glm5"));
+        };
         if (template_override) |path| {
             t.source = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch |e| {
                 problem.* = try std.fmt.allocPrint(pa, "cannot read chat template override ({s})", .{@errorName(e)});
@@ -43,6 +65,12 @@ pub const HfText = struct {
         t.specials = try specialsOf(a, config);
         t.eos = try t.eosIds(a, model_config, config);
         try t.readPostProcessor(io, a, dir);
+        if (media_template and t.glm and t.source.len > 0) {
+            t.source = (try swapMedia(a, t.source)) orelse {
+                problem.* = try std.fmt.allocPrint(pa, "--vision: this checkpoint's chat template has no media branch TensorFold knows how to extend (GLM-5.3 Flash's chat_template.jinja)", .{});
+                return error.Load;
+            };
+        }
         if (t.source.len > 0) {
             var diag: template.Diag = .{};
             defer if (diag.msg.len > 0) gpa.free(diag.msg);
@@ -53,6 +81,18 @@ pub const HfText = struct {
         }
         if (t.tool_source.len > 0) t.tool_compiled = template.compile(gpa, t.tool_source, null) catch null;
         return t;
+    }
+
+    /// The recipe's switches for a GLM checkpoint: the effort line's place, earlier turns' reasoning, and
+    /// `<|assistant|>` ending a reply (TF_GLM_ASSISTANT_ENDS, patch 0075: the model sometimes started a second answer
+    /// with it, and the raw token reached the reply's text, issue #60).
+    pub fn applyRecipe(t: *HfText, r: @import("recipe.zig").Recipe) Allocator.Error!void {
+        t.effort_tail = r.effort_tail;
+        t.clear_thinking = r.clear_thinking;
+        // a special added token of the checkpoint's tokenizer (`assistant_end` of weights.py), not any vocabulary entry
+        if (r.assistant_ends) if (if (t.tok.specials.contains("<|assistant|>")) t.tok.specialTokenId("<|assistant|>") else null) |id| {
+            if (std.mem.indexOfScalar(u32, t.eos, id) == null) t.eos = try std.mem.concat(t.arena.allocator(), u32, &.{ t.eos, &.{id} });
+        };
     }
 
     pub fn deinit(t: *HfText) void {
@@ -122,7 +162,8 @@ pub const HfText = struct {
         return .{ .object = out };
     }
 
-    /// Model end ids plus the tokenizer's chat end, when both are declared.
+    /// config.json's eos_token_id (one or a list) and the tokenizer's eos_token, as Python's tokenizer wrapper
+    /// stops on both (Qwen3.8 Flash Next: config 248044 <|endoftext|>, tokenizer 248046 <|im_end|>).
     fn eosIds(t: *HfText, a: Allocator, model_config: std.json.Value, config: std.json.Value) ![]const u32 {
         var out: std.ArrayList(u32) = .empty;
         if (model_config == .object) {
@@ -270,6 +311,9 @@ pub const HfText = struct {
             var it = t.specials.object.iterator();
             while (it.next()) |e| try context.put(a, e.key_ptr.*, e.value_ptr.*);
         }
+        // earlier turns keep their reasoning unless the request (chat_template_kwargs) or TF_GLM_CLEAR_THINKING says
+        // otherwise, as in zai-org's current template; a request's own switch wins
+        if (t.glm or options.clear_thinking != null) try context.put(a, "clear_thinking", .{ .bool = options.clear_thinking orelse t.clear_thinking });
         try context.put(a, "enable_thinking", .{ .bool = options.enable_thinking });
         try context.put(a, "thinking_mode", .{ .string = if (options.enable_thinking) "thinking" else "chat" });
         if (options.reasoning_effort) |e| try context.put(a, "reasoning_effort", .{ .string = e });
@@ -280,7 +324,12 @@ pub const HfText = struct {
             problem.* = diag.msg;
             return error.Template;
         };
-        return out;
+        if (!t.glm) return out;
+        const prompts = @import("glm_prompts.zig");
+        // TF_GLM_EFFORT_TAIL=1 (issue #93): the effort line goes last, not first; then thinking off, as ThinkingOffTemplate
+        const placed = if (t.effort_tail) try prompts.effortToTail(a, out, options.enable_thinking) else out;
+        if (!options.enable_thinking) return prompts.thinkingOff(a, placed);
+        return placed;
     }
 };
 
@@ -366,4 +415,47 @@ test "explicit template overrides checkpoint templates including tool prompts an
     const empty = try HfText.load(gpa, io, dir, path, a, &problem);
     defer empty.deinit();
     try std.testing.expectError(error.Template, empty.text().render(a, messages, .{}, &problem));
+}
+
+test "TF_GLM_ASSISTANT_ENDS: <|assistant|> ends a reply beside the checkpoint's end tokens (0075)" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data =
+        \\{"model":{"type":"BPE","vocab":{"H":0,"<|endoftext|>":1,"<|user|>":2,"<|assistant|>":3,"<|plain|>":4},"merges":[]},"added_tokens":[{"id":1,"content":"<|endoftext|>","special":true},{"id":2,"content":"<|user|>","special":true},{"id":3,"content":"<|assistant|>","special":true},{"id":4,"content":"<|plain|>","special":false}]}
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer_config.json", .data = "{\"chat_template\":\"x\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"glm5_next\",\"eos_token_id\":[1,2]}" });
+    const dir = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var problem: []const u8 = "";
+    const on = try HfText.load(gpa, io, dir, null, a, &problem);
+    defer on.deinit();
+    try std.testing.expect(on.glm);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, on.eos);
+    try on.applyRecipe(.{ .glm = true });
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, on.eos); // the role token ends a reply too
+    try on.applyRecipe(.{ .glm = true }); // once
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2, 3 }, on.eos);
+    const off = try HfText.load(gpa, io, dir, null, a, &problem);
+    defer off.deinit();
+    try off.applyRecipe(.{ .glm = true, .assistant_ends = false, .effort_tail = true, .clear_thinking = true });
+    try std.testing.expectEqualSlices(u32, &.{ 1, 2 }, off.eos); // TF_GLM_ASSISTANT_ENDS=0 keeps the checkpoint's
+    try std.testing.expect(off.effort_tail and off.clear_thinking);
+}
+
+test "the media branch of GLM's template is swapped for the picture and clip markers" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const source = "x{%- set media_type = item.type -%}" ++ no_media ++ "y";
+    const out = (try swapMedia(a, source)).?;
+    try std.testing.expect(std.mem.indexOf(u8, out, "<|begin_of_image|><|image|><|end_of_image|>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "item.tf_mark is defined") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "{%- endif -%}y"));
+    try std.testing.expect((try swapMedia(a, "no media branch")) == null);
+    try std.testing.expect((try swapMedia(a, source ++ no_media)) == null);
 }

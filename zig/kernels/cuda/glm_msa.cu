@@ -1,0 +1,310 @@
+// Port of families/glm5_next/cuda/msa.cu (msa.cpp / msa.py: TF_GLM_MSA=1) of the Python reference (TensorFold v0.6.0 +
+// the GLM-5.3 recipe's patches) to TensorFold's Zig CUDA runtime: the device code is the original's, character for
+// character (same arithmetic order, same bits); the torch extension glue is replaced by the plain launch interface
+// zig/src/families/glm_cuda/cuda_mla.zig drives. Below, the original's header.
+//
+// Mia's sparse attention for GLM-5.3-Flash's prompt rows (TF_GLM_MSA=1): each row's absorbed queries [H, 512] over
+// its selected tokens of the 512-wide FP8 latent cache (TF_GLM_KV=fp8, kv8's rows), straight to the output. By Mia's AI
+// Lab (Apache-2.0); adapted from the GLM-5.3 recipe's kernel 2 (msa2.cu) to Flash's latent (no rotary part) and to
+// 17-32 heads a rank.
+//
+// One block a row. The heads are the mma's M in m16 tiles: one tile up to 16 heads (TP=4: 4 warps), two up to 32
+// (TP=2, TP=3: 8 warps), so a key tile is read and converted once for every head of the row. Warp w owns latent
+// columns 128 (w % 4) .. 128 (w % 4) + 127 of m tile w / 4 (heads 16 (w / 4) ..):
+//   - a tile's keys (16, in list order) are loaded one tile ahead into registers (ld.global) and converted to bf16
+//     (code x the row's power-of-two scale, exact in bf16) into the column group's shared region; with two m
+//     tiles the group's two warps each convert half the keys into a double-buffered region and meet at a barrier of
+//     the pair, so no other warp ever waits on those columns;
+//   - QK: the warp's 8 k steps of its m tile's scores (query fragments held in registers for the whole row); the four
+//     warps of an m tile add their partial scores through shared memory in warp order (one block barrier a tile);
+//   - every warp of the m tile then runs the same online softmax on the summed scores (the same m and l in each) and
+//     its 128 output columns of O += P V.
+// A row's bits depend on its query, its token list and the cache only: any chunking, any block of rows, any rank.
+
+#include <stdint.h>
+#include <cuda_bf16.h>
+#include <cuda_fp16.h>
+#include <cuda_fp8.h>
+
+namespace tf_glm_msa {
+
+constexpr int LW = 512;                       // latent values a key
+constexpr int KT = 16;                        // keys a tile
+constexpr int WC = 128;                       // latent columns a warp
+constexpr int KROW = WC + 8;                  // a key's row in a column group's region (halves; 272 B: ldmatrix
+                                              // conflict-free)
+constexpr int CROW8 = LW + 16;                // an FP8 cache row: codes, fp32 scale, zeros (kv8)
+constexpr int SPL = KT / 8 * 4;               // partial scores a lane (8)
+
+template <int MT>
+struct Shape {
+    static constexpr int NW = 4 * MT;                                         // warps
+    static constexpr int NT = NW * 32;
+    static constexpr int KB = MT;                                             // key buffers a column group
+    static constexpr int COLS = WC * KT / 32 / MT;                            // columns a lane converts (64, 32)
+    static constexpr size_t SM_K = 0;                                         // [4][KB][KT][KROW] bf16 keys
+    static constexpr size_t SM_S = SM_K + (size_t)4 * KB * KT * KROW * 2;     // [2][NW][32][SPL] fp32 partials
+    static constexpr size_t SMEM = SM_S + (size_t)2 * NW * 32 * SPL * 4;
+};
+
+__device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+__device__ __forceinline__ void ldsm_x4_t(uint32_t (&r)[4], const void* p) {
+    const unsigned s = (unsigned)__cvta_generic_to_shared(p);
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3]) : "r"(s));
+}
+__device__ __forceinline__ void mma_bf16(float (&d)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, "
+                 "{%0,%1,%2,%3};\n"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ float ex2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;\n" : "=f"(y) : "f"(x));
+    return y;
+}
+__device__ __forceinline__ uint32_t pack_bf16(float a, float b) {
+    const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+    return *reinterpret_cast<const uint32_t*>(&v);
+}
+// two e4m3 codes (low byte first) times a power of two s as a bf16 pair (exact)
+__device__ __forceinline__ uint32_t e4m3x2_bf16x2(uint32_t c, float s) {
+    __half2_raw hr = __nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t)(c & 0xffffu), __NV_E4M3);
+    const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&hr));
+    return pack_bf16(f.x * s, f.y * s);
+}
+// the pair barrier of column group g (two m tiles: its two warps, 64 threads; ids 1-4, 0 is __syncthreads')
+__device__ __forceinline__ void pair_sync(int g) { asm volatile("bar.sync %0, 64;\n" :: "r"(g + 1) : "memory"); }
+
+// a lane's raw bytes of one tile: its key's COLS e4m3 codes of the warp's column group and the row's scale
+template <int MT>
+struct Raw {
+    static constexpr int N = Shape<MT>::COLS / 16;                                // 16-byte words
+    uint4 c[N];
+    float rs;
+};
+
+// the lane's key in a tile and its first column in the group: one m tile, 16 keys x 2 halves; two, each warp of the
+// pair 8 keys (8 mt ..) x 4 quarters
+template <int MT>
+__device__ __forceinline__ int lane_key(int lane, int mt) { return MT == 1 ? lane >> 1 : 8 * mt + (lane >> 2); }
+template <int MT>
+__device__ __forceinline__ int lane_col(int lane) { return MT == 1 ? 64 * (lane & 1) : 32 * (lane & 3); }
+
+template <int MT>
+__device__ __forceinline__ void load_raw(Raw<MT>& x, const uint8_t* __restrict__ cache, int tok, int col) {
+    if (tok < 0) {
+#pragma unroll
+        for (int i = 0; i < Raw<MT>::N; ++i) x.c[i] = make_uint4(0u, 0u, 0u, 0u);
+        x.rs = 0.f;
+        return;
+    }
+    const uint8_t* row = cache + (long long)tok * CROW8;
+    const uint4* src = reinterpret_cast<const uint4*>(row + col);
+#pragma unroll
+    for (int i = 0; i < Raw<MT>::N; ++i) x.c[i] = __ldg(src + i);
+    x.rs = __ldg(reinterpret_cast<const float*>(row + LW));
+}
+
+// the lane's codes as bf16 values (code x row scale, exact) into its key's row of the group region
+template <int MT>
+__device__ __forceinline__ void convert(const Raw<MT>& x, __nv_bfloat16* __restrict__ krow) {
+#pragma unroll
+    for (int i = 0; i < Raw<MT>::N; ++i) {
+        const uint32_t wd[4] = {x.c[i].x, x.c[i].y, x.c[i].z, x.c[i].w};
+        uint32_t o[8];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            o[2 * j] = e4m3x2_bf16x2(wd[j], x.rs);
+            o[2 * j + 1] = e4m3x2_bf16x2(wd[j] >> 16, x.rs);
+        }
+        *reinterpret_cast<uint4*>(krow + 16 * i) = make_uint4(o[0], o[1], o[2], o[3]);
+        *reinterpret_cast<uint4*>(krow + 16 * i + 8) = make_uint4(o[4], o[5], o[6], o[7]);
+    }
+}
+
+// one tile of KT keys at t0: convert the lane's raw bytes (then load the next tile's into them: in flight while this
+// one computes), the warp's partial scores, their sum over the m tile's warps, the online softmax and the warp's
+// columns of O += P V
+template <int MT>
+__device__ __forceinline__ void tile(Raw<MT>& raw, int t0, int n, const int* __restrict__ toks,
+                                     const uint8_t* __restrict__ cache, __nv_bfloat16* Kg, float* Sp,
+                                     const uint32_t (&qf)[8][4], int& tok_next, int& buf, float (&o)[16][4],
+                                     float& m0, float& m1, float& l0, float& l1, float sl2) {
+    using S = Shape<MT>;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, t = lane & 3;
+    const int grp = warp & 3, mt = warp >> 2;
+    const int kb = MT == 1 ? 0 : (t0 / KT) & 1;                     // the group's key buffer of this tile
+    __nv_bfloat16* Kw = Kg + (size_t)kb * KT * KROW;
+    const int lk = lane_key<MT>(lane, mt), lc = lane_col<MT>(lane);
+    convert<MT>(raw, Kw + (size_t)lk * KROW + lc);
+    if constexpr (MT == 1)
+        __syncwarp();
+    else
+        pair_sync(grp);
+    if (t0 + KT < n) load_raw<MT>(raw, cache, tok_next, WC * grp + lc);
+    tok_next = t0 + 2 * KT + lk < n ? __ldg(toks + t0 + 2 * KT + lk) : -1;
+
+    // the warp's partial scores: its m tile's 16 heads x 16 keys over its 8 k steps (two chains a key n tile)
+    const __nv_bfloat16* bq = Kw + (size_t)((lane & 7) + ((lane >> 4) & 1) * 8) * KROW + ((lane >> 3) & 1) * 8;
+    const __nv_bfloat16* bv = Kw + (size_t)(lane & 15) * KROW + (lane >> 4) * 8;
+    float acc[2][2][4] = {};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        uint32_t b[4];
+        ldsm_x4(b, bq + 16 * i);
+        mma_bf16(acc[0][i & 1], qf[i], b[0], b[1]);
+        mma_bf16(acc[1][i & 1], qf[i], b[2], b[3]);
+    }
+    float* mine = Sp + ((size_t)(buf * S::NW + warp) * 32 + lane) * SPL;
+    *reinterpret_cast<float4*>(mine) = make_float4(acc[0][0][0] + acc[0][1][0], acc[0][0][1] + acc[0][1][1],
+                                                   acc[0][0][2] + acc[0][1][2], acc[0][0][3] + acc[0][1][3]);
+    *reinterpret_cast<float4*>(mine + 4) = make_float4(acc[1][0][0] + acc[1][1][0], acc[1][0][1] + acc[1][1][1],
+                                                       acc[1][0][2] + acc[1][1][2], acc[1][0][3] + acc[1][1][3]);
+    __syncthreads();
+    // the scores: the m tile's four warps' partials in warp order (each of them the same sums); the buffer of the
+    // tile after next is this one again, written after the next barrier, which every warp passes after these reads
+    float s[2][4];
+    {
+        const float* base = Sp + ((size_t)(buf * S::NW + 4 * mt) * 32 + lane) * SPL;
+        float4 a0 = *reinterpret_cast<const float4*>(base), a1 = *reinterpret_cast<const float4*>(base + 4);
+#pragma unroll
+        for (int v = 1; v < 4; ++v) {
+            const float4 b0 = *reinterpret_cast<const float4*>(base + (size_t)v * 32 * SPL);
+            const float4 b1 = *reinterpret_cast<const float4*>(base + (size_t)v * 32 * SPL + 4);
+            a0.x += b0.x; a0.y += b0.y; a0.z += b0.z; a0.w += b0.w;
+            a1.x += b1.x; a1.y += b1.y; a1.z += b1.z; a1.w += b1.w;
+        }
+        s[0][0] = a0.x; s[0][1] = a0.y; s[0][2] = a0.z; s[0][3] = a0.w;
+        s[1][0] = a1.x; s[1][1] = a1.y; s[1][2] = a1.z; s[1][3] = a1.w;
+    }
+    buf ^= 1;
+    // online softmax (log2 domain): keys 8 j + 2 t (+ 1) of the tile; c0, c1 head g, c2, c3 head g + 8
+    float mx0 = -INFINITY, mx1 = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 2; ++j)
+#pragma unroll
+        for (int q = 0; q < 4; ++q) {
+            const bool ok = t0 + 8 * j + 2 * t + (q & 1) < n;
+            s[j][q] = ok ? s[j][q] * sl2 : -INFINITY;
+            if (q < 2) mx0 = fmaxf(mx0, s[j][q]);
+            else mx1 = fmaxf(mx1, s[j][q]);
+        }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 1));
+    mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(0xffffffffu, mx1, 2));
+    const float n0 = fmaxf(m0, mx0), n1 = fmaxf(m1, mx1);      // finite: the tile's first key is in the list
+    const float al0 = ex2(m0 - n0), al1 = ex2(m1 - n1);        // 0 at the first tile (m = -inf), 1 if no new max
+    m0 = n0;
+    m1 = n1;
+    float p[2][4];
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        p[j][0] = ex2(s[j][0] - n0);
+        p[j][1] = ex2(s[j][1] - n0);
+        p[j][2] = ex2(s[j][2] - n1);
+        p[j][3] = ex2(s[j][3] - n1);
+    }
+    float ps0 = ((p[0][0] + p[0][1]) + p[1][0]) + p[1][1];
+    float ps1 = ((p[0][2] + p[0][3]) + p[1][2]) + p[1][3];
+    ps0 += __shfl_xor_sync(0xffffffffu, ps0, 1);
+    ps1 += __shfl_xor_sync(0xffffffffu, ps1, 1);
+    ps0 += __shfl_xor_sync(0xffffffffu, ps0, 2);
+    ps1 += __shfl_xor_sync(0xffffffffu, ps1, 2);
+    l0 = l0 * al0 + ps0;
+    l1 = l1 * al1 + ps1;
+    const uint32_t pa[4] = {pack_bf16(p[0][0], p[0][1]), pack_bf16(p[0][2], p[0][3]), pack_bf16(p[1][0], p[1][1]),
+                            pack_bf16(p[1][2], p[1][3])};
+    // O = O alpha + P V over the warp's 128 columns (O alpha skipped when every alpha of the warp is 1: x 1 is exact)
+    if (__any_sync(0xffffffffu, al0 != 1.f || al1 != 1.f)) {
+#pragma unroll
+        for (int b = 0; b < 16; ++b) {
+            o[b][0] *= al0;
+            o[b][1] *= al0;
+            o[b][2] *= al1;
+            o[b][3] *= al1;
+        }
+    }
+#pragma unroll
+    for (int b = 0; b < 8; ++b) {
+        uint32_t v[4];
+        ldsm_x4_t(v, bv + 16 * b);
+        mma_bf16(o[2 * b], pa, v[0], v[1]);
+        mma_bf16(o[2 * b + 1], pa, v[2], v[3]);
+    }
+}
+
+template <int MT>
+__global__ void __launch_bounds__(Shape<MT>::NT, MT == 1 ? 3 : 1) msa_kernel(
+    const __nv_bfloat16* __restrict__ qa, const uint8_t* __restrict__ cache, const int* __restrict__ tokens,
+    const int* __restrict__ counts, __nv_bfloat16* __restrict__ out, int H, int W, float scale) {
+    using S = Shape<MT>;
+    extern __shared__ __align__(16) unsigned char smem[];
+    const int r = blockIdx.x;
+    const int n = counts[r];
+    if (n <= 0) return;                            // rows without a sparse count are left alone
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int grp = warp & 3, mt = warp >> 2;
+    __nv_bfloat16* Kg = reinterpret_cast<__nv_bfloat16*>(smem + S::SM_K) + (size_t)grp * S::KB * KT * KROW;
+    float* Sp = reinterpret_cast<float*>(smem + S::SM_S);
+    const int* toks = tokens + (size_t)r * W;
+    const int lk = lane_key<MT>(lane, mt), lc = lane_col<MT>(lane);
+
+    Raw<MT> raw;
+    load_raw<MT>(raw, cache, lk < n ? __ldg(toks + lk) : -1, WC * grp + lc);
+    int tok_next = KT + lk < n ? __ldg(toks + KT + lk) : -1;
+
+    // the query fragments (A, m16 x k16, rows = the m tile's heads; heads >= H zero) of the warp's 8 k steps: latent
+    // columns 128 grp + 16 i
+    uint32_t qf[8][4];
+    const int h0 = 16 * mt + g, h1 = h0 + 8;
+    {
+        const bool ok0 = h0 < H, ok1 = h1 < H;
+        const uint32_t* q0 = reinterpret_cast<const uint32_t*>(qa + ((size_t)r * H + h0) * LW + WC * grp + 2 * t);
+        const uint32_t* q1 = reinterpret_cast<const uint32_t*>(qa + ((size_t)r * H + h1) * LW + WC * grp + 2 * t);
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            qf[i][0] = ok0 ? __ldg(q0 + 8 * i) : 0u;
+            qf[i][1] = ok1 ? __ldg(q1 + 8 * i) : 0u;
+            qf[i][2] = ok0 ? __ldg(q0 + 8 * i + 4) : 0u;
+            qf[i][3] = ok1 ? __ldg(q1 + 8 * i + 4) : 0u;
+        }
+    }
+
+    float o[16][4];
+#pragma unroll
+    for (int b = 0; b < 16; ++b)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) o[b][c] = 0.f;
+    float m0 = -INFINITY, m1 = -INFINITY, l0 = 0.f, l1 = 0.f;      // rows g, g + 8 of the m tile (log2 domain)
+    const float sl2 = scale * 1.4426950408889634f;
+
+    int buf = 0;
+    for (int t0 = 0; t0 < n; t0 += KT)
+        tile<MT>(raw, t0, n, toks, cache, Kg, Sp, qf, tok_next, buf, o, m0, m1, l0, l1, sl2);
+    // out = O / l (bf16, heads < H)
+#pragma unroll
+    for (int b = 0; b < 16; ++b) {
+        const int col = WC * grp + 8 * b + 2 * t;
+        if (h0 < H)
+            *reinterpret_cast<uint32_t*>(out + ((size_t)r * H + h0) * LW + col) = pack_bf16(o[b][0] / l0, o[b][1] / l0);
+        if (h1 < H)
+            *reinterpret_cast<uint32_t*>(out + ((size_t)r * H + h1) * LW + col) = pack_bf16(o[b][2] / l1, o[b][3] / l1);
+    }
+}
+
+// The torch glue of the original (launch<MT>, msa_prompt_cuda) is the host's: zig/src/families/glm_cuda/cuda_mla.zig
+// resolves these two instantiations (cuobjdump -symbols), opts each into Shape<MT>::SMEM dynamic shared memory and
+// launches grid R, block Shape<MT>::NT: MT = 1 for up to 16 heads a rank, MT = 2 for 17 to 32.
+template __global__ void msa_kernel<1>(const __nv_bfloat16*, const uint8_t*, const int*, const int*, __nv_bfloat16*,
+                                       int, int, float);
+template __global__ void msa_kernel<2>(const __nv_bfloat16*, const uint8_t*, const int*, const int*, __nv_bfloat16*,
+                                       int, int, float);
+
+}  // namespace tf_glm_msa

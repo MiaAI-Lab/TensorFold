@@ -37,8 +37,26 @@ pub fn opened(e: *Engine, s: *Stream) !void {
     const drawn = try e.drawFirst(s, position);
     var feed: Feed = .{ .handle = drawn };
     if (try e.forcedNext(s)) |t| feed = .{ .value = t };
+    if (s.gateWatching() and feed == .handle) { // the call gate reads the first draw: a reply that skips the opener opens it
+        const drawn_token = try e.backend.read(drawn);
+        if (s.gateCut(&.{drawn_token}) != null) {
+            // The opener replaces the draw. Python's generate_gated then prefills the prompt plus that fix;
+            // decoding the opener on this cache samples the next token from a different kernel.
+            const value = s.gate.?.spec.opener;
+            _ = try s.commit(e.gpa, &.{value}, &.{});
+            s.pending = value;
+            s.reprefill = !s.finished;
+            try trail.resolve(e);
+            if (s.finished) {
+                try trail.finish(e, s);
+                e.release(s);
+            }
+            return;
+        }
+        feed = .{ .value = drawn_token };
+    }
     var asked: ?u32 = null;
-    if (e.cfg.family_mtp and s.drafts) {
+    if (e.cfg.family_mtp and s.drafts and !e.cfg.join_batch) {
         // the head reads the prompt's last row and the first token, and drafts the one after it
         const d: u32 = @intCast(try e.rule.depth(win.who(s)));
         asked = d;
@@ -48,11 +66,16 @@ pub fn opened(e: *Engine, s: *Stream) !void {
         if (e.backend.vtable.tree) |tree| if (try tree(e.backend.ptr, s, e.gpa)) |held| {
             s.next = held; // a tree head's first drafts as host tokens, as every later round's
         };
-    } else if (e.cfg.pipelined and s.logprobs == null and s.grammar == null) {
+    } else if (!(e.cfg.family_mtp and s.drafts) and e.cfg.pipelined and s.logprobs == null and s.grammar == null and !s.gateWatching()) {
         try e.queueNext(s, feed);
     }
     const value = try e.readFeed(feed);
     if (asked) |d| try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(d)), f("position", int(position + 1)), f("follow", .{ .u32s = &.{value} }), f("rows", .null) });
+    if (e.cfg.family_mtp and s.drafts and e.cfg.join_batch) {
+        // the first token goes out now; its first drafts come with the next round's other joiners (joinDrafts)
+        s.dropHeld(e.gpa);
+        s.join_draft = true;
+    }
     if (e.log != null) {
         const first = if (feed == .handle) value else try e.backend.read(drawn);
         try trail.event(e, &.{ f("ev", str("first")), f("stream", str(s.id)), f("position", int(position)), f("drawn", int(first)), f("token", int(value)) });

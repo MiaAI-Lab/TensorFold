@@ -1,11 +1,12 @@
 //! Bounded request bodies, fixed-length or chunked, refused as the Python server refuses them.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const Conn = @import("http_conn.zig").Conn;
 const Allocator = std.mem.Allocator;
 
-pub const limit = 32 * 1024 * 1024;
+/// 32 MiB; 96 MiB with --vision (base64 data URLs are a third larger than the files)
+pub var limit: usize = 32 * 1024 * 1024;
 const metadata_limit = 65536;
 
 /// A body, or the refusal a RequestError carries (the connection then closes).
@@ -138,7 +139,17 @@ fn trailerName(line: []const u8) bool {
 
 /// The body as JSON (an empty body reads as ``{}``): a framing refusal, or the decoder's message as another exception.
 pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
-    const raw = switch (try read(conn, cx.a, limit)) {
+    return readJsonUpTo(conn, cx, limit);
+}
+
+/// The chat routes' cap: 96 MiB under the GLM recipe (patch 0094: up to 50 pictures or 4 clips as data URLs, tool results'
+/// among them), 32 MiB otherwise.
+pub fn chatLimit(glm: bool) usize {
+    return if (glm) 96 * 1024 * 1024 else limit;
+}
+
+pub fn readJsonUpTo(conn: *Conn, cx: *errors.Cx, max: usize) errors.Refused!json.Value {
+    const raw = switch (try read(conn, cx.a, max)) {
         .ok => |b| b,
         .refused => |message| return cx.refuse(message),
     };
@@ -146,4 +157,9 @@ pub fn readJson(conn: *Conn, cx: *errors.Cx) errors.Refused!json.Value {
         .ok => |v| v,
         .err => |message| cx.other(message),
     };
+}
+
+test "the chat routes' body cap is the recipe's 96 MiB, others 32 MiB" {
+    try std.testing.expectEqual(@as(usize, 96 << 20), chatLimit(true));
+    try std.testing.expectEqual(@as(usize, 32 << 20), chatLimit(false));
 }

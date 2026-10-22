@@ -5,6 +5,9 @@ const Shape = @import("shape.zig").Shape;
 const Held = @import("stream.zig").Held;
 const Row = @import("logprob.zig").Row;
 
+/// A filling stream's state after a fill_step.
+pub const FillState = enum { filling, done, cancelled };
+
 /// A token to feed: one the backend drew and holds (a handle), or a host value (forced or pending).
 pub const Feed = union(enum) { handle: u64, value: u32 };
 
@@ -100,6 +103,18 @@ pub const Backend = struct {
         held: ?*const fn (ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void = null,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
+        /// Incremental prompt fills (prefill_begin and fill_step), both or neither (null: `prefill` runs a whole prompt at
+        /// admission). Start the
+        /// stream's prompt pass (its admission and caches) without running it.
+        prefill_begin: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
+        /// One slice of every filling stream's prompt pass, between rounds (prompts may share a pass): each one's
+        /// state after it (`done`: its prompt is in and `first` draws its first token; `cancelled`: its request
+        /// was cancelled, the backend stopped its pass). An error fails every filling stream.
+        fill_step: ?*const fn (ptr: *anyopaque, streams: []const *Stream, states: []FillState) anyerror!void = null,
+        /// Prefill several streams' prompts together (a burst admitted at once: prompts may share one pass), each as
+        /// `prefill` does it, ending at the same state; the core then joins each. `error.BurstRefused`: nothing ran
+        /// (a stream was refused or the burst does not fit one pass), prefill them one at a time.
+        prefill_many: ?*const fn (ptr: *anyopaque, streams: []const *Stream) anyerror!void = null,
     };
 
     pub fn prefill(b: Backend, s: *Stream) !void {

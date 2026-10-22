@@ -1,13 +1,16 @@
 //! ``tensorfold-native``: ``capabilities --json`` for the Python switch, and ``serve MODEL [flags]`` with no Python.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const cli = @import("cli.zig");
 const log = @import("log.zig");
 const hub = @import("hub.zig");
 const engines = @import("engines.zig");
 const serve = @import("serve.zig");
 const hf_text = @import("hf_text.zig");
+const vision = @import("vision_helper.zig");
+const vision_server = @import("vision_server.zig");
 const startup = @import("startup.zig");
+const recipe = @import("recipe.zig");
 const checkpoint_cli = @import("checkpoint_cli");
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE] [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard] [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB] [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB] [--max-tokens MAX_TOKENS] [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}] [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER] [--drafter-bits {0,4}] [--keep-warm SECONDS] [--compact-at COMPACT_AT] [--compact-keep COMPACT_KEEP] [--compact-memory COMPACT_MEMORY] [--slide] [--slide-graph SLIDE_GRAPH] [--parallel PARALLEL] [--no-update-check] [--backend {auto,mlx,cuda}] [--device DEVICE] [--segments SEGMENTS] model\n";
@@ -66,6 +69,28 @@ pub fn main(init: std.process.Init) !u8 {
         if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
         return 0;
     }
+    // the GLM recipe's TF_GLM_* switches: a typo fails here, before the weights load
+    var recipe_cfg: recipe.Recipe = .{};
+    if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5")) {
+        recipe_cfg = recipe.Recipe.parse(a, init.environ_map, &problem) catch |e| switch (e) {
+            error.Invalid => return fail(problem),
+            error.OutOfMemory => return e,
+        };
+        recipe_cfg.glm = true;
+    }
+    hf_text.media_template = args.vision;
+    // --vision (rank 0): the frontend, and for the python backend the helper, which loads and warms its tower on this GPU
+    // before the engine reads its memory budget, so the tower and the helper's context stay outside the caches' share
+    var vis: ?*vision_server.Vision = null;
+    defer if (vis) |x| x.stop(io);
+    if (args.vision) {
+        const backend: vision_server.Backend = if (std.mem.eql(u8, args.vision_backend, "zig")) .zig else .python;
+        vis = vision_server.Vision.start(gpa, io, backend, args.vision_urls, imageTokenId(a, io, dir), if (args.vision_max_images) |n| @intCast(n) else null, if (args.vision_image_tokens) |n| @intCast(n) else null, &problem) catch return fail(problem);
+        if (backend == .python) {
+            const lim = vis.?.fe.opts.limits;
+            vis.?.helper = vision.Helper.start(gpa, io, dir, .{ .allow_urls = args.vision_urls, .max_images = lim.max_images, .image_tokens = lim.image_tokens }, init.environ_map, &problem) catch return fail(problem);
+        }
+    }
     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
     defer text_arena.deinit();
     var text_problem: []const u8 = "";
@@ -76,6 +101,7 @@ pub fn main(init: std.process.Init) !u8 {
     } orelse return fail(problem);
     defer up.text.deinit();
     defer up.engine.close(up.engine.ctx);
+    if (recipe_cfg.glm) try up.text.applyRecipe(recipe_cfg);
     return serve.run(gpa, io, args, .{
         .engine = up.engine.engine,
         .text = up.text.text(),
@@ -83,7 +109,9 @@ pub fn main(init: std.process.Init) !u8 {
         .model_dir = dir,
         .sampling = try sampling(a, io, dir, args),
         .environ = init.environ_map,
+        .recipe = recipe_cfg,
         .started = started,
+        .vision = vis,
     });
 }
 
@@ -127,4 +155,14 @@ fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args) !
     if (args.top_k) |t| try out.put(a, "top_k", try json.intValue(a, t));
     if (args.min_p) |t| try out.put(a, "min_p", .{ .float = t });
     return if (out.count() > 0) json.Value{ .object = out } else null;
+}
+
+/// config.json's image_token_id (the picture placeholder), 154854 for GLM-5.3-Flash.
+fn imageTokenId(a: std.mem.Allocator, io: std.Io, dir: []const u8) u32 {
+    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return 154854;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return 154854;
+    const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return 154854;
+    if (doc != .object) return 154854;
+    const t = doc.object.get("image_token_id") orelse return 154854;
+    return if (t == .integer and t.integer > 0) @intCast(t.integer) else 154854;
 }

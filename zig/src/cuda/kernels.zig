@@ -37,6 +37,23 @@ pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_point
 pub const torch_indexing: []const u8 = if (available) &Blob("fatbin_torch_indexing").bytes else &.{};
 pub const torch_movement: []const u8 = if (available) &Blob("fatbin_torch_movement").bytes else &.{};
 pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_torch_nemotron_constants").bytes else &.{};
+pub const fn_gdn: []const u8 = if (available) &Blob("fatbin_fn_gdn").bytes else &.{};
+pub const fn_gdn_io: []const u8 = if (available) &Blob("fatbin_fn_gdn_io").bytes else &.{};
+pub const fn_gdn_prefill: []const u8 = if (available) &Blob("fatbin_fn_gdn_prefill").bytes else &.{};
+pub const fn_gdn_tree: []const u8 = if (available) &Blob("fatbin_fn_gdn_tree").bytes else &.{};
+pub const fn_nvfp4_experts: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_experts").bytes else &.{};
+pub const fn_qmm: []const u8 = if (available) &Blob("fatbin_fn_qmm").bytes else &.{};
+pub const fn_qmm_prefill: []const u8 = if (available) &Blob("fatbin_fn_qmm_prefill").bytes else &.{};
+pub const fn_pack: []const u8 = if (available) &Blob("fatbin_fn_pack").bytes else &.{};
+pub const torch_fn_ops: []const u8 = if (available) &Blob("fatbin_torch_fn_ops").bytes else &.{};
+pub const glm_msa: []const u8 = if (available) &Blob("fatbin_glm_msa").bytes else &.{};
+pub const torch_fn_logsumexp: []const u8 = if (available) &Blob("fatbin_torch_fn_logsumexp").bytes else &.{};
+pub const fn_experts_prompt: []const u8 = if (available) &Blob("fatbin_fn_experts_prompt").bytes else &.{};
+pub const fn_qmmf: []const u8 = if (available) &Blob("fatbin_fn_qmmf").bytes else &.{};
+pub const fn_int4: []const u8 = if (available) &Blob("fatbin_fn_int4").bytes else &.{};
+pub const fn_qmm_cluster: []const u8 = if (available) &Blob("fatbin_fn_qmm_cluster").bytes else &.{};
+pub const fn_roce: []const u8 = if (available) &Blob("fatbin_fn_roce").bytes else &.{};
+pub const fn_nvfp4_shape: []const u8 = if (available) &Blob("fatbin_fn_nvfp4_shape").bytes else &.{};
 pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
 pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
 pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
@@ -75,3 +92,15 @@ pub fn treeVariant(slots: u32, streams: u32, major: c_int, minor: c_int, sms: c_
     if (slots <= 16) return tree(16, 2, 2, false);
     return tree(32, 2, 1, false);
 }
+
+// GLM foundations and package-owned images (TensorFold glm5_next CUDA reference).
+pub const glm_foundations: []const u8 = if (available) &Blob("fatbin_glm_foundations").bytes else &.{};
+pub const glm_kda: []const u8 = if (options.glm_kda) &Blob("fatbin_glm_kda").bytes else &.{};
+pub const glm_kda_chunk: []const u8 = if (options.glm_kda_chunk) &Blob("fatbin_glm_kda_chunk").bytes else &.{};
+pub const glm_hc: []const u8 = if (options.glm_hc) &Blob("fatbin_glm_hc").bytes else &.{};
+pub const glm_vision: []const u8 = if (options.glm_vision) &Blob("fatbin_glm_vision").bytes else &.{};
+pub const glm_exl3: []const u8 = if (options.glm_exl3) &Blob("fatbin_glm_exl3").bytes else &.{};
+pub const glm_qmm: []const u8 = if (options.glm_qmm) &Blob("fatbin_glm_qmm").bytes else &.{};
+pub const glm_qmm_prefill: []const u8 = if (options.glm_qmm_prefill) &Blob("fatbin_glm_qmm_prefill").bytes else &.{};
+
+pub const glm_ops: []const u8 = if (available) &Blob("fatbin_glm_ops").bytes else &.{};

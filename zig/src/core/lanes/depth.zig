@@ -55,6 +55,12 @@ pub const Rule = struct {
     mtp_step_ms: f64,
     plain_guard: bool,
     node_probabilities: bool,
+    /// the head stops each chain by its own rule (a running product of its draws' probabilities): every ask is the
+    /// most drafts the stream's room allows, and the head's stops are the depth (no acceptance-rate guess cuts them)
+    head_stops: bool = false,
+    /// ... while at most this many streams are live (`live`, which the round loop sets each step)
+    head_stops_most: u32 = std.math.maxInt(u32),
+    live: usize = 0,
     batch_rows: u32,
     round_ms: Table = .{}, // a round's wall time by drafts, shared by every stream
     overhead: std.ArrayList(Overhead) = .empty, // a shared round's ms past its forward, by streams (insertion order)
@@ -124,14 +130,23 @@ pub const Rule = struct {
         return modeled;
     }
 
+    /// Whether the head's own stops size the chains this step (head_stops, and few enough live streams).
+    pub fn stopsNow(r: *const Rule) bool {
+        return r.head_stops and r.live <= r.head_stops_most;
+    }
+
     /// The most expected tokens a ms, probing one depth farther every `depth_probe_every` rounds.
     pub fn depth(r: *Rule, who: Who) !i64 {
         const most = @min(@as(i64, r.most_drafts), @max(1, who.draft_room - 1));
         if (most <= 0) return 0;
+        if (r.stopsNow()) return most;
         const p = try r.rates(who);
         if (r.family_costs.empty()) {
-            const want: i64 = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
-            return @max(1, @min(most, want));
+            // GLM's CUDA server never times family rounds, so this table stays empty. The served policy is fnc7:0.3:
+            // every round asks for 7 drafts and the drafter's confidence product cuts the chain. The 1/2/3 ladder
+            // (family_depth.py, for a measured-cost engine) left a repetitive reply at about 4 tokens a round.
+            if (p.len == 0) return 1;
+            return @max(1, @min(most, 7));
         }
         var best: i64 = 1;
         var best_rate: f64 = -1.0;
@@ -188,6 +203,11 @@ pub const Rule = struct {
 
     /// Head drafts for the streams of a shared round, sized by allocation over their chain chances.
     pub fn budgets(r: *Rule, whos: []Who, probe: Probe, out: []i64) !void {
+        if (r.stopsNow()) {
+            // the head's own stops size each chain: no allocation over guessed acceptance
+            for (whos, out) |*w, *o| o.* = try r.headDepth(w, null, probe);
+            return;
+        }
         if (r.node_probabilities) {
             for (whos, out) |*w, *o| {
                 const inner = try r.headDepth(w, null, probe);

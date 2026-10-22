@@ -314,3 +314,64 @@ test "a learn step that moves the weights drops every kept state: the next turn 
     try std.testing.expectEqual(@as(?u32, 0), b2.cached);
     try std.testing.expectEqual(@as(u64, 0), store.counts.hits);
 }
+
+test "a lane host fills prompts between rounds: requests arriving together fill together, each reply its own" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa, .slice = 2 };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backendSliced(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 3 });
+    try host.start();
+    defer host.stop();
+    const Box = struct {
+        mutex: std.Io.Mutex = .init,
+        tokens: std.ArrayList(u32) = .empty,
+        prefilled: bool = false,
+        done: ?Reason = null,
+        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+            const b: *@This() = @ptrCast(@alignCast(ctx));
+            b.mutex.lockUncancelable(std.testing.io);
+            defer b.mutex.unlock(std.testing.io);
+            switch (e.*) {
+                .prefilled => b.prefilled = true,
+                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
+                .finished => |f| b.done = f.reason,
+            }
+        }
+        fn wait(b: *@This()) Reason {
+            while (true) {
+                b.mutex.lockUncancelable(std.testing.io);
+                const d = b.done;
+                b.mutex.unlock(std.testing.io);
+                if (d) |r| return r;
+                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+            }
+        }
+    };
+    const prompts = [_][]const u32{ &.{ 3, 1, 4, 1, 5, 9, 2, 6, 5, 3, 5, 8 }, &.{ 2, 7, 1, 8, 2, 8 }, &.{ 1, 6, 1, 8, 0, 3, 3, 9, 8, 8, 7, 4, 9, 8 } };
+    var boxes: [3]Box = .{ .{}, .{}, .{} };
+    defer for (&boxes) |*b| b.tokens.deinit(gpa);
+    var reqs: [3]Request = undefined;
+    const e = host.engine();
+    for (prompts, &reqs, 0..) |p, *r, i| {
+        r.* = .{ .prompt = p, .max_tokens = 10 + @as(u32, @intCast(i)) * 5 };
+        try e.submit(@intCast(i + 1), r, .{ .ctx = &boxes[i], .event = Box.event });
+    }
+    for (prompts, &boxes, &reqs) |p, *b, r| {
+        try std.testing.expectEqual(Reason.length, b.wait());
+        try std.testing.expect(b.prefilled);
+        try std.testing.expectEqual(@as(usize, r.max_tokens), b.tokens.items.len);
+        var history: std.ArrayList(u32) = .empty; // the fake's tokens read the whole history: any slip changes them
+        defer history.deinit(gpa);
+        try history.appendSlice(gpa, p);
+        for (b.tokens.items) |t| {
+            try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
+            try history.append(gpa, t);
+        }
+    }
+    try std.testing.expect(target.fill_steps > 0);
+}

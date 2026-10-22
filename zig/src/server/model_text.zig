@@ -1,6 +1,6 @@
 //! The tokenizer and chat template a server renders prompts and replies with (the tok and jinja branches plug in here).
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const Allocator = std.mem.Allocator;
 
 pub const RenderOptions = struct {
@@ -10,6 +10,8 @@ pub const RenderOptions = struct {
     /// Also ``thinking_mode`` ("thinking" or "chat") for templates that read that switch.
     enable_thinking: bool = false,
     reasoning_effort: ?[]const u8 = null,
+    /// A request's `chat_template_kwargs.clear_thinking`: drop earlier turns' reasoning (null: the server's default).
+    clear_thinking: ?bool = null,
 };
 
 pub const Error = error{ Template, OutOfMemory };

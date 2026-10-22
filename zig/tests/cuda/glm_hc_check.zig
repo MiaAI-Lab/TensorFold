@@ -1,0 +1,42 @@
+//! Byte check against tools/zig/glm_hc_oracle.py's actual reference Triton _hc_partial.
+const std = @import("std");
+const cuda = @import("cuda");
+const glm = @import("glm_cuda");
+const Fixture = @import("fixture.zig").Fixture;
+pub fn main(init: std.process.Init) !void {
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len != 2) return error.ExpectedFixtureDirectory;
+    var f = try Fixture.open(init.gpa, init.io, args[1]);
+    defer f.deinit();
+    const rows: usize = @intCast(try f.int("rows"));
+    if (rows < 1 or rows > 64) return error.BadRows;
+    const xraw = try f.bytes("x");
+    defer init.gpa.free(xraw);
+    const wraw = try f.bytes("fn");
+    defer init.gpa.free(wraw);
+    const expected = try f.bytes("part");
+    defer init.gpa.free(expected);
+    if (xraw.len != rows * 16384 * 2 or wraw.len != 24 * 16384 * 2 or expected.len != rows * 16 * 32 * 4) return error.BadFixture;
+    var d = try cuda.Driver.open();
+    defer d.close();
+    var ctx = try cuda.Context.init(&d, 0);
+    defer ctx.deinit();
+    var stream = try cuda.Stream.init(&d, true);
+    defer stream.deinit();
+    var hc = try glm.hc.HC.init(&d);
+    defer hc.deinit();
+    var x = try cuda.DeviceBuffer.fromHost(&d, xraw);
+    defer x.free();
+    var w = try cuda.DeviceBuffer.fromHost(&d, wraw);
+    defer w.free();
+    var out = try cuda.DeviceBuffer.alloc(&d, expected.len);
+    defer out.free();
+    try out.fill8(0, null);
+    try hc.runPartial(stream, x.ptr, w.ptr, out.ptr, rows);
+    try stream.synchronize();
+    const actual = try init.gpa.alloc(u8, expected.len);
+    defer init.gpa.free(actual);
+    try out.download(0, actual);
+    try glm.layer_check.compare(0, expected, actual);
+    std.debug.print("PASS: HC {d} rows equals reference Triton bytes\n", .{rows});
+}

@@ -38,6 +38,9 @@ pub const LaneHost = struct {
     /// A Metal engine's keepalive target, set by the family that owns the queue; null keeps the ticker off.
     keepalive_target: ?api.keepalive.Target = null,
     live_generated: u64 = 0,
+    /// the prompt cache's numbers as of its last change (status.noteKept), for /health
+    kept_view: ?pc.KeptStats = null,
+    extra_status: ?struct { ctx: *anyopaque, read: *const fn (*anyopaque, *api.Status) void } = null,
     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
     lone_job: ?*Job = null, // the job that driver holds now
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
@@ -71,7 +74,10 @@ pub const LaneHost = struct {
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request));
+            if (job.host.cache) |store| {
+                _ = store.keep(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request));
+                status.noteKept(job.host);
+            }
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -91,7 +97,18 @@ pub const LaneHost = struct {
         return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
     }
 
+    /// The lane core's word that a filling prompt is in (or its fill ended): emit `prefilled`, or end the job.
+    fn filled(ptr: *anyopaque, s: *lanes.Stream, err: ?anyerror) void {
+        const h: *LaneHost = @ptrCast(@alignCast(ptr));
+        const job: *Job = @alignCast(@fieldParentPtr("stream", s));
+        const e = err orelse return h.prefilled(job, job.began); // the run loop delivers its tokens
+        if (e == error.Cancelled) {
+            _ = h.cancel(job);
+        } else _ = h.drop(job, @errorName(e));
+    }
+
     pub fn start(h: *LaneHost) !void {
+        h.core.fill_hook = .{ .ptr = h, .done = filled };
         h.thread = try std.Thread.spawn(.{ .stack_size = 16 << 20 }, run, .{h});
     }
 
@@ -267,37 +284,41 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
-    fn admitOne(h: *LaneHost) bool {
+    const Prep = union(enum) { none, dropped, job: *Job };
+
+    /// Takes the next queued request into a free lane and builds its stream, not yet prefilled: `none` when none waits
+    /// or no lane is free, `dropped` when it ended here.
+    fn admitPrepare(h: *LaneHost) Prep {
         h.lock();
         if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
-            return false;
+            return .none;
         }
         if (h.info_.admit) |a| { // a shared cache pool: the next request waits for room (always there when idle)
             const r = h.queued.items[0].request;
             if (h.core.activeCount() > 0 and !a.fits(a.ctx, @intCast(r.prompt.len), r.max_tokens)) {
                 h.unlock();
-                return false;
+                return .none;
             }
         }
         const job = h.queued.orderedRemove(0);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
-            return true;
+            return .dropped;
         };
         h.unlock();
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (store.lookupRewind(h.gpa, r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
+        // a prompt with pictures or clips is neither resumed nor kept
+        if (r.media == null) if (h.cache) |store| if (store.lookupRewind(h.gpa, r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, h.spans(r))) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.droppedJob(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -313,28 +334,147 @@ pub const LaneHost = struct {
             .think_close = r.think_close,
             .think_end = if (r.think_end) |t| t else -1,
             .logprobs = r.logprobs,
+            .call = if (r.call) |c| .{ .opener = c.opener, .think_open = if (c.think_open) |t| t else -1, .think_end = if (c.think_end) |t| t else -1, .blank = c.blank } else null,
             .loop_guard = r.loop_guard,
+            .loop_rule = if (r.loop_recipe) .recipe else .mac,
             .chunks = r.chunks,
             .history_len = r.history_len,
             .shared_prefixes = r.shared_prefixes,
             .reuse = reuse,
             .grammar = if (r.structure) |st| h.constraint(st) catch |e| {
                 job.proposer.deinit();
-                return h.drop(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
+                return h.droppedJob(job, if (e == error.OutOfMemory) "out of memory" else "the reply's grammar could not start (xgrammar)");
             } else null,
             .decode_spans = h.spans(r),
             .decide = r.decide,
+            .media = r.media,
         }) catch {
             job.proposer.deinit();
-            return h.drop(job, "out of memory");
+            return h.droppedJob(job, "out of memory");
         };
         job.started = true;
+        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        return .{ .job = job };
+    }
+
+    fn droppedJob(h: *LaneHost, job: *Job, message: []const u8) Prep {
+        _ = h.drop(job, message);
+        return .dropped;
+    }
+
+    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+    fn admitOne(h: *LaneHost) bool {
+        switch (h.admitPrepare()) {
+            .none => return false,
+            .dropped => return true,
+            .job => |job| return h.startJob(job),
+        }
+    }
+
+    /// Every request waiting for a lane, admitted now: prompts that arrive together (a burst, with no resume or kept
+    /// state to take) prefill in one backend call, where the backend can (one pass over their rows).
+    fn admitAll(h: *LaneHost) void {
+        var burst: [16]*Job = undefined;
+        var n: usize = 0;
+        while (true) switch (h.admitPrepare()) {
+            .none => break,
+            .dropped => {},
+            .job => |job| {
+                const r = job.request;
+                if (r.max_tokens == 0 or h.loneFits(job)) {
+                    _ = h.startJob(job);
+                } else if (n < burst.len and h.core.batches() and job.stream.reuse.at == 0 and
+                    job.stream.reuse.marks.len == 0 and r.media == null and r.logprobs == null and r.structure == null)
+                {
+                    burst[n] = job;
+                    n += 1;
+                } else _ = h.startJob(job);
+            },
+        };
+        h.startBurst(burst[0..n]);
+    }
+
+    /// The jobs' prompts in one backend call, then each joined and delivered in admission order; a refused burst
+    /// prefills one at a time.
+    fn startBurst(h: *LaneHost, jobs: []*Job) void {
+        if (jobs.len == 0) return;
+        if (jobs.len == 1) {
+            _ = h.startJob(jobs[0]);
+            return;
+        }
+        var ss: [16]*lanes.Stream = undefined;
         const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        job.began = began;
+        for (jobs, ss[0..jobs.len]) |job, *s| {
+            job.began = began;
+            s.* = &job.stream;
+        }
+        h.core.prefillBurst(ss[0..jobs.len]) catch |e| {
+            for (jobs) |job| {
+                if (e == error.BurstRefused) _ = h.startJob(job) else if (e == error.Cancelled) _ = h.cancel(job) else _ = h.drop(job, @errorName(e));
+            }
+            return;
+        };
+        for (jobs) |job| {
+            h.core.addPrefilled(&job.stream) catch |e| {
+                _ = switch (e) {
+                    error.Cancelled => h.cancel(job),
+                    else => h.drop(job, h.words(e)),
+                };
+                continue;
+            };
+            if (job.stream.reprefill) h.continueGate(job) catch |e| {
+                _ = h.drop(job, h.words(e));
+                continue;
+            };
+            h.prefilled(job, began);
+            if (h.deliver(job)) h.remove(job);
+        }
+    }
+
+    /// A call-gate fix is in the reply. Send it, then prefill the prompt plus that reply so the next token
+    /// matches Python's `generate_gated` (a new prefill, not a decode of the replaced token).
+    fn continueGate(h: *LaneHost, job: *Job) !void {
+        var n: u8 = 0;
+        while (job.stream.reprefill) {
+            n += 1;
+            if (n > 4) return error.GateRestart;
+            h.send(job);
+            job.stream.reuse = .{};
+            job.stream.cached = 0;
+            job.stream.reuse_failed = false;
+            h.core.release(&job.stream);
+            try job.stream.absorbIntoPrompt();
+            job.delivered = 0;
+            if (job.stream.max_new == 0) {
+                job.stream.finished = true;
+                job.stream.reason = .length;
+                return;
+            }
+            try h.core.addStream(&job.stream);
+        }
+    }
+
+    /// One prepared job: its prompt prefilled alone (or its fill started), delivered.
+    fn startJob(h: *LaneHost, job: *Job) bool {
+        const r = job.request;
+        const began = job.began;
         if (r.max_tokens == 0 and h.info_.warm_turns) return h.warmPass(job, began);
         if (h.loneFits(job)) return h.runLone(job, began);
         if (h.core.fills()) {
             h.filling.append(h.gpa, job) catch return h.drop(job, "out of memory");
+            return true;
+        }
+        // a backend that fills prompts between rounds starts this one and admits the next (prompts that arrive
+        // together fill together); the fill hook reports it in
+        if (h.core.slices()) {
+            const filling = h.core.beginStream(&job.stream) catch |e| return switch (e) {
+                error.Cancelled => h.cancel(job),
+                error.LaneMemory => h.requeue(job),
+                else => h.drop(job, h.words(e)),
+            };
+            if (filling) return true;
+            h.prefilled(job, began);
+            if (h.deliver(job)) h.remove(job);
             return true;
         }
         h.core.addStream(&job.stream) catch |e| return switch (e) {
@@ -342,6 +482,7 @@ pub const LaneHost = struct {
             error.LaneMemory => h.requeue(job),
             else => h.drop(job, h.words(e)),
         };
+        if (job.stream.reprefill) h.continueGate(job) catch |e| return h.drop(job, h.words(e));
         h.prefilled(job, began);
         if (h.deliver(job)) h.remove(job);
         return true;
@@ -366,6 +507,10 @@ pub const LaneHost = struct {
         };
         if (!done) return;
         _ = h.filling.orderedRemove(0);
+        if (job.stream.reprefill) h.continueGate(job) catch |e| {
+            _ = h.drop(job, h.words(e));
+            return;
+        };
         h.prefilled(job, job.began);
         if (h.deliver(job)) h.remove(job);
     }
@@ -392,6 +537,7 @@ pub const LaneHost = struct {
         h.unlock();
         job.reported();
         if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+        status.noteKept(h);
         emit(job, .{ .prefilled = job.stream.cached });
     }
 
@@ -410,6 +556,7 @@ pub const LaneHost = struct {
         };
         h.prefilled(job, began);
         if (h.cache) |store| _ = store.keep(job.request.prompt, @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request));
+        status.noteKept(h);
         be.release(&job.stream);
         h.remove(job);
         h.finish(job, .length, "");
@@ -420,10 +567,10 @@ pub const LaneHost = struct {
     fn loneFits(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         const lone = h.lone orelse return false;
-        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null) return false;
+        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null or r.media != null) return false;
         h.lock();
         defer h.unlock();
-        return h.admitted.items.len == 1 and !h.foregroundWaiting() and h.cancels.items.len == 0 and h.core.activeCount() == 0;
+        return h.admitted.items.len == 1 and !h.foregroundWaiting() and h.cancels.items.len == 0 and h.core.activeCount() == 0 and h.core.fillingCount() == 0;
     }
 
     /// Send lone-driver tokens as they land; arrivals and cancellation return its stream to the lane core.
@@ -525,7 +672,7 @@ pub const LaneHost = struct {
     fn run(h: *LaneHost) void {
         while (true) {
             h.takeCancels();
-            while (h.admitOne()) {}
+            h.admitAll();
             h.fillOne();
             status.noteLive(h);
             h.lock();
@@ -540,7 +687,7 @@ pub const LaneHost = struct {
                 h.closeAll();
                 continue;
             }
-            if (h.core.activeCount() == 0) {
+            if (h.core.activeCount() == 0 and h.core.fillingCount() == 0) {
                 if (h.filling.items.len > 0) {
                     h.unlock();
                     continue;
@@ -563,6 +710,10 @@ pub const LaneHost = struct {
             var i: usize = 0;
             while (i < h.admitted.items.len) {
                 const job = h.admitted.items[i];
+                if (job.stream.reprefill) h.continueGate(job) catch |e| {
+                    _ = h.drop(job, h.words(e));
+                    continue;
+                };
                 if (h.deliver(job)) {
                     h.lock();
                     _ = h.admitted.orderedRemove(i);

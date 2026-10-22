@@ -1,6 +1,6 @@
 //! Typed tool parameters: XML parameter text decoded by the offered schema (``tool_parameters.py``).
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const reply_text = @import("reply_text.zig");
 const tool_specs = @import("tool_specs.zig");
 const Value = json.Value;
@@ -43,23 +43,92 @@ pub fn schemaOf(s: *const Schemas, name: []const u8, key: []const u8, a: Allocat
     return props.get(key) orelse .{ .object = try json.newObject(a) };
 }
 
-const Kind = enum { array, object, boolean, integer, number, null };
+/// The JSON types a parameter schema admits, as bits (``schema_types`` of the recipe's tool_parameters.py).
+pub const Types = u8;
+const t_array: Types = 1;
+const t_object: Types = 2;
+const t_boolean: Types = 4;
+const t_integer: Types = 8;
+const t_number: Types = 16;
+const t_null: Types = 32;
+const t_string: Types = 64;
+const t_other: Types = 128; // a type name this decoder does not know: never typed
+const t_typed: Types = t_array | t_object | t_boolean | t_integer | t_number | t_null;
 
-fn kindOf(schema: Value) ?Kind {
-    const t = schema.get("type") orelse return null;
-    if (t != .string) return null;
-    return std.meta.stringToEnum(Kind, t.string);
+fn nameBit(name: []const u8) Types {
+    const names = [_]struct { []const u8, Types }{ .{ "array", t_array }, .{ "object", t_object }, .{ "boolean", t_boolean }, .{ "integer", t_integer }, .{ "number", t_number }, .{ "null", t_null }, .{ "string", t_string } };
+    for (names) |n| if (std.mem.eql(u8, n[0], name)) return n[1];
+    return t_other;
 }
 
-fn valid(kind: Kind, v: Value) bool {
-    return switch (kind) {
-        .array => v == .array,
-        .object => v == .object,
-        .boolean => v == .bool,
-        .integer => v == .int,
-        .number => v == .int or v == .float,
-        .null => v == .null,
+/// ``_KINDS.get(type(v), "string")``: the kind of an enum or const value.
+fn valueBit(v: Value) Types {
+    return switch (v) {
+        .bool => t_boolean,
+        .int => t_integer,
+        .float => t_number,
+        .string => t_string,
+        .null => t_null,
+        .array => t_array,
+        .object => t_object,
     };
+}
+
+/// ``schema_types``: its ``type`` (a name or a list of names), else those of its ``anyOf`` / ``oneOf`` members (none if
+/// a member is untyped), else those of its ``enum`` values or ``const``.
+pub fn schemaTypes(schema: Value) Types {
+    if (schema != .object) return 0;
+    if (schema.get("type")) |kind| switch (kind) {
+        .string => |name| return nameBit(name),
+        .array => |names| {
+            var out: Types = 0;
+            for (names) |n| if (n == .string) {
+                out |= nameBit(n.string);
+            };
+            return out;
+        },
+        else => {},
+    };
+    for ([_][]const u8{ "anyOf", "oneOf" }) |key| {
+        const members = schema.get(key) orelse continue;
+        if (members != .array or members.array.len == 0) continue;
+        var out: Types = 0;
+        for (members.array) |m| {
+            const found = schemaTypes(m);
+            if (found == 0) return 0;
+            out |= found;
+        }
+        return out;
+    }
+    if (schema.get("enum")) |values| if (values == .array and values.array.len > 0) {
+        var out: Types = 0;
+        for (values.array) |v| out |= valueBit(v);
+        return out;
+    };
+    if (schema.get("const")) |c| return valueBit(c);
+    return 0;
+}
+
+/// ``typed_parameter``: every type the schema admits is a JSON one other than string (a union with string, such as
+/// ``["string", "null"]``, keeps the text as written).
+pub fn typedParameter(schema: Value) bool {
+    const kinds = schemaTypes(schema);
+    return kinds != 0 and kinds & ~t_typed == 0;
+}
+
+/// ``nullable_text``: a text value that may also be null (``["string", "null"]``, pydantic's ``Optional[str]``).
+pub fn nullableText(schema: Value) bool {
+    const kinds = schemaTypes(schema);
+    return kinds & t_string != 0 and kinds & t_null != 0;
+}
+
+fn admitted(kinds: Types, v: Value) bool {
+    return (kinds & t_array != 0 and v == .array) or
+        (kinds & t_object != 0 and v == .object) or
+        (kinds & t_boolean != 0 and v == .bool) or
+        (kinds & t_integer != 0 and v == .int) or
+        (kinds & t_number != 0 and (v == .int or v == .float)) or
+        (kinds & t_null != 0 and v == .null);
 }
 
 /// ``json.dumps(v, allow_nan=False)`` succeeds: no NaN or infinity anywhere.
@@ -102,10 +171,13 @@ pub fn closedJson(a: Allocator, text: []const u8) Allocator.Error!?[]const u8 {
     return try std.mem.concat(a, u8, &.{ reply_text.pyRstrip(text), closers.items });
 }
 
-/// ``decode_parameter``: the schema's type when the text spells one, else the text; ``python`` also reads Python's spelling.
+/// ``decode_parameter``: a string schema keeps the text (a nullable one reads ``null`` as null); a typed one reads JSON
+/// of an admitted type, or the value closed (#87), and with ``python`` (Qwen's parsers) Python's spelling of one;
+/// anything else stays as written, so a resent history renders the tokens the model wrote.
 pub fn decode(a: Allocator, value: []const u8, schema: Value, python: bool) Allocator.Error!Value {
-    const kind = kindOf(schema) orelse return .{ .string = value };
-    const closed: ?[]const u8 = if (kind == .array or kind == .object) try closedJson(a, value) else null;
+    if (!typedParameter(schema)) return if (nullableText(schema) and std.mem.eql(u8, value, "null")) .null else .{ .string = value };
+    const kinds = schemaTypes(schema);
+    const closed: ?[]const u8 = if (kinds & (t_array | t_object) != 0) try closedJson(a, value) else null;
     for ([_]?[]const u8{ value, closed }) |candidate| {
         const text = candidate orelse continue;
         const parsed = switch (try json.parseText(a, text)) {
@@ -113,12 +185,12 @@ pub fn decode(a: Allocator, value: []const u8, schema: Value, python: bool) Allo
             .err => continue,
         };
         if (!finite(parsed)) continue;
-        return if (valid(kind, parsed)) parsed else .{ .string = value };
+        return if (admitted(kinds, parsed)) parsed else .{ .string = value };
     }
     if (!python) return .{ .string = value };
     const parsed = (try pythonLiteral(a, value)) orelse return .{ .string = value };
     if (!finite(parsed)) return .{ .string = value };
-    return if (valid(kind, parsed)) parsed else .{ .string = value };
+    return if (admitted(kinds, parsed)) parsed else .{ .string = value };
 }
 
 /// ``_python_literal``: True, None, quoted strings, numbers, lists, tuples and dicts; null if ``text`` is not one.
@@ -324,7 +396,7 @@ const Literal = struct {
     fn appendCode(a: Allocator, out: *std.ArrayList(u8), v: u21) Error!void {
         if (v > 0x10ffff) return error.Invalid;
         var buf: [4]u8 = undefined;
-        const n = @import("json_parse.zig").wtf8Encode(v, &buf);
+        const n = json.wtf8Encode(v, &buf);
         try out.appendSlice(a, buf[0..n]);
     }
 
@@ -378,4 +450,48 @@ test "decode parameters" {
     const py = try decode(a, "['a', None, True]", arr, true);
     try std.testing.expectEqualStrings("[\"a\", null, true]", try json.stringify(a, py, .{}));
     try std.testing.expectEqual(Value.null, (try decode(a, " None ", (try json.parse(a, "{\"type\": \"null\"}")).ok, true)));
+}
+
+fn schemaOfText(a: Allocator, text: []const u8) !Value {
+    return (try json.parse(a, text)).ok;
+}
+
+test "schemas typed by a type list, anyOf, enum or const decode as the recipe's tool_parameters.py does" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // ["integer", "null"]: typed, a number or null
+    const opt = try schemaOfText(a, "{\"type\":[\"integer\",\"null\"]}");
+    try std.testing.expect(typedParameter(opt));
+    try std.testing.expectEqualStrings("7", (try decode(a, "7", opt, false)).int);
+    try std.testing.expect((try decode(a, "null", opt, false)) == .null);
+    // ["string", "null"]: the text as written, except a bare null
+    const nullable = try schemaOfText(a, "{\"type\":[\"string\",\"null\"]}");
+    try std.testing.expect(!typedParameter(nullable) and nullableText(nullable));
+    try std.testing.expect((try decode(a, "null", nullable, false)) == .null);
+    try std.testing.expectEqualStrings("nullx", (try decode(a, "nullx", nullable, false)).string);
+    try std.testing.expectEqualStrings("5", (try decode(a, "5", nullable, false)).string);
+    // a plain string schema keeps "null" as text
+    const plain = try schemaOfText(a, "{\"type\":\"string\"}");
+    try std.testing.expectEqualStrings("null", (try decode(a, "null", plain, false)).string);
+    // anyOf of typed members is typed; one untyped member makes none
+    const any = try schemaOfText(a, "{\"anyOf\":[{\"type\":\"array\"},{\"type\":\"null\"}]}");
+    try std.testing.expect(typedParameter(any));
+    try std.testing.expectEqual(@as(usize, 2), (try decode(a, "[1,2]", any, false)).array.len);
+    try std.testing.expect(!typedParameter(try schemaOfText(a, "{\"anyOf\":[{\"type\":\"array\"},{}]}")));
+    // enum and const are typed by their values
+    const en = try schemaOfText(a, "{\"enum\":[1,2,3]}");
+    try std.testing.expect(typedParameter(en));
+    try std.testing.expectEqualStrings("2", (try decode(a, "2", en, false)).int);
+    const named = try schemaOfText(a, "{\"enum\":[\"a\",\"b\"]}");
+    try std.testing.expect(!typedParameter(named));
+    const fixed = try schemaOfText(a, "{\"const\":true}");
+    try std.testing.expect((try decode(a, "true", fixed, false)).bool);
+    // a type the decoder does not know is untyped
+    try std.testing.expect(!typedParameter(try schemaOfText(a, "{\"type\":\"str\"}")));
+    // a typed value of another type stays as written
+    const arr = try schemaOfText(a, "{\"type\":\"array\"}");
+    try std.testing.expectEqualStrings("{\"a\":1}", (try decode(a, "{\"a\":1}", arr, false)).string);
+    // an array left one closer short is closed (#87)
+    try std.testing.expectEqual(@as(usize, 2), (try decode(a, "[1,2", arr, false)).array.len);
 }

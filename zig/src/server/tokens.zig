@@ -1,6 +1,6 @@
 //! vLLM's /tokenize and /detokenize (the ids the chat and completion routes would run), and a reply's token SHA.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const messages = @import("messages.zig");
@@ -94,7 +94,7 @@ pub fn post(srv: *Server, conn: *Conn, a: Allocator, detok: bool) void {
     o.put(a, "type", .{ .string = "invalid_request_error" }) catch return;
     const wrapped = json.newObject(a) catch return;
     wrapped.put(a, "error", .{ .object = o }) catch return;
-    routes.sendValue(conn, a, if (cx.kind == .capacity) 503 else 400, .{ .object = wrapped });
+    routes.sendValue(conn, a, if (cx.kind == .capacity) errors.capacity_status else 400, .{ .object = wrapped });
 }
 
 /// The reply's token ids hashed: drafted and ``"draft": false`` replies must match.

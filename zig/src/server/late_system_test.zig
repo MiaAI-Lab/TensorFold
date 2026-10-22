@@ -21,8 +21,8 @@ const misplaced_body =
 ;
 
 /// Drops a system message after the first, so the late-system probe comes back as user.
-const DropLate = struct {
-    fn text(t: *@This()) model_text.Text {
+pub const DropLate = struct {
+    pub fn text(t: *@This()) model_text.Text {
         return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
     }
 
@@ -79,10 +79,10 @@ fn textOf(v: json.Value, key: []const u8) []const u8 {
 }
 
 /// Copies the prompt the server submits, then finishes at once.
-const Capture = struct {
+pub const Capture = struct {
     prompt: []u32 = &.{},
 
-    fn engine(e: *@This()) api.Engine {
+    pub fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
     }
 
@@ -110,14 +110,28 @@ const Capture = struct {
     }
 };
 
-const Reply = struct { status: u16, body: []u8 };
+pub const Reply = struct { status: u16, body: []u8 };
 
-fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
+pub fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
+    return exchangeMethod(srv, "POST", path, body);
+}
+
+pub fn exchangeMethod(srv: *server.Server, method: []const u8, path: []const u8, body: []const u8) !Reply {
+    const raw = try exchangeRaw(srv, method, path, body);
+    defer std.testing.allocator.free(raw);
+    const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadReply;
+    const status = std.fmt.parseInt(u16, raw["HTTP/1.1 ".len..][0..3], 10) catch return error.BadReply;
+    const payload = try std.testing.allocator.dupe(u8, raw[split + 4 ..]);
+    return .{ .status = status, .body = payload };
+}
+
+/// The whole response, head and body, as the client reads it (the caller frees it).
+pub fn exchangeRaw(srv: *server.Server, method: []const u8, path: []const u8, body: []const u8) ![]u8 {
     var pair: [2]std.c.fd_t = undefined;
     if (std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &pair) != 0) return error.SocketPair;
     defer _ = std.c.close(pair[0]);
     defer _ = std.c.close(pair[1]);
-    const head = try std.fmt.allocPrint(std.testing.allocator, "POST {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ path, body.len });
+    const head = try std.fmt.allocPrint(std.testing.allocator, "{s} {s} HTTP/1.1\r\nHost: t\r\nContent-Length: {d}\r\n\r\n", .{ method, path, body.len });
     defer std.testing.allocator.free(head);
     try writeAll(pair[0], head);
     try writeAll(pair[0], body);
@@ -129,13 +143,7 @@ fn exchange(srv: *server.Server, path: []const u8, body: []const u8) !Reply {
     const a = arena.allocator();
     if (try conn.readRequest(a, false) != .ready) return error.BadRequest;
     routes.dispatch(srv, &conn, a);
-    const raw = try readReady(std.testing.allocator, pair[0]);
-    errdefer std.testing.allocator.free(raw);
-    const split = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadReply;
-    const status = std.fmt.parseInt(u16, raw["HTTP/1.1 ".len..][0..3], 10) catch return error.BadReply;
-    const payload = try std.testing.allocator.dupe(u8, raw[split + 4 ..]);
-    std.testing.allocator.free(raw);
-    return .{ .status = status, .body = payload };
+    return readReady(std.testing.allocator, pair[0]);
 }
 
 fn writeAll(fd: std.c.fd_t, data: []const u8) !void {

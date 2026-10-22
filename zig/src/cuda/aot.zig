@@ -27,9 +27,9 @@ fn has(a: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
     return true;
 }
 
-const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
-const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
-const KernelJson = struct {
+pub const ParamJson = struct { name: []const u8, type: []const u8, div16: bool, nospec: bool };
+pub const ConstJson = struct { int: ?i64 = null, f32: ?u32 = null };
+pub const KernelJson = struct {
     @"fn": []const u8,
     hash: []const u8,
     name: []const u8,
@@ -43,7 +43,7 @@ const KernelJson = struct {
     params: []ParamJson,
     consts: std.json.ArrayHashMap(ConstJson),
 };
-const SetJson = struct { kernels: []KernelJson };
+pub const SetJson = struct { kernels: []KernelJson };
 
 /// One argument of a launch, by the kernel's parameter name.
 pub const Arg = struct {
@@ -131,6 +131,40 @@ pub const Set = struct {
             .f32 => |x| std.log.err("  {s}: fp32 {d}", .{ a.name, x }),
             .u64 => |x| std.log.err("  {s}: u64 {d}", .{ a.name, x }),
         };
+        for (consts) |c| {
+            if (c.int) |x| std.log.err("  {s}: constexpr {d}", .{ c.name, x });
+            if (c.f32) |x| std.log.err("  {s}: constexpr fp32 {d}", .{ c.name, x });
+        }
+        // one line per miss, as Triton specializes it (int: 1 / div16 / none; pointer: div16 or not), for capture lists
+        var line: [1024]u8 = undefined;
+        var w: std.Io.Writer = .fixed(&line);
+        var cut = false; // a field that did not fit: the line ends with " TRUNCATED" instead of passing for complete
+        w.print("MISSING-VARIANT fn={s}", .{function}) catch {
+            cut = true;
+        };
+        for (args) |a| switch (a.value) {
+            .ptr => |p| w.print(" {s}={s}", .{ a.name, if (p.addr % 16 == 0) "p16" else "p" }) catch {
+                cut = true;
+            },
+            .i32 => |x| w.print(" {s}={s}", .{ a.name, if (x == 1) "i1" else if (@mod(x, 16) == 0) "i16" else "i" }) catch {
+                cut = true;
+            },
+            .u64 => |x| w.print(" {s}={s}", .{ a.name, if (x % 16 == 0) "u16" else "u" }) catch {
+                cut = true;
+            },
+            .f32 => w.print(" {s}=f", .{a.name}) catch {
+                cut = true;
+            },
+        };
+        for (consts) |c| {
+            if (c.int) |x| w.print(" {s}:{d}", .{ c.name, x }) catch {
+                cut = true;
+            };
+            if (c.f32) |x| w.print(" {s}:f32bits:{d}", .{ c.name, @as(u32, @bitCast(x)) }) catch {
+                cut = true;
+            };
+        }
+        std.log.err("{s}{s}", .{ w.buffered(), if (cut) " TRUNCATED" else "" });
         return error.MissingTritonVariant;
     }
 
@@ -167,7 +201,7 @@ fn lookup(args: []const Arg, name: []const u8) ?Arg {
     return null;
 }
 
-fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
+pub fn matches(k: KernelJson, args: []const Arg, consts: []const Const) bool {
     for (consts) |c| {
         const got = k.consts.map.get(c.name) orelse return false;
         if (c.int) |x| if (got.int == null or got.int.? != x) return false;

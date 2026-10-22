@@ -19,7 +19,11 @@ pub const Flag = struct {
     native: bool = false,
     /// The values it honours when only some of the choices.
     native_values: ?[]const []const u8 = null,
+    /// A flag the GLM recipe passes that this engine does not serve yet: parsed, then refused with this reason.
+    later: ?[]const u8 = null,
 };
+
+const vision_later = "GLM vision (pictures and clips) is not built into the Zig engine yet (package H); serve with VISION=0 until it lands";
 
 const backend_values: []const []const u8 = if (builtin.os.tag == .macos) &.{ "auto", "mlx" } else if (served("--backend=rocm")) &.{ "auto", "rocm" } else &.{ "auto", "cuda" };
 
@@ -49,11 +53,12 @@ pub const flags = [_]Flag{
     .{ .name = "--api-key-file", .native = true },
     .{ .name = "--metrics-open", .kind = .store_true, .native = true },
     .{ .name = "--dashboard", .kind = .store_true, .native = true },
-    .{ .name = "--vision", .kind = .store_true },
-    .{ .name = "--vision-urls", .kind = .store_true },
+    .{ .name = "--vision", .kind = .store_true, .native = cuda_build },
+    .{ .name = "--vision-urls", .kind = .store_true, .native = cuda_build },
+    .{ .name = "--vision-backend", .choices = &.{ "zig", "python" }, .native = cuda_build },
     .{ .name = "--vision-offload", .kind = .store_true },
-    .{ .name = "--vision-max-images" },
-    .{ .name = "--vision-image-tokens" },
+    .{ .name = "--vision-max-images", .native = cuda_build },
+    .{ .name = "--vision-image-tokens", .native = cuda_build },
     .{ .name = "--context", .native = true },
     .{ .name = "--speed-up", .native = true },
     .{ .name = "--max-tokens", .native = true },
@@ -81,8 +86,12 @@ pub const flags = [_]Flag{
     .{ .name = "--prompt-cache-gib", .native = true },
     .{ .name = "--prompt-cache-over-cap", .kind = .store_true, .native = true },
     .{ .name = "--checkpoint-slots", .native = served("--checkpoint-slots") },
-    .{ .name = "--spill-gib" },
-    .{ .name = "--snapshot-dir", .native = true, .native_values = &.{"none"} },
+    .{ .name = "--spill-gib", .native = cuda_build },
+    .{ .name = "--spill-highwater", .native = cuda_build },
+    .{ .name = "--spill-min-tokens", .native = cuda_build },
+    .{ .name = "--spill-min-free-gib", .native = cuda_build },
+    .{ .name = "--spill-flush-s", .native = cuda_build },
+    .{ .name = "--snapshot-dir", .native = true }, // the spill tier's folder (the recipe passes /spill with --spill-gib)
     .{ .name = "--max-snapshots", .native = true, .native_values = &.{"0"} },
     .{ .name = "--parallel", .native = true },
     .{ .name = "--decode-share" },
@@ -93,7 +102,7 @@ pub const flags = [_]Flag{
     .{ .name = "--ple-on-ssd", .kind = .store_true },
     .{ .name = "--no-update-check", .kind = .store_true, .native = true },
     .{ .name = "--backend", .choices = &.{ "auto", "mlx", "cuda", "rocm" }, .native = true, .native_values = backend_values },
-    .{ .name = "--tp", .choices = &.{ "1", "2", "4", "8" }, .native = served("--tp") },
+    .{ .name = "--tp", .choices = &.{ "1", "2", "3", "4", "8" }, .native = served("--tp") },
     .{ .name = "--rank", .native = served("--tp") },
     .{ .name = "--master", .native = served("--tp") },
     .{ .name = "--master-port", .native = served("--tp") },
@@ -115,7 +124,9 @@ pub const flags = [_]Flag{
 
 /// The variables this binary honours as the Python engine does, then the CUDA build's.
 pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" } ++
-    (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{});
+    (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{}) ++
+    // the GLM recipe's server switches (recipe.zig; scripts/config.sh exports them)
+    (if (cuda_build) [_][]const u8{ "TF_GLM_EFFORT_TAIL", "TF_GLM_CLEAR_THINKING", "TF_GLM_STREAM_SMOOTH", "TF_GLM_STREAM_SMOOTH_MS", "TF_GLM_LOOP_GUARD", "TF_GLM_MAX_QUEUED", "TF_GLM_KEEP_REASONING", "TF_GLM_KEEP_REASONING_MB", "TF_GLM_ASSISTANT_ENDS", "TF_GLM_PROMPT_STOP" } else [_][]const u8{});
 
 pub const Args = struct {
     model: []const u8 = "",
@@ -136,6 +147,12 @@ pub const Args = struct {
     learn_dir: ?[]const u8 = null,
     learn_min_free_gib: f64 = 4,
     learn_gib: f64 = 32, // disk for learned states, every model and build together
+    snapshot_dir: ?[]const u8 = null, // the spill tier's folder
+    spill_gib: f64 = 0, // the spill tier's disk cap a rank (0: off)
+    spill_highwater: f64 = 0.70,
+    spill_min_tokens: u32 = 8192,
+    spill_min_free_gib: f64 = 50,
+    spill_flush_s: ?f64 = null, // a clean stop's budget (null: TF_SPILL_FLUSH_S, else 60)
     max_tokens: i64 = 4096,
     temperature: ?f64 = null,
     top_p: ?f64 = null,
@@ -146,6 +163,11 @@ pub const Args = struct {
     thinking_budget: i64 = 0,
     loop_guard: bool = false,
     no_drafts: bool = false,
+    vision: bool = false, // picture and clip input (the CUDA engine hosts the vision tower)
+    vision_urls: bool = false, // --vision: also fetch public https URLs
+    vision_backend: []const u8 = "python", // zig: the engine hosts the tower; python: Python TensorFold's, in a helper process
+    vision_max_images: ?i64 = null,
+    vision_image_tokens: ?i64 = null,
     keep_warm: i64 = 900, // seconds the idle keepalive runs after the last request ends (0: off)
     compact_auto: bool = false,
     compact_fraction: ?f64 = null,
@@ -210,6 +232,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
                 if (std.mem.eql(u8, c, value.?)) break;
             } else return fail(u, a, "argument {s}: invalid choice: '{s}'", .{ name, value.? });
         } else if (eq != null) return fail(u, a, "argument {s}: ignored explicit argument '{s}'", .{ name, token[eq.? + 1 ..] });
+        if (flag.later) |why| return fail(u, a, "{s}: {s}", .{ name, why });
         if (!flag.native) return fail(u, a, "{s} is not served by the native engine yet; the Python engine 0.6.6 serves it: python -m pip install git+https://github.com/ashhart/TensorFold.git@v0.6.6", .{name});
         if (flag.native_values) |allowed| if (value) |v| for (allowed) |x| {
             if (std.mem.eql(u8, x, v)) break;
@@ -218,6 +241,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
     try ranks(u, a, out);
+    if (out.tp > 1 and out.master.len == 0) return fail(u, a, "--tp {d} needs --master, the address rank 0 listens on for the other ranks", .{out.tp});
     out.alias = alias.items;
     out.api_key = keys.items;
     return out;
@@ -257,6 +281,20 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     } else if (is(name, "--name")) out.name = v else if (is(name, "--alias")) try alias.append(a, v) else if (is(name, "--api-key")) try keys.append(a, v) else if (is(name, "--api-key-file")) out.api_key_file = v else if (is(name, "--metrics-open")) out.metrics_open = true else if (is(name, "--dashboard")) out.dashboard = true else if (is(name, "--context")) out.context = try int(u, a, name, v) else if (is(name, "--speed-up")) out.speed_up = v else if (is(name, "--prompt-cache-gib")) out.prompt_cache_gib = try gib(u, a, name, v) else if (is(name, "--prompt-cache-over-cap")) out.prompt_cache_over_cap = true else if (is(name, "--learn")) out.learn = true else if (is(name, "--learn-dir")) {
         out.learn = true;
         out.learn_dir = v;
+    } else if (is(name, "--snapshot-dir")) {
+        out.snapshot_dir = if (std.mem.eql(u8, v, "none")) null else v;
+    } else if (is(name, "--spill-gib")) {
+        out.spill_gib = try gib(u, a, name, v);
+    } else if (is(name, "--spill-highwater")) {
+        const f = try float(u, a, name, v);
+        if (!(f > 0 and f <= 1)) return fail(u, a, "argument --spill-highwater: a fraction in (0, 1]: '{s}'", .{v});
+        out.spill_highwater = f;
+    } else if (is(name, "--spill-min-tokens")) {
+        out.spill_min_tokens = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --spill-min-tokens: a token count from 0: '{s}'", .{v});
+    } else if (is(name, "--spill-min-free-gib")) {
+        out.spill_min_free_gib = try gib(u, a, name, v);
+    } else if (is(name, "--spill-flush-s")) {
+        out.spill_flush_s = try gib(u, a, name, v);
     } else if (is(name, "--learn-min-free-gib")) {
         out.learn_min_free_gib = try gib(u, a, name, v);
     } else if (is(name, "--learn-gib")) {
@@ -279,6 +317,18 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
 fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage) error{ Usage, OutOfMemory }!bool {
     if (std.mem.eql(u8, name, "--device")) {
         out.device = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --device: a GPU ordinal from 0: '{s}'", .{v});
+    } else if (std.mem.eql(u8, name, "--vision")) {
+        out.vision = true;
+    } else if (std.mem.eql(u8, name, "--vision-urls")) {
+        out.vision = true;
+        out.vision_urls = true;
+    } else if (std.mem.eql(u8, name, "--vision-backend")) {
+        out.vision = true;
+        out.vision_backend = v;
+    } else if (std.mem.eql(u8, name, "--vision-max-images")) {
+        out.vision_max_images = try int(u, a, name, v);
+    } else if (std.mem.eql(u8, name, "--vision-image-tokens")) {
+        out.vision_image_tokens = try int(u, a, name, v);
     } else if (std.mem.eql(u8, name, "--segments")) {
         const n = try int(u, a, name, v);
         out.segments = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --segments: a count from 1: '{s}'", .{v});
@@ -350,6 +400,12 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .speed_up = args.speed_up,
         .prompt_cache_gib = args.prompt_cache_gib,
         .prompt_cache_over_cap = args.prompt_cache_over_cap,
+        .spill_dir = args.snapshot_dir,
+        .spill_gib = args.spill_gib,
+        .spill_highwater = args.spill_highwater,
+        .spill_min_tokens = args.spill_min_tokens,
+        .spill_min_free_gib = args.spill_min_free_gib,
+        .spill_flush_s = args.spill_flush_s,
         .learn = if (args.learn) args.learn_dir orelse try api.prompt_imprint.defaultRoot(a) else null,
         .learn_gib = args.learn_gib,
         .learn_min_free_gib = args.learn_min_free_gib,
@@ -364,6 +420,8 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .master = args.master,
         .master_port = args.master_port,
         .policy = args.policy,
+        .vision = args.vision,
+        .vision_zig = args.vision and std.mem.eql(u8, args.vision_backend, "zig"),
     };
 }
 
@@ -533,4 +591,20 @@ test "an engine is asked for what the flags say, and the defaults of the flags n
     try std.testing.expectEqual(@as(?f64, 0.5), gpu.mtp_confidence);
     try std.testing.expectEqual(@as(?i64, 3), gpu.keep);
     try std.testing.expectEqualStrings("matrix=off", gpu.policy);
+}
+
+test "the recipe's start.sh flags: the spill flags are read and vision is accepted" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var u: Usage = .{};
+    const got = try parse(a, &.{ "m", "--context", "131072", "--parallel", "8", "--max-tokens", "32768", "--no-thinking", "--spill-gib", "64", "--snapshot-dir", "/spill", "--spill-highwater", "0.70", "--spill-min-tokens", "8192", "--spill-min-free-gib", "50" }, &u);
+    try std.testing.expectEqual(@as(f64, 64), got.spill_gib);
+    try std.testing.expectEqualStrings("/spill", got.snapshot_dir.?);
+    try std.testing.expectEqual(@as(f64, 0.70), got.spill_highwater);
+    try std.testing.expectEqual(@as(u32, 8192), got.spill_min_tokens);
+    try std.testing.expectEqual(@as(f64, 50), got.spill_min_free_gib);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-highwater", "1.5" }, &u));
+    const vis = try parse(a, &.{ "m", "--vision", "--vision-urls" }, &u);
+    try std.testing.expect(vis.vision and vis.vision_urls);
 }

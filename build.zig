@@ -1,4 +1,5 @@
 const std = @import("std");
+const vision_build = @import("zig/build/vision.zig");
 const builtin = @import("builtin");
 const cuda_build = @import("zig/build/cuda.zig");
 const dist_build = @import("zig/build/dist.zig");
@@ -174,6 +175,20 @@ pub fn build(b: *std.Build) void {
     const warning_run = b.addRunArtifact(warning);
     test_step.dependOn(&warning_run.step);
     b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
+    // GLM-5.3-Flash picture and clip input, the CPU side: decoders, resize, geometry, prompt expansion (zig/src/vision)
+    const vision_json = b.createModule(.{ .root_source_file = b.path("zig/src/server/json.zig"), .target = b.graph.host, .optimize = .safe });
+    const vision_tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/vision/vision.zig"),
+        .target = b.graph.host,
+        .optimize = .safe,
+        .link_libc = true,
+        .imports = &.{.{ .name = "json", .module = vision_json }},
+    }) });
+    const vision_run = b.addRunArtifact(vision_tests);
+    vision_run.setCwd(b.path("."));
+    vision_run.has_side_effects = true; // reads fixtures and (optionally) FFmpeg libraries the build graph cannot see
+    test_step.dependOn(&vision_run.step);
+    b.step("test-vision", "GLM image/video input, the CPU side").dependOn(&vision_run.step);
     grammar_build.steps(b, target, xgrammar);
 }
 
@@ -190,6 +205,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = engines }, .{ .name = "checkpoint_cli", .module = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{.{ .name = "native_engines", .module = engines }} }) } },
     }) });
     exe.root_module.addOptions("build_options", build_options);
+    vision_build.attach(b, exe.root_module, target, .ReleaseSafe);
     if (test_step == null) {
         exe.root_module.strip = true;
         return exe;
@@ -207,9 +223,12 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .link_libc = true,
         .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } },
     });
+    vision_build.attach(b, server_tests, target, .Debug);
     test_step.?.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = server_tests })).step);
     // the parse half's tests, as their own test binary (zig/src/server/tool_parse_test.zig)
-    const tool_parse_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/server/tool_parse_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } } }) });
+    const tool_parse_mod = b.createModule(.{ .root_source_file = b.path("zig/src/server/tool_parse_test.zig"), .target = target, .optimize = .Debug, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template } } });
+    vision_build.attach(b, tool_parse_mod, target, .Debug);
+    const tool_parse_tests = b.addTest(.{ .root_module = tool_parse_mod });
     test_step.?.dependOn(&b.addRunArtifact(tool_parse_tests).step);
     // the engine seam's own tests (lane_host.zig), as zig/tests/server/zig_test.sh runs them
     test_step.?.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api })).step);

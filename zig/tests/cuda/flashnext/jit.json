@@ -1,0 +1,1717 @@
+{
+ "tensorfold.cuda.exl3.prefill._gemm": {
+  "do_not_specialize": [
+   "M"
+  ],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "W",
+   "H",
+   "SVH",
+   "BIAS",
+   "OUT",
+   "M",
+   "o_stride",
+   "K",
+   "N",
+   "BM",
+   "BK",
+   "GROUP",
+   "HAS_BIAS",
+   "SCALE"
+  ]
+ },
+ "tensorfold.cuda.kernels.qmm._group_sums": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "XS",
+   "ldx",
+   "KG",
+   "GS",
+   "GB"
+  ]
+ },
+ "tensorfold.cuda.kernels.qmm._quantize_rows": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "X8",
+   "XS",
+   "A",
+   "ldx",
+   "K",
+   "GS",
+   "BK"
+  ]
+ },
+ "tensorfold.cuda.logprobs._finish": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "P",
+   "L",
+   "T",
+   "B"
+  ]
+ },
+ "tensorfold.cuda.logprobs._parts": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "P",
+   "STRIDE",
+   "V",
+   "T",
+   "B"
+  ]
+ },
+ "tensorfold.cuda.moe._combine": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "Y",
+   "W",
+   "OUT",
+   "S",
+   "D",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.cuda.moe._router": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "W",
+   "OUT",
+   "M",
+   "x_stride",
+   "D",
+   "NE",
+   "BM",
+   "BLOCK_E",
+   "BK"
+  ]
+ },
+ "tensorfold.cuda.moe._topk_rows": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "L",
+   "PICK",
+   "WTS",
+   "NE",
+   "NL",
+   "TOPK",
+   "SLOTS",
+   "BLOCK",
+   "SLOTP"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._block_keys": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "ROW",
+   "b",
+   "ok"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._chunk": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "Q",
+   "KC",
+   "VC",
+   "KSC",
+   "VSC",
+   "n",
+   "sparse",
+   "r",
+   "hk",
+   "c",
+   "PO",
+   "PM",
+   "PL",
+   "IDS",
+   "H",
+   "HK",
+   "D",
+   "G",
+   "CH",
+   "NCH",
+   "SCALE",
+   "IDW",
+   "QSA",
+   "BITS"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._chunks": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "Q",
+   "KC",
+   "VC",
+   "KSC",
+   "VSC",
+   "POS0",
+   "PO",
+   "PM",
+   "PL",
+   "IDS",
+   "NKR",
+   "SPR",
+   "H",
+   "HK",
+   "D",
+   "G",
+   "CH",
+   "NCH",
+   "SCALE",
+   "IDW",
+   "QSA",
+   "BITS"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._merge": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PO",
+   "PM",
+   "PL",
+   "POS0",
+   "OUT",
+   "NKR",
+   "SPR",
+   "H",
+   "HK",
+   "D",
+   "G",
+   "CH",
+   "NCH",
+   "QSA",
+   "BITS"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._merge_row": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PO",
+   "PM",
+   "PL",
+   "OUT",
+   "n",
+   "r",
+   "hk",
+   "H",
+   "HK",
+   "D",
+   "G",
+   "CH",
+   "NCH",
+   "BITS"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._pool": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "IKC",
+   "POOLED",
+   "POS0",
+   "W",
+   "INV",
+   "eps",
+   "R",
+   "DI",
+   "HALF",
+   "RATIO",
+   "ROPE",
+   "DELTA",
+   "length",
+   "MODE",
+   "S1",
+   "S2"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._pool_block": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "IKC",
+   "POOLED",
+   "p0",
+   "i",
+   "W",
+   "INV",
+   "eps",
+   "R",
+   "DI",
+   "HALF",
+   "RATIO",
+   "ROPE",
+   "DELTA",
+   "length",
+   "MODE",
+   "S1",
+   "S2"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._scores": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "IQ",
+   "POOLED",
+   "POS0",
+   "SC",
+   "NB",
+   "HI",
+   "DI",
+   "RATIO",
+   "TOP",
+   "BB"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._select": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "SC",
+   "POS0",
+   "IDS",
+   "NKR",
+   "SPR",
+   "NB",
+   "RATIO",
+   "TOP",
+   "IDW",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._select_tiles": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "SC",
+   "POS0",
+   "IDS",
+   "NKR",
+   "SPR",
+   "NB",
+   "RATIO",
+   "TOP",
+   "IDW",
+   "TB"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attention._tile": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "q",
+   "k",
+   "v",
+   "m",
+   "l",
+   "o",
+   "valid",
+   "scale"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attn_multi._chunks_multi": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "Q",
+   "CP",
+   "POSR",
+   "SID",
+   "PO",
+   "PM",
+   "PL",
+   "IDS",
+   "NKR",
+   "N",
+   "H",
+   "HK",
+   "D",
+   "G",
+   "CH",
+   "NCH",
+   "SCALE",
+   "IDW",
+   "QSA",
+   "BITS",
+   "KT",
+   "RATIO",
+   "TOP"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attn_multi._merge_multi": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PO",
+   "PM",
+   "PL",
+   "POSR",
+   "OUT",
+   "NKR",
+   "H",
+   "HK",
+   "D",
+   "G",
+   "CH",
+   "NCH",
+   "QSA",
+   "BITS",
+   "RATIO",
+   "TOP"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attn_multi._pool_multi": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "CP",
+   "VP",
+   "P0",
+   "RS",
+   "W",
+   "INV",
+   "eps",
+   "N",
+   "DI",
+   "HALF",
+   "RATIO",
+   "VISION",
+   "S1",
+   "S2"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attn_multi._prep_multi": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "P",
+   "POSR",
+   "SID",
+   "CP",
+   "VP",
+   "QW",
+   "KW",
+   "IW",
+   "INV",
+   "Q",
+   "IQ",
+   "eps",
+   "N",
+   "PW",
+   "NQ",
+   "NKV",
+   "HD",
+   "NI",
+   "IHD",
+   "HALF",
+   "BITS",
+   "KT",
+   "VISION",
+   "S1",
+   "S2"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.attn_multi._ptr": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "TABLE",
+   "s",
+   "T"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.bf16._b16mm": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "W",
+   "OUT",
+   "PART",
+   "M",
+   "x_stride",
+   "N",
+   "K",
+   "SK",
+   "BM",
+   "BLOCK_N",
+   "BK",
+   "F32"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.bf16._reduce": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PART",
+   "OUT",
+   "total",
+   "SK",
+   "BLOCK",
+   "F32"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.exl3_mm._embed": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "IDS",
+   "T",
+   "OUT",
+   "D",
+   "S",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.exl3_mm._f16_mm": {
+  "do_not_specialize": [
+   "M"
+  ],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "W",
+   "OUT",
+   "M",
+   "N",
+   "x_stride",
+   "o_stride",
+   "K",
+   "KS",
+   "BM",
+   "BN",
+   "BK",
+   "F32"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.exl3_mm._ple_rows": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PK",
+   "HB",
+   "OUT",
+   "WORDS",
+   "KB",
+   "HEADS",
+   "DH",
+   "BLOCK",
+   "K_INV",
+   "K_BIAS"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.exl3_mm._reduce": {
+  "do_not_specialize": [
+   "M"
+  ],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "P",
+   "OUT",
+   "M",
+   "N",
+   "o_stride",
+   "SK",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.forward._shift_windows": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "OLD",
+   "NEW",
+   "keep",
+   "OLD_L",
+   "NEW_L",
+   "NEW_ROW",
+   "C",
+   "T",
+   "TP",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._add_streams": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "E",
+   "HS",
+   "OUT",
+   "D",
+   "S",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._attn_gate": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "O",
+   "P",
+   "OUT",
+   "XS",
+   "PW",
+   "NQ",
+   "HD"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._attn_prep": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "P",
+   "POS0",
+   "QW",
+   "KW",
+   "IW",
+   "INV",
+   "Q",
+   "KC",
+   "VC",
+   "KS",
+   "VS",
+   "IQ",
+   "IKC",
+   "ROPE",
+   "DELTA",
+   "length",
+   "eps",
+   "PW",
+   "NQ",
+   "NKV",
+   "HD",
+   "NI",
+   "IHD",
+   "HALF",
+   "BITS",
+   "MODE",
+   "S1",
+   "S2"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._bsig": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._bsilu": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._embed": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "IDS",
+   "W",
+   "S",
+   "B",
+   "OUT",
+   "D",
+   "S_COPIES"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._hc_act": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "DN",
+   "ACT",
+   "XS",
+   "INJ",
+   "S",
+   "LOW",
+   "LOWP",
+   "HAS_INJ",
+   "NDN"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._hc_mix": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "UP",
+   "NORMED",
+   "MIXED",
+   "XS",
+   "D",
+   "S",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._hc_normed": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "H",
+   "PSS",
+   "SCALE",
+   "NORMED",
+   "XS",
+   "eps",
+   "D",
+   "S",
+   "NC",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._hc_reduce_act": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PART",
+   "ACT",
+   "XS",
+   "INJ",
+   "SK",
+   "M",
+   "S",
+   "LOW",
+   "LOWP",
+   "HAS_INJ",
+   "NDN"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._hc_writeback": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "H",
+   "HOUT",
+   "PSS",
+   "BR",
+   "INJ",
+   "Y",
+   "WTS",
+   "RS",
+   "D",
+   "S",
+   "MODE",
+   "TOPK",
+   "SLOTS",
+   "BLOCK",
+   "WORLD"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._moe_partial": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "Y",
+   "WTS",
+   "OUT",
+   "D",
+   "TOPK",
+   "SLOTS",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._ple_conv": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "GATED",
+   "PSS",
+   "NC",
+   "TAIL",
+   "CW",
+   "H",
+   "HOUT",
+   "NROW",
+   "eps",
+   "R",
+   "D",
+   "S",
+   "TAPS",
+   "DIL",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._ple_embed": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "W",
+   "S",
+   "B",
+   "OUT",
+   "XS",
+   "HEADS",
+   "DH",
+   "SCALE"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._ple_embed_bf16": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "V",
+   "OUT",
+   "XS",
+   "HEADS",
+   "DH",
+   "SCALE"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._ple_gate": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "KEYS",
+   "VALS",
+   "H",
+   "NK",
+   "NQ",
+   "GATED",
+   "PSS",
+   "eps",
+   "D",
+   "S",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._prep_row": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "P",
+   "pos",
+   "r",
+   "head",
+   "QW",
+   "KW",
+   "IW",
+   "INV",
+   "Q",
+   "KC",
+   "VC",
+   "KS",
+   "VS",
+   "IQ",
+   "IKC",
+   "eps",
+   "PW",
+   "NQ",
+   "NKV",
+   "HD",
+   "NI",
+   "IHD",
+   "HALF",
+   "BITS",
+   "ROPE",
+   "DELTA",
+   "length",
+   "MODE",
+   "S1",
+   "S2"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.glue._rmsnorm": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "W",
+   "OUT",
+   "XS",
+   "eps",
+   "x_stride",
+   "D",
+   "G",
+   "BLOCK"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.image_rows.rope_axis": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "pos",
+   "ROPE",
+   "DELTA",
+   "length",
+   "index",
+   "MODE",
+   "S1",
+   "S2"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.kvquant._h32_stage": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "M",
+   "HI",
+   "LO"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.kvquant._quant_scale": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "M"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.kvquant.dequant_group_4": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "code",
+   "scale",
+   "M",
+   "W"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.kvquant.dequant_group_8": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "code",
+   "scale",
+   "M",
+   "W"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.kvquant.h32": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "M"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.kvquant.quant_groups_4": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "M"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.kvquant.quant_groups_8": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "M"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.nvfp4._bf16_widen": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "bits"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.nvfp4._e2m1_pattern": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "code"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.nvfp4._e4m3_value": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "byte"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.nvfp4._fp4mm": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "W",
+   "S",
+   "S2",
+   "OUT",
+   "PART",
+   "M",
+   "x_stride",
+   "N",
+   "K",
+   "SK",
+   "BM",
+   "SBN",
+   "BLOCK_N",
+   "GPI",
+   "F32",
+   "PACKED"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.nvfp4._reduce": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PART",
+   "OUT",
+   "total",
+   "SK",
+   "BLOCK",
+   "F32"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.qmm._bsig": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.qmm._deq": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "words",
+   "shifts",
+   "ROWS"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.qmm._group_sums": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "XS",
+   "x_stride",
+   "K",
+   "GB"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.qmm._qmm": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "XS",
+   "W",
+   "S",
+   "B",
+   "OUT",
+   "PART",
+   "M",
+   "x_stride",
+   "N",
+   "K",
+   "SK",
+   "BM",
+   "BLOCK_N",
+   "GPI",
+   "F32",
+   "SBN"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.qmm._qmm_hcdown": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "H",
+   "PSS",
+   "SCALE",
+   "NORMED",
+   "W",
+   "S",
+   "B",
+   "OUT",
+   "PART",
+   "M",
+   "eps",
+   "N",
+   "K",
+   "D",
+   "NC",
+   "SS",
+   "SK",
+   "BM",
+   "BLOCK_N",
+   "GPI",
+   "SBN"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.qmm._qmm_upmix": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "X",
+   "XS",
+   "W",
+   "S",
+   "B",
+   "NORMED",
+   "MIXED",
+   "XSM",
+   "M",
+   "N",
+   "K",
+   "D",
+   "SS",
+   "BM",
+   "DB",
+   "GPI",
+   "SBN"
+  ]
+ },
+ "tensorfold.families.qwen4_exp.cuda.qmm._reduce": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "PART",
+   "OUT",
+   "total",
+   "SK",
+   "BLOCK",
+   "F32"
+  ]
+ },
+ "triton.experimental.gluon.language._standard.full_like": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "value",
+   "shape",
+   "dtype",
+   "layout"
+  ]
+ },
+ "triton.experimental.gluon.language._standard.zeros": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "shape",
+   "dtype",
+   "layout"
+  ]
+ },
+ "triton.experimental.gluon.language._standard.zeros_like": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "shape",
+   "dtype",
+   "layout"
+  ]
+ },
+ "triton.experimental.gluon.language.nvidia.ampere.mbarrier.allocate_mbarrier": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "batch",
+   "two_ctas"
+  ]
+ },
+ "triton.experimental.gluon.language.nvidia.hopper.mbarrier.sync_cluster_init": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": []
+ },
+ "triton.language.random.pair_uniform_to_normal": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "u1",
+   "u2"
+  ]
+ },
+ "triton.language.random.philox": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "seed",
+   "c0",
+   "c1",
+   "c2",
+   "c3",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.philox_impl": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "c0",
+   "c1",
+   "c2",
+   "c3",
+   "k0",
+   "k1",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.rand": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "seed",
+   "offset",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.rand4x": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "seed",
+   "offsets",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.randint": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "seed",
+   "offset",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.randint4x": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "seed",
+   "offset",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.randn": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "seed",
+   "offset",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.randn4x": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "seed",
+   "offset",
+   "n_rounds"
+  ]
+ },
+ "triton.language.random.uint_to_uniform_float": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x"
+  ]
+ },
+ "triton.language.standard._argmax_combine": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "value1",
+   "index1",
+   "value2",
+   "index2",
+   "tie_break_left"
+  ]
+ },
+ "triton.language.standard._argmax_combine_tie_break_fast": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "value1",
+   "index1",
+   "value2",
+   "index2"
+  ]
+ },
+ "triton.language.standard._argmax_combine_tie_break_left": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "value1",
+   "index1",
+   "value2",
+   "index2"
+  ]
+ },
+ "triton.language.standard._argmin_combine": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "value1",
+   "index1",
+   "value2",
+   "index2",
+   "tie_break_left"
+  ]
+ },
+ "triton.language.standard._argmin_combine_tie_break_fast": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "value1",
+   "index1",
+   "value2",
+   "index2"
+  ]
+ },
+ "triton.language.standard._argmin_combine_tie_break_left": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "value1",
+   "index1",
+   "value2",
+   "index2"
+  ]
+ },
+ "triton.language.standard._bitonic_merge": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "stage",
+   "order",
+   "n_dims"
+  ]
+ },
+ "triton.language.standard._bitonic_merge_hypercube": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "stage",
+   "order"
+  ]
+ },
+ "triton.language.standard._compare_and_swap": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "flip",
+   "i"
+  ]
+ },
+ "triton.language.standard._elementwise_max": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "a",
+   "b"
+  ]
+ },
+ "triton.language.standard._elementwise_min": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "a",
+   "b"
+  ]
+ },
+ "triton.language.standard._indicator": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "n_dims",
+   "j"
+  ]
+ },
+ "triton.language.standard._or_combine": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "y"
+  ]
+ },
+ "triton.language.standard._prod_combine": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "a",
+   "b"
+  ]
+ },
+ "triton.language.standard._sum_combine": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "a",
+   "b"
+  ]
+ },
+ "triton.language.standard._xor_combine": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "a",
+   "b"
+  ]
+ },
+ "triton.language.standard.argmax": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "tie_break_left",
+   "keep_dims"
+  ]
+ },
+ "triton.language.standard.argmin": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "tie_break_left",
+   "keep_dims"
+  ]
+ },
+ "triton.language.standard.bitonic_merge": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "dim",
+   "descending"
+  ]
+ },
+ "triton.language.standard.cdiv": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "div"
+  ]
+ },
+ "triton.language.standard.cumprod": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "reverse"
+  ]
+ },
+ "triton.language.standard.cumsum": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "reverse",
+   "dtype"
+  ]
+ },
+ "triton.language.standard.flip": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "dim"
+  ]
+ },
+ "triton.language.standard.interleave": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "a",
+   "b"
+  ]
+ },
+ "triton.language.standard.max": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "return_indices",
+   "return_indices_tie_break_left",
+   "keep_dims"
+  ]
+ },
+ "triton.language.standard.min": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "return_indices",
+   "return_indices_tie_break_left",
+   "keep_dims"
+  ]
+ },
+ "triton.language.standard.ravel": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "can_reorder"
+  ]
+ },
+ "triton.language.standard.reduce_or": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "keep_dims"
+  ]
+ },
+ "triton.language.standard.sigmoid": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x"
+  ]
+ },
+ "triton.language.standard.softmax": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "dim",
+   "keep_dims",
+   "ieee_rounding"
+  ]
+ },
+ "triton.language.standard.sort": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "dim",
+   "descending"
+  ]
+ },
+ "triton.language.standard.sort_impl": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "k",
+   "dim",
+   "descending"
+  ]
+ },
+ "triton.language.standard.squeeze": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "dim"
+  ]
+ },
+ "triton.language.standard.sum": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "keep_dims",
+   "dtype"
+  ]
+ },
+ "triton.language.standard.swizzle2d": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "i",
+   "j",
+   "size_i",
+   "size_j",
+   "size_g"
+  ]
+ },
+ "triton.language.standard.topk": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "k",
+   "dim"
+  ]
+ },
+ "triton.language.standard.unsqueeze": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "x",
+   "dim"
+  ]
+ },
+ "triton.language.standard.xor_sum": {
+  "do_not_specialize": [],
+  "kind": "GluonJITFunction",
+  "no_align": [],
+  "params": [
+   "input",
+   "axis",
+   "keep_dims"
+  ]
+ },
+ "triton.language.standard.zeros": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "shape",
+   "dtype"
+  ]
+ },
+ "triton.language.standard.zeros_like": {
+  "do_not_specialize": [],
+  "kind": "JITFunction",
+  "no_align": [],
+  "params": [
+   "input"
+  ]
+ }
+}

@@ -52,10 +52,21 @@ pub const Snapshots = struct {
         peer_other_bytes: ?*const fn (*anyopaque, u64) anyerror!u64 = null,
         peer_other_remove: ?*const fn (*anyopaque, u64) anyerror!void = null,
         forget_checked: ?*const fn (*anyopaque, [:0]const u8, u64) anyerror!void = null,
+        /// A state leaving memory for room or a cap (the policy lets it go to disk): the family may store it first.
+        evict: ?*const fn (ptr: *anyopaque, saved: Saved, tokens: []const u32, at: u32) void = null,
+        /// The longest stored state `prompt` extends that is longer than `longer_than` (null: none).
+        stored: ?*const fn (ptr: *anyopaque, prompt: []const u32, longer_than: u32, at: *u32, key: *u64, tokens: *[]const u32) bool = null,
+        /// Read stored state `key` of `at` tokens into new storage; the store keeps it like a saved one.
+        load: ?*const fn (ptr: *anyopaque, key: u64, at: u32) anyerror!Saved = null,
+        /// The disk tier's numbers: entries, bytes, writes, write bytes, reads, read bytes, skipped, failed.
+        spill_stats: ?*const fn (ptr: *anyopaque, out: *[8]u64) void = null,
         /// Learned state `key`'s files under `dir` removed (the cap needs room, or they no longer read back).
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
     };
 };
+
+/// A state a family holds on disk (the spill tier): its position and tokens, and the family's key for it.
+pub const Stored = struct { at: u32, key: u64, tokens: []const u32 };
 
 /// What a paged store asks of the backend's pages: who holds each, and how many are free.
 pub const Pages = struct {
@@ -94,6 +105,50 @@ pub const Rules = struct {
     tail: bool = false,
 };
 
+/// What a family's recipe adds to the store's own order (GLM's kept-state policy, multi.py): off by default. The caps
+/// are Thomas Wade's (ThomasWadeZ, PR #65), the recency of shared cuts meleesciony's (issue #75), the share of the pool
+/// jdecker76's (issue #84), the disk tier Robert Wojciechowski's (wojo, patch 0088): the recipe's authors.
+pub const Policy = struct {
+    /// Kept states at most (0: no limit): the oldest superseded one goes first (`capVictim`), then the least recently used.
+    entries: u32 = 0,
+    /// The bytes the kept states hold together (0: only the budget): the states go by the same order, the newest stays.
+    bytes_cap: u64 = 0,
+    /// One conversation's own states at most (0: no limit), the least recently used of its own first; shared cuts are not counted.
+    per_chat: u32 = 0,
+    /// The recipe's order and marks: no rewind state, a conversation's shorter states superseded first, a shared cut only by recency.
+    recipe: bool = false,
+    /// The fewest tokens a shared-prefix state adds past the resume point (0: off): a state is also kept where the prompt
+    /// stops sharing a kept one (rounded down to the grid), as engine.shared_points.
+    shared_least: u32 = 0,
+    /// States leaving memory may go to the family's disk tier, and a lookup may read one back (the spill tier).
+    spill: bool = false,
+    /// Past this share of the budget (0: never) the states eviction would take next are stored early, one a keep.
+    spill_highwater: f64 = 0,
+};
+
+/// /health's kept-state view: counts, bytes, and the mix by origin and conversation.
+pub const KeptStats = struct {
+    prompts: u32 = 0,
+    bytes: u64 = 0,
+    bytes_cap: u64 = 0,
+    own: u32 = 0,
+    shared: u32 = 0,
+    chats: u32 = 0,
+    rows: u64 = 0,
+    entries_cap: u32 = 0,
+    per_chat: u32 = 0,
+    budget: u64 = 0,
+    /// [chat, states, longest] of the first chats (by chat id)
+    by_chat: [8][3]u64 = @splat(.{ 0, 0, 0 }),
+    by_chat_n: u8 = 0,
+    spill_on: bool = false,
+    spill: [8]u64 = @splat(0),
+    hits: u64 = 0,
+    misses: u64 = 0,
+    evicted: u64 = 0,
+    restored: u64 = 0,
+};
+
 pub const Entry = struct {
     tokens: []u32, // the state's tokens and `lookahead` more
     decode_spans: []modes.Span = &.{}, // canonical row arithmetic through at, excluding lookahead
@@ -104,9 +159,12 @@ pub const Entry = struct {
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
+    chat: u32 = 0, // the conversation (Policy): the state it resumed from, else a new one
+    own: bool = true, // a conversation's own state, not a shared cut
+    spilled: bool = false, // the family stored it on disk already (an early write)
 };
 
-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0 };
+pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0 };
 
 /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
 pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
@@ -129,6 +187,8 @@ pub const Store = struct {
     shared_keys: std.ArrayList(u64) = .empty, // the tokens of recently planned shared cuts, hashed (at most SHARED_KEYS)
     imprint: ?*imprint.Imprint = null, // --learn: shared cuts' states on disk, read back by later sessions and servers
     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
+    policy: Policy = .{},
+    next_chat: u32 = 1,
 
     const SHARED_KEYS = 64;
 
@@ -149,6 +209,21 @@ pub const Store = struct {
         s.gpa.free(e.decode_spans);
         s.gpa.free(e.last);
         s.gpa.destroy(e);
+    }
+
+    /// A state leaving memory for room or a cap: stored first when the policy allows it and a longer state of its
+    /// conversation does not hold it (multi.py `_superseded`).
+    fn evict(s: *Store, i: usize, to_disk: bool) void {
+        const e = s.entries.items[i];
+        if (to_disk and s.policy.spill and !e.spilled) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
+        s.remove(i);
+    }
+
+    fn superseded(s: *const Store, e: *const Entry) bool {
+        for (s.entries.items) |o| {
+            if (o != e and o.chat == e.chat and o.tokens.len > e.tokens.len and std.mem.eql(u32, o.tokens[0..e.tokens.len], e.tokens)) return true;
+        }
+        return false;
     }
 
     fn remove(s: *Store, i: usize) void {
@@ -228,7 +303,9 @@ pub const Store = struct {
     }
 
     /// `lookup` plus a rewind state on the starts or grid; a state kept under min_gap before it serves instead.
-    pub fn lookupRewind(s: *Store, a: Allocator, prompt: []const u32, history_len: u32, rewind_len: u32, shared: []const u32, starts: []const u32, spans: []const modes.Span) !Lookup {
+    pub fn lookupRewind(s: *Store, a: Allocator, prompt: []const u32, history_in: u32, rewind_in: u32, shared_in: []const u32, starts: []const u32, spans: []const modes.Span) !Lookup {
+        const rewind_len = if (s.policy.recipe) 0 else rewind_in;
+        const history_len = s.recipeHistory(prompt.len, history_in);
         const endpoint = if (s.rules.planned) s.startAt(starts, history_len) else history_len;
         const rewind = if (s.rules.planned) s.startAt(starts, rewind_len -| s.rules.lookahead) else rewind_len -| s.rules.lookahead;
         const endpoint_bytes = if (endpoint > 0 and (endpoint < prompt.len or (s.rules.warm and endpoint == prompt.len)) and endpoint + s.rules.lookahead <= prompt.len) s.family.vtable.bytes(s.family.ptr, endpoint) else 0;
@@ -241,6 +318,16 @@ pub const Store = struct {
         const e = s.recall(prompt, starts, spans, s.find(prompt, starts, spans));
         if (e == null) s.counts.misses += 1;
         const from = if (e) |x| x.at else 0;
+        var merged: ?[]u32 = null;
+        defer if (merged) |m| a.free(m);
+        var shared: []const u32 = if (s.policy.recipe and s.policy.shared_least == 0) &.{} else shared_in; // TF_GLM_SHARED_PREFIX=0: no shared points
+        if (s.policy.recipe and s.policy.shared_least > 0) if (s.lcpPoint(prompt, from, endpoint, starts)) |p| {
+            const m = try a.alloc(u32, shared_in.len + 1);
+            @memcpy(m[0..shared_in.len], shared_in);
+            m[shared_in.len] = p;
+            merged = m;
+            shared = m;
+        };
         const marks_ = if (s.active_rewind_at == 0)
             try s.fitting(a, try s.marks(a, prompt, from, history_len, shared, starts, if (e) |x| x.last else &.{}))
         else
@@ -265,7 +352,7 @@ pub const Store = struct {
         }
         while (s.held + need > s.budget) {
             const i = s.victimBut(from, prompt) orelse return;
-            s.remove(i);
+            s.evict(i, true);
             s.counts.evicted += 1;
         }
     }
@@ -413,10 +500,11 @@ pub const Store = struct {
                 if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
-            s.remove(s.victimBut(null, prompt).?); // its storage may come back spare and take this state
+            s.evict(s.victimBut(null, prompt).?, true); // its storage may come back spare and take this state
             s.counts.evicted += 1;
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
+        const chat = s.chatOf(prompt, at);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
             s.gpa.destroy(e);
@@ -434,7 +522,7 @@ pub const Store = struct {
             return s.fail(at, err);
         };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared };
+        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared };
         owns_decoded = false;
         s.entries.append(s.gpa, e) catch {
             s.free(e);
@@ -443,19 +531,21 @@ pub const Store = struct {
         s.held += charged;
         s.counts.kept += 1;
         if (shared) learned.learn(s, e, starts);
+        s.enforce(e);
         if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
         return true;
     }
 
     /// A learned state on disk longer than `have`, read back as a shared entry; else `have` (none, or reading failed).
-    fn recall(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have: ?*Entry) ?*Entry {
+    fn recall(s: *Store, prompt: []const u32, starts: []const u32, spans: []const modes.Span, have_in: ?*Entry) ?*Entry {
+        const have = if (spans.len == 0) s.spillRecall(prompt, have_in) else have_in;
         const im = s.imprint orelse return have;
         const read = s.family.vtable.read orelse return have;
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
         while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
-            s.remove(s.victimBut(have, prompt) orelse return have);
+            s.evict(s.victimBut(have, prompt) orelse return have, true);
             s.counts.evicted += 1;
         }
         if (bytes > s.budget) return have;
@@ -474,6 +564,71 @@ pub const Store = struct {
         s.held += bytes;
         if (!@import("builtin").is_test) std.log.info("prompt cache: read {d} learned tokens from disk", .{m.at});
         return e;
+    }
+
+    /// The spill tier's longest stored state this prompt extends, when it is longer than `have`: read into new storage as an
+    /// entry no conversation owns. Else `have`.
+    fn spillRecall(s: *Store, prompt: []const u32, have: ?*Entry) ?*Entry {
+        if (!s.policy.spill) return have;
+        const find_stored = s.family.vtable.stored orelse return have;
+        const load = s.family.vtable.load orelse return have;
+        var hit: Stored = .{ .at = 0, .key = 0, .tokens = &.{} };
+        if (!find_stored(s.family.ptr, prompt, if (have) |x| x.at else 0, &hit.at, &hit.key, &hit.tokens)) return have;
+        const bytes = s.family.vtable.bytes(s.family.ptr, hit.at);
+        if (bytes > s.budget) return have;
+        while (s.held + s.spare() + bytes > s.budget) {
+            s.evict(s.victimBut(have, prompt) orelse return have, true);
+            s.counts.evicted += 1;
+        }
+        const e = s.gpa.create(Entry) catch return have;
+        e.* = .{ .tokens = &.{}, .at = hit.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .own = false, .spilled = true, .chat = s.freshChat() };
+        e.tokens = s.gpa.dupe(u32, hit.tokens) catch return s.drop(e, have, false);
+        e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
+        e.saved = load(s.family.ptr, hit.key, hit.at) catch |err| {
+            note("reading {d} stored tokens failed ({s}); prefilling them", .{ hit.at, @errorName(err) });
+            return s.drop(e, have, false);
+        };
+        s.entries.append(s.gpa, e) catch return s.drop(e, have, true);
+        s.held += bytes;
+        s.counts.restored += 1;
+        return e;
+    }
+
+    /// Past the highwater share of the budget, the next state eviction would take is stored now (one a call), so its
+    /// eviction frees its memory at once.
+    fn earlyWrite(s: *Store) void {
+        const hw = s.policy.spill_highwater;
+        if (!s.policy.spill or hw <= 0) return;
+        if (@as(f64, @floatFromInt(s.held)) <= hw * @as(f64, @floatFromInt(s.budget))) return;
+        const f = s.family.vtable.evict orelse return;
+        const i = s.capVictim(null, true) orelse return;
+        const e = s.entries.items[i];
+        e.spilled = true;
+        if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
+    }
+
+    /// A clean stop: every state not stored yet is stored, newest first, until `max_ns` have passed.
+    pub fn flush(s: *Store, max_ns: u64) u32 {
+        if (!s.policy.spill) return 0;
+        const f = s.family.vtable.evict orelse return 0;
+        var t0: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t0);
+        var n: u32 = 0;
+        while (true) {
+            var best: ?*Entry = null;
+            for (s.entries.items) |e| if (!e.spilled and !s.superseded(e) and (best == null or e.used > best.?.used)) {
+                best = e;
+            };
+            const e = best orelse break;
+            e.spilled = true;
+            f(s.family.ptr, e.saved, e.tokens, e.at);
+            n += 1;
+            var t1: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t1);
+            const spent: u64 = @intCast((t1.sec - t0.sec) * 1_000_000_000 + (t1.nsec - t0.nsec));
+            if (spent > max_ns) break;
+        }
+        return n;
     }
 
     /// A half-made recalled entry undone (`saved` once read); the lookup goes on with `have`.
@@ -499,6 +654,7 @@ pub const Store = struct {
 
     /// The entry to free first, never `skip`: a superseded one, oldest first; else the oldest, the turn's rewind last.
     fn victimBut(s: *const Store, skip: ?*Entry, prompt: []const u32) ?usize {
+        if (s.policy.recipe) return s.capVictim(skip, false);
         var best: ?usize = null;
         for (s.entries.items, 0..) |e, i| {
             if (e.shared or e == skip or s.isActiveRewind(e, prompt)) continue; // a shared cut is evicted only as the least recently used
@@ -514,6 +670,128 @@ pub const Store = struct {
             oldest = i;
         };
         return oldest;
+    }
+
+    /// The recipe keeps a prompt's own end state on the grid whatever the request names (engine.grid_point): without a
+    /// history length (a raw prompt) the end of the prompt; a prompt that ends on the grid keeps one grid step short of
+    /// its end, so a repeat still runs its last rows (the recipe keeps the head's logits row to replay; here none).
+    fn recipeHistory(s: *const Store, n: usize, history: u32) u32 {
+        if (!s.policy.recipe) return history;
+        const h: u32 = if (history == 0 or history > n) @intCast(n) else history;
+        const g = s.rules.grid;
+        return if (s.rules.planned and g > 0 and h == n and h % g == 0 and h > g) h - g else h;
+    }
+
+    /// The recipe's cap_victim (multi.py): the least recently used state shorter than a longer one of its conversation, a
+    /// shared cut excepted; else the least recently used of all. Never `skip`.
+    fn capVictim(s: *const Store, skip: ?*Entry, unspilled: bool) ?usize {
+        var oldest: ?usize = null;
+        var shorter: ?usize = null;
+        for (s.entries.items, 0..) |e, i| {
+            if (e == skip or (unspilled and e.spilled)) continue;
+            if (oldest == null or e.used < s.entries.items[oldest.?].used) oldest = i;
+            if (e.shared) continue;
+            const longer = for (s.entries.items) |o| {
+                if (o != e and o.chat == e.chat and o.at > e.at) break true;
+            } else false;
+            if (longer and (shorter == null or e.used < s.entries.items[shorter.?].used)) shorter = i;
+        }
+        return shorter orelse oldest;
+    }
+
+    fn freshChat(s: *Store) u32 {
+        defer s.next_chat += 1;
+        return s.next_chat;
+    }
+
+    /// The conversation a state kept for `prompt` at `at` belongs to: the longest kept state this prompt extends (the one
+    /// it resumed from, or an earlier mark of this pass), else a new one.
+    fn chatOf(s: *Store, prompt: []const u32, at: u32) u32 {
+        var best: ?*Entry = null;
+        for (s.entries.items) |e| {
+            if (e.at >= at or e.tokens.len > prompt.len) continue;
+            if (best != null and e.at <= best.?.at) continue;
+            if (std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) best = e;
+        }
+        if (best) |b| return b.chat;
+        defer s.next_chat += 1;
+        return s.next_chat;
+    }
+
+    /// The caps after a state is kept (multi.py `_keep`): the conversation's own states, then the entry count, then the bytes.
+    fn enforce(s: *Store, newest: *Entry) void {
+        const p = s.policy;
+        if (p.per_chat > 0 and newest.own) while (true) {
+            var count: u32 = 0;
+            var oldest: ?usize = null;
+            for (s.entries.items, 0..) |e, i| if (e.own and e.chat == newest.chat) {
+                count += 1;
+                if (oldest == null or e.used < s.entries.items[oldest.?].used) oldest = i;
+            };
+            if (count <= p.per_chat) break;
+            if (s.entries.items[oldest.?] == newest) break; // the state this call kept stays
+            s.evict(oldest.?, false); // superseded turns are not worth the disk tier
+            s.counts.evicted += 1;
+        };
+        if (p.entries > 0) while (s.entries.items.len > @max(1, p.entries)) {
+            s.evict(s.capVictim(newest, false) orelse break, true);
+            s.counts.evicted += 1;
+        };
+        if (p.bytes_cap > 0) while (s.entries.items.len > 1 and s.held > p.bytes_cap) {
+            s.evict(s.capVictim(newest, false) orelse break, false); // dropped for its bytes: not written
+            s.counts.evicted += 1;
+        };
+        s.earlyWrite();
+    }
+
+    /// Where `prompt` stops sharing a kept state, rounded down to the grid, when that adds at least `shared_least` tokens past
+    /// the resume point and lies before the history's end (engine.shared_points; the system block's cut comes from the host).
+    fn lcpPoint(s: *const Store, prompt: []const u32, from: u32, endpoint: u32, starts: []const u32) ?u32 {
+        const least = s.policy.shared_least;
+        var best: usize = 0;
+        for (s.entries.items) |e| {
+            if (e.tokens.len < from + least) continue;
+            const n = @min(prompt.len, e.tokens.len);
+            const lcp = std.mem.indexOfDiff(u32, prompt[0..n], e.tokens[0..n]) orelse n;
+            best = @max(best, lcp);
+        }
+        const at: u32 = if (s.rules.planned) s.startAt(starts, @intCast(best)) else @intCast(best);
+        if (at < from + least or at >= endpoint) return null;
+        return at;
+    }
+
+    /// /health's kept-state numbers: the first eight conversations by their state count (the recipe's kept_mix.by_chat).
+    pub fn keptStats(s: *const Store) KeptStats {
+        var k: KeptStats = .{ .prompts = @intCast(s.entries.items.len), .bytes = s.held, .bytes_cap = s.policy.bytes_cap, .entries_cap = s.policy.entries, .per_chat = s.policy.per_chat, .budget = s.budget };
+        var chats: [64][3]u64 = undefined; // [chat, states, longest]
+        var n: usize = 0;
+        for (s.entries.items) |e| {
+            if (e.own) k.own += 1 else k.shared += 1;
+            k.rows += e.at;
+            const slot = for (chats[0..n]) |*c| {
+                if (c[0] == e.chat) break c;
+            } else if (n < chats.len) blk: {
+                chats[n] = .{ e.chat, 0, 0 };
+                n += 1;
+                break :blk &chats[n - 1];
+            } else continue;
+            slot[1] += 1;
+            slot[2] = @max(slot[2], e.at);
+        }
+        k.chats = @intCast(n);
+        std.mem.sort([3]u64, chats[0..n], {}, struct {
+            fn lt(_: void, x: [3]u64, y: [3]u64) bool {
+                return if (x[1] != y[1]) x[1] > y[1] else x[0] < y[0];
+            }
+        }.lt);
+        k.hits, k.misses, k.evicted, k.restored = .{ s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.restored };
+        if (s.policy.spill) if (s.family.vtable.spill_stats) |f| {
+            k.spill_on = true;
+            f(s.family.ptr, &k.spill);
+        };
+        k.by_chat_n = @intCast(@min(n, k.by_chat.len));
+        @memcpy(k.by_chat[0..k.by_chat_n], chats[0..k.by_chat_n]);
+        return k;
     }
 
     /// Eviction order past the superseded states: least recently used first, the turn's rewind state last.
@@ -547,6 +825,7 @@ fn floorStart(starts: []const u32, at: u32) u32 {
 test {
     _ = @import("prompt_cache_test.zig");
     _ = @import("prompt_cache_rewind_test.zig");
+    _ = @import("prompt_cache_policy_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = modes;
 }

@@ -1,7 +1,7 @@
 //! The server: one engine and tokenizer behind the HTTP routes, one thread a connection.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const errors = @import("errors.zig");
 const fields = @import("fields.zig");
 const auth = @import("auth.zig");
@@ -22,6 +22,7 @@ const log = @import("log.zig");
 const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
+const recipe_mod = @import("recipe.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -57,6 +58,8 @@ pub const Config = struct {
     /// --slide-graph: the file holding the Sliding Weights fact graph; null keeps the graph in memory.
     slide_graph: ?[]const u8 = null,
     timeouts: http_conn.Timeouts = .{},
+    /// The GLM recipe's switches (TF_GLM_*), read at start; `recipe.glm` turns its server behaviours on.
+    recipe: recipe_mod.Recipe = .{},
 };
 
 pub const Server = struct {
@@ -73,6 +76,8 @@ pub const Server = struct {
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
     eos: []const u32 = &.{},
+    /// The recipe's GLM tool-call handling applies: the tokenizer has `<tool_call>`, `<arg_key>` and `</arg_value>`.
+    glm_calls: bool = false,
     think_close: []const u32 = &.{},
     think_close_end: ?u32 = null,
     metrics: metrics.Metrics,
@@ -83,17 +88,26 @@ pub const Server = struct {
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
     preparing: std.atomic.Value(i64) = .init(0),
+    /// The reasoning of GLM's tool-calling replies, put back where a client dropped it (TF_GLM_KEEP_REASONING).
+    kept_reasoning: ?*@import("glm_kept.zig").KeptReasoning = null,
+    /// Requests the engine holds now, running or waiting, background ones included (admission.zig).
+    in_system: std.atomic.Value(u32) = .init(0),
     arena: std.heap.ArenaAllocator,
+    /// --vision: the helper that prepares picture and clip prompts (null: text only)
+    vision: ?*@import("vision_server.zig").Vision = null,
     /// Structured output's compiler, opened by the first structured request (Python's grammar.compiler).
     grammars: ?*api.grammar.Compiler = null,
     grammar_problem: ?[]const u8 = null,
     grammar_mutex: std.Io.Mutex = .init,
+    blank_ids: ?[]const u32 = null, // the whitespace-only tokens, sorted (a call gate lets them precede the opener)
     /// The facts the learner was taught and whether the weights recall them.
     slide: slide_graph.Graph,
     teacher: slide_lesson.Teacher, // what every Sliding Weights lesson shares: keep prompts, the turn's end
 
     /// Reads what the template and tokenizer decide once: late system role, think markers, efforts, the forced close.
     pub fn init(gpa: Allocator, io: std.Io, engine: api.Engine, text: model_text.Text, config: Config, keys: ?*auth.Store) !*Server {
+        @import("glm_keys.zig").enabled = config.recipe.glm; // a missing <arg_key> is put back by the end parser
+        errors.capacity_status = if (config.recipe.glm) 429 else 503; // the recipe: 429 + Retry-After: 5, not a bare 503 (patch 0081)
         const srv = try gpa.create(Server);
         srv.* = .{ .gpa = gpa, .io = io, .engine = engine, .info = engine.info(), .text = text, .config = config, .keys = keys, .metrics = .{ .gpa = gpa }, .store = .{ .gpa = gpa }, .arena = .init(gpa), .slide = .init(gpa, io, config.slide_graph), .teacher = .init(gpa) };
         if (config.keep_warm_s > 0) if (engine.keepaliveTarget()) |target| {
@@ -106,6 +120,13 @@ pub const Server = struct {
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         srv.effort_levels = try fields.effortLevels(a, text.templateSource());
+        srv.glm_calls = config.recipe.glm and text.tokenId("<tool_call>") != null and text.tokenId("<arg_key>") != null and text.tokenId("</arg_value>") != null;
+        if (config.recipe.glm and config.recipe.keep_reasoning > 0) {
+            const kept = try gpa.create(@import("glm_kept.zig").KeptReasoning);
+            kept.* = .init(gpa, io, config.recipe.keep_reasoning, config.recipe.keep_reasoning_mb);
+            srv.kept_reasoning = kept;
+        }
+        srv.config.loop_guard = config.loop_guard or (config.recipe.glm and config.recipe.loop_guard); // TF_GLM_LOOP_GUARD=1
         srv.late_system = try lateSystem(a, text);
         srv.needs_user_after_tool = needsUserAfterTool(text.templateSource());
         if (text.tokenId("</think>")) |end| {
@@ -123,6 +144,10 @@ pub const Server = struct {
     }
 
     pub fn deinit(srv: *Server) void {
+        if (srv.kept_reasoning) |k| {
+            k.deinit();
+            srv.gpa.destroy(k);
+        }
         if (srv.keepalive) |k| k.stop(); // before the engine's queue goes away
         if (srv.grammars) |g| g.close();
         srv.metrics.deinit();
@@ -166,7 +191,8 @@ pub const Server = struct {
     pub fn checkFeatures(srv: *Server, cx: *Cx, f: Value, has_tools: bool, thinking: bool, prompt_ids: []const u32, tools: []const Value, request: *api.Request) errors.Refused!void {
         _ = prompt_ids;
         const required = if (f.get("tool_call_required")) |r| r.truthy() else false;
-        if (has_tools and required and srv.info.structures) {
+        // GLM's recipe gates the call's first token (Info.call_gates, r107-serve) instead of compiling a grammar.
+        if (has_tools and required and srv.info.structures and !(srv.config.recipe.glm and srv.info.call_gates)) {
             const one_call = if (f.get("tool_call_single")) |x| x.truthy() else false;
             request.structure = try tool_grammar.structure(srv, cx, tools, !one_call, thinking);
         } else if (has_tools and required) {
@@ -183,12 +209,31 @@ pub const Server = struct {
                 };
                 break :blk if (ids.len > 0) ids[0] else null;
             } else srv.text.tokenId("<think>");
-            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close) };
+            request.call = .{ .opener = opener.?, .lead = form.?.lead orelse "", .tail = form.?.tail orelse "", .names = names.items, .think_open = think_open, .think_end = srv.text.tokenId(srv.markers.close), .blank = try srv.blankTokens() };
         }
         if (try grammar.spec(cx, f)) |s| {
             if (!srv.info.structures) return cx.refuse("structured output (response_format and the guided_* fields) is not supported by this engine yet");
             request.structure = try srv.compiledStructure(cx, s.kind, s.text, s.field, thinking);
         }
+    }
+
+    /// The ids of the vocabulary's whitespace-only tokens, sorted; scanned at the first gated request.
+    fn blankTokens(srv: *Server) Allocator.Error![]const u32 {
+        srv.grammar_mutex.lockUncancelable(srv.io);
+        defer srv.grammar_mutex.unlock(srv.io);
+        if (srv.blank_ids) |b| return b;
+        var out: std.ArrayList(u32) = .empty;
+        var scratch: std.heap.ArenaAllocator = .init(srv.gpa);
+        defer scratch.deinit();
+        var id: u32 = 0;
+        while (id < srv.text.vocabSize()) : (id += 1) {
+            _ = scratch.reset(.retain_capacity);
+            const text = try srv.text.decode(scratch.allocator(), &.{id});
+            if (text.len == 0) continue;
+            if (std.mem.indexOfNone(u8, text, " \t\r\n") == null) try out.append(srv.arena.allocator(), id);
+        }
+        srv.blank_ids = out.items;
+        return out.items;
     }
 
     /// A request's grammar, compiled once here (a 400 with xgrammar's reason when it cannot be enforced).

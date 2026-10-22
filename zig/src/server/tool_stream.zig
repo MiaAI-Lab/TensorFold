@@ -1,6 +1,6 @@
 //! Tool calls while they are written: XML calls as argument deltas, and the one-call policy's text filter.
 const std = @import("std");
-const json = @import("json.zig");
+const json = @import("json");
 const ids = @import("ids.zig");
 const reply_text = @import("reply_text.zig");
 const tool_params = @import("tool_params.zig");
@@ -188,12 +188,7 @@ fn trimTail(rest: []const u8, tail: usize) usize {
     return rest.len - reply_text.afterChars(rest, chars - tail).len;
 }
 
-fn typedSchema(schema: Value) bool {
-    const t = schema.get("type") orelse return false;
-    if (t != .string) return false;
-    for ([_][]const u8{ "array", "object", "boolean", "integer", "number", "null" }) |k| if (std.mem.eql(u8, k, t.string)) return true;
-    return false;
-}
+const typedSchema = tool_params.typedParameter;
 
 const wrap = @import("tool_parse.zig").wrapCalls;
 

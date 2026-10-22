@@ -1,0 +1,172 @@
+{
+ "text": {
+  "content": "Lighthouses are tall structures built along coastlines to guide ships and warn them away from dangerous rocks and reefs. Before modern navigation technology, lighthouse keepers maintained the lights by burning oil lamps and",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 14,
+   "completion_tokens": 40,
+   "total_tokens": 54,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 1.08
+ },
+ "png": {
+  "content": "This image shows a simple geometric composition on a solid dark blue background. The image contains four distinct elements:\n\n1. **Red circle** - Located in the upper-left area of the image, this is",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 62,
+   "completion_tokens": 40,
+   "total_tokens": 102,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 2.31
+ },
+ "jpg": {
+  "content": "The image shows a colorful abstract design featuring:\n\n1. **Diagonal rainbow stripes** - The background consists of vibrant diagonal bands of color running from the upper left to lower right, including blue, purple",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 122,
+   "completion_tokens": 40,
+   "total_tokens": 162,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 1.3
+ },
+ "webp": {
+  "content": "I see a vibrant rainbow gradient background with diagonal stripes running from the upper left to the lower right. The colors include:\n\n- **Blue** (top left corner)\n- **Purple/Magenta**\n-",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 122,
+   "completion_tokens": 40,
+   "total_tokens": 162,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 1.26
+ },
+ "two": {
+  "content": "# Comparing the Two Pictures\n\n## Similarities\n- Both images feature a **square** as a central element\n- Both use **vibrant, saturated colors**\n- Both appear to be",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 172,
+   "completion_tokens": 40,
+   "total_tokens": 212,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 1.4
+ },
+ "video": {
+  "content": "The video shows a simple animation on a dark blue background. A rectangular object, composed of three vertical stripes (a lighter blue stripe, a white stripe, and a slightly darker blue stripe), moves horizontally",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 134,
+   "completion_tokens": 40,
+   "total_tokens": 174,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 1.64
+ },
+ "system": {
+  "content": "The image contains a red circle, a green square, and a yellow triangle.",
+  "tool_calls": null,
+  "finish": "stop",
+  "usage": {
+   "prompt_tokens": 68,
+   "completion_tokens": 17,
+   "total_tokens": 85,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 0.54
+ },
+ "followup": {
+  "content": "A green square.",
+  "tool_calls": null,
+  "finish": "stop",
+  "usage": {
+   "prompt_tokens": 78,
+   "completion_tokens": 5,
+   "total_tokens": 83,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 0.49
+ },
+ "tool": {
+  "content": "The screenshot shows a simple graphic with a dark blue background containing three colorful geometric shapes:\n\n1. **A red circle** \u2014 positioned in the upper-left area of the image\n2. **A green",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 197,
+   "completion_tokens": 40,
+   "total_tokens": 237,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 1.21
+ },
+ "big": {
+  "content": "This image shows an abstract geometric composition on a dark navy blue background:\n\n**Main elements:**\n- **A large red circle** on the left side of the image, positioned in the upper-left quadrant",
+  "tool_calls": null,
+  "finish": "length",
+  "usage": {
+   "prompt_tokens": 2053,
+   "completion_tokens": 40,
+   "total_tokens": 2093,
+   "prompt_tokens_details": {
+    "cached_tokens": 0
+   },
+   "completion_tokens_details": {
+    "reasoning_tokens": 0
+   }
+  },
+  "seconds": 3.86
+ }
+}

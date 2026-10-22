@@ -1,0 +1,4910 @@
+{
+ "generator": "tools/zig/flashnext_int4ar_spec.py spec",
+ "target": [
+  "cuda",
+  121,
+  32
+ ],
+ "source_root": "/tensorfold/src",
+ "kernels": [
+  {
+   "function": "tensorfold.cuda.moe._topk_rows",
+   "name": "_topk_rows",
+   "source": {
+    "file": "tensorfold/cuda/moe.py",
+    "line": 58
+   },
+   "signature": {
+    "L": "*fp32",
+    "PICK": "*i32",
+    "WTS": "*fp32",
+    "NE": "constexpr",
+    "NL": "constexpr",
+    "TOPK": "constexpr",
+    "SLOTS": "constexpr",
+    "BLOCK": "constexpr",
+    "SLOTP": "constexpr"
+   },
+   "params": [
+    "L",
+    "PICK",
+    "WTS",
+    "NE",
+    "NL",
+    "TOPK",
+    "SLOTS",
+    "BLOCK",
+    "SLOTP"
+   ],
+   "constexprs": {
+    "NE": {
+     "int": 512
+    },
+    "NL": {
+     "int": 513
+    },
+    "TOPK": {
+     "int": 5
+    },
+    "SLOTS": {
+     "int": 6
+    },
+    "BLOCK": {
+     "int": 1024
+    },
+    "SLOTP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "L": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PICK": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "WTS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "NE": [],
+    "NL": [],
+    "TOPK": [],
+    "SLOTS": [],
+    "BLOCK": [],
+    "SLOTP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "b5103e129ba6eb194cdce38e2bdf4a4f3ac594a6113701b7cee6931b078d5fac",
+   "rule": "int4ar top-5 routing"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*fp32",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 4
+    },
+    "K": {
+     "int": 10240
+    },
+    "SK": {
+     "int": 32
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "02b8fb5c0924c61e881e489b4a7d87408671e26fcc48f1e7d3a6f79cbcd8263a",
+   "rule": "int4ar _b16mm the HC read-out's 4 block_inject rows beside its block-FP8 down projection (fp32), SK 32"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 96
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cloned_from": "1534c62807d9f001be9e9fd35728da0f9f2693263e855ae1f457248c88b0696d",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, one GPU (48 + 48 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 48
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "cloned_from": "1534c62807d9f001be9e9fd35728da0f9f2693263e855ae1f457248c88b0696d",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, a TP=2 rank (24 + 24 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 640
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "1534c62807d9f001be9e9fd35728da0f9f2693263e855ae1f457248c88b0696d",
+   "rule": "int4ar _b16mm the indexer's index_qk_proj (4 x 128 q + 128 k rows), replicated, SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*fp32",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 4
+    },
+    "K": {
+     "int": 10240
+    },
+    "SK": {
+     "int": 32
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "440b5d236a9278ecbbcc321f6218c406227838669f9fb0e13777821cfdca4b9b",
+   "rule": "int4ar _b16mm the HC read-out's 4 block_inject rows beside its block-FP8 down projection (fp32), SK 32"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*fp32",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 4
+    },
+    "K": {
+     "int": 10240
+    },
+    "SK": {
+     "int": 32
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "5b415408ad6894c52514680a6823886b889b208804b0a44ebcaecbbc6a54285d",
+   "rule": "int4ar _b16mm the HC read-out's 4 block_inject rows beside its block-FP8 down projection (fp32), SK 32"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 96
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cloned_from": "6861be8d344767f135e46d257c25a442525be175a4d5442e218935bd79161bc1",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, one GPU (48 + 48 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 48
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "cloned_from": "6861be8d344767f135e46d257c25a442525be175a4d5442e218935bd79161bc1",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, a TP=2 rank (24 + 24 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 640
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "6861be8d344767f135e46d257c25a442525be175a4d5442e218935bd79161bc1",
+   "rule": "int4ar _b16mm the indexer's index_qk_proj (4 x 128 q + 128 k rows), replicated, SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "constexpr",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "M": {
+     "int": 1
+    },
+    "N": {
+     "int": 96
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cloned_from": "948f97ccbe7fa39fe71f2004c8234f21189861a621518c243b2e044de99bdcda",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, one GPU (48 + 48 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "constexpr",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "M": {
+     "int": 1
+    },
+    "N": {
+     "int": 48
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "cloned_from": "948f97ccbe7fa39fe71f2004c8234f21189861a621518c243b2e044de99bdcda",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, a TP=2 rank (24 + 24 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "constexpr",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "M": {
+     "int": 1
+    },
+    "N": {
+     "int": 640
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "948f97ccbe7fa39fe71f2004c8234f21189861a621518c243b2e044de99bdcda",
+   "rule": "int4ar _b16mm the indexer's index_qk_proj (4 x 128 q + 128 k rows), replicated, SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*fp32",
+    "PART": "*fp32",
+    "M": "constexpr",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "M": {
+     "int": 1
+    },
+    "N": {
+     "int": 4
+    },
+    "K": {
+     "int": 10240
+    },
+    "SK": {
+     "int": 32
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "a4ec2b15c8aa424c7432cfb7520de3aeb61b064d8713c01eeb1441b324e9539f",
+   "rule": "int4ar _b16mm the HC read-out's 4 block_inject rows beside its block-FP8 down projection (fp32), SK 32"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 96
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cloned_from": "c2602c4a551d151d630a52c89dd5c3c15e754666dfda2f0e14ddcc0f990990b4",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, one GPU (48 + 48 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 48
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "cloned_from": "c2602c4a551d151d630a52c89dd5c3c15e754666dfda2f0e14ddcc0f990990b4",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, a TP=2 rank (24 + 24 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 640
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "c2602c4a551d151d630a52c89dd5c3c15e754666dfda2f0e14ddcc0f990990b4",
+   "rule": "int4ar _b16mm the indexer's index_qk_proj (4 x 128 q + 128 k rows), replicated, SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 96
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cloned_from": "edce626d89e9c610d37df881e74a35b10dda5e41b57eda94d6a53b03f22c6bda",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, one GPU (48 + 48 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 48
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "cloned_from": "edce626d89e9c610d37df881e74a35b10dda5e41b57eda94d6a53b03f22c6bda",
+   "rule": "int4ar _b16mm GDN in_proj_b|in_proj_a, a TP=2 rank (24 + 24 rows), SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 640
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "cloned_from": "edce626d89e9c610d37df881e74a35b10dda5e41b57eda94d6a53b03f22c6bda",
+   "rule": "int4ar _b16mm the indexer's index_qk_proj (4 x 128 q + 128 k rows), replicated, SK 8"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._hc_writeback",
+   "name": "_hc_writeback",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 52
+   },
+   "signature": {
+    "H": "*bf16",
+    "HOUT": "*bf16",
+    "PSS": "*fp32",
+    "BR": "*bf16",
+    "INJ": "*bf16",
+    "Y": "*fp32",
+    "WTS": "*fp32",
+    "RS": "i32",
+    "D": "constexpr",
+    "S": "constexpr",
+    "MODE": "constexpr",
+    "TOPK": "constexpr",
+    "SLOTS": "constexpr",
+    "BLOCK": "constexpr",
+    "WORLD": "constexpr"
+   },
+   "params": [
+    "H",
+    "HOUT",
+    "PSS",
+    "BR",
+    "INJ",
+    "Y",
+    "WTS",
+    "RS",
+    "D",
+    "S",
+    "MODE",
+    "TOPK",
+    "SLOTS",
+    "BLOCK",
+    "WORLD"
+   ],
+   "constexprs": {
+    "D": {
+     "int": 2560
+    },
+    "S": {
+     "int": 4
+    },
+    "MODE": {
+     "int": 2
+    },
+    "TOPK": {
+     "int": 5
+    },
+    "SLOTS": {
+     "int": 6
+    },
+    "BLOCK": {
+     "int": 256
+    },
+    "WORLD": {
+     "int": 1
+    }
+   },
+   "attrs": {
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "HOUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PSS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BR": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "INJ": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "Y": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "WTS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "RS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "D": [],
+    "S": [],
+    "MODE": [],
+    "TOPK": [],
+    "SLOTS": [],
+    "BLOCK": [],
+    "WORLD": []
+   },
+   "options": {
+    "num_warps": 2,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cloned_from": "10bc98f4e31039157bd2952e89f1e766480fee899ff7312e50a69e16f332e09a",
+   "rule": "int4ar mode 2 over 5 routed slots + shared (Y *fp32)"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._hc_writeback",
+   "name": "_hc_writeback",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 52
+   },
+   "signature": {
+    "H": "*bf16",
+    "HOUT": "*bf16",
+    "PSS": "*fp32",
+    "BR": "*bf16",
+    "INJ": "*bf16",
+    "Y": "*bf16",
+    "WTS": "*fp32",
+    "RS": "i32",
+    "D": "constexpr",
+    "S": "constexpr",
+    "MODE": "constexpr",
+    "TOPK": "constexpr",
+    "SLOTS": "constexpr",
+    "BLOCK": "constexpr",
+    "WORLD": "constexpr"
+   },
+   "params": [
+    "H",
+    "HOUT",
+    "PSS",
+    "BR",
+    "INJ",
+    "Y",
+    "WTS",
+    "RS",
+    "D",
+    "S",
+    "MODE",
+    "TOPK",
+    "SLOTS",
+    "BLOCK",
+    "WORLD"
+   ],
+   "constexprs": {
+    "D": {
+     "int": 2560
+    },
+    "S": {
+     "int": 4
+    },
+    "MODE": {
+     "int": 2
+    },
+    "TOPK": {
+     "int": 5
+    },
+    "SLOTS": {
+     "int": 6
+    },
+    "BLOCK": {
+     "int": 256
+    },
+    "WORLD": {
+     "int": 1
+    }
+   },
+   "attrs": {
+    "H": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "HOUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PSS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "BR": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "INJ": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "Y": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "WTS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "RS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "D": [],
+    "S": [],
+    "MODE": [],
+    "TOPK": [],
+    "SLOTS": [],
+    "BLOCK": [],
+    "WORLD": []
+   },
+   "options": {
+    "num_warps": 2,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "cloned_from": "656238627ca5f6da8122fd7ab081eb1bc5214c86d1d4de3ab013ea1aedab9f69",
+   "rule": "int4ar mode 2 over 5 routed slots + shared (Y *bf16)"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._moe_partial",
+   "name": "_moe_partial",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 125
+   },
+   "signature": {
+    "Y": "*bf16",
+    "WTS": "*fp32",
+    "OUT": "*fp32",
+    "D": "constexpr",
+    "TOPK": "constexpr",
+    "SLOTS": "constexpr",
+    "BLOCK": "constexpr"
+   },
+   "params": [
+    "Y",
+    "WTS",
+    "OUT",
+    "D",
+    "TOPK",
+    "SLOTS",
+    "BLOCK"
+   ],
+   "constexprs": {
+    "D": {
+     "int": 2560
+    },
+    "TOPK": {
+     "int": 5
+    },
+    "SLOTS": {
+     "int": 6
+    },
+    "BLOCK": {
+     "int": 256
+    }
+   },
+   "attrs": {
+    "Y": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "WTS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "D": [],
+    "TOPK": [],
+    "SLOTS": [],
+    "BLOCK": []
+   },
+   "options": {
+    "num_warps": 2,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "rule": "int4ar a rank's MoE partial over 6 slots (Y *bf16)",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.bf16._b16mm",
+   "name": "_b16mm",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/bf16.py",
+    "line": 50
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*fp32",
+    "PART": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "PART",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 4
+    },
+    "K": {
+     "int": 10240
+    },
+    "SK": {
+     "int": 32
+    },
+    "BM": {
+     "int": 16
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "PART": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "rule": "int4ar _b16mm the HC read-out's 4 block_inject rows beside its block-FP8 down projection (fp32), SK 32",
+   "cloned_from": "02b8fb5c0924c61e881e489b4a7d87408671e26fcc48f1e7d3a6f79cbcd8263a"
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.glue._moe_partial",
+   "name": "_moe_partial",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/glue.py",
+    "line": 125
+   },
+   "signature": {
+    "Y": "*fp32",
+    "WTS": "*fp32",
+    "OUT": "*fp32",
+    "D": "constexpr",
+    "TOPK": "constexpr",
+    "SLOTS": "constexpr",
+    "BLOCK": "constexpr"
+   },
+   "params": [
+    "Y",
+    "WTS",
+    "OUT",
+    "D",
+    "TOPK",
+    "SLOTS",
+    "BLOCK"
+   ],
+   "constexprs": {
+    "D": {
+     "int": 2560
+    },
+    "TOPK": {
+     "int": 5
+    },
+    "SLOTS": {
+     "int": 6
+    },
+    "BLOCK": {
+     "int": 256
+    }
+   },
+   "attrs": {
+    "Y": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "WTS": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "D": [],
+    "TOPK": [],
+    "SLOTS": [],
+    "BLOCK": []
+   },
+   "options": {
+    "num_warps": 2,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "rule": "int4ar a rank's MoE partial over 6 slots (Y *fp32)",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 4
+    },
+    "K": {
+     "int": 10240
+    },
+    "SK": {
+     "int": 32
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "rule": "int4ar _b16mm_ks the HC read-out's 4 block_inject rows beside its block-FP8 down projection (fp32), SK 32",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*fp32",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 4
+    },
+    "K": {
+     "int": 10240
+    },
+    "SK": {
+     "int": 32
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": true
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "rule": "int4ar _b16mm_ks the HC read-out's 4 block_inject rows beside its block-FP8 down projection (fp32), SK 32",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 96
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "rule": "int4ar _b16mm_ks GDN in_proj_b|in_proj_a, one GPU (48 + 48 rows), SK 8",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 48
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "rule": "int4ar _b16mm_ks GDN in_proj_b|in_proj_a, a TP=2 rank (24 + 24 rows), SK 8",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 640
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "rule": "int4ar _b16mm_ks the indexer's index_qk_proj (4 x 128 q + 128 k rows), replicated, SK 8",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 96
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1
+   ],
+   "rule": "int4ar _b16mm_ks GDN in_proj_b|in_proj_a, one GPU (48 + 48 rows), SK 8",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 48
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    2
+   ],
+   "rule": "int4ar _b16mm_ks GDN in_proj_b|in_proj_a, a TP=2 rank (24 + 24 rows), SK 8",
+   "cloned_from": null
+  },
+  {
+   "function": "tensorfold.families.qwen4_exp.cuda.prompt_mm._b16mm_ks",
+   "name": "_b16mm_ks",
+   "source": {
+    "file": "tensorfold/families/qwen4_exp/cuda/prompt_mm.py",
+    "line": 26
+   },
+   "signature": {
+    "X": "*bf16",
+    "W": "*bf16",
+    "OUT": "*bf16",
+    "M": "i32",
+    "x_stride": "i32",
+    "N": "constexpr",
+    "K": "constexpr",
+    "SK": "constexpr",
+    "BM": "constexpr",
+    "BLOCK_N": "constexpr",
+    "BK": "constexpr",
+    "F32": "constexpr",
+    "GROUP": "constexpr"
+   },
+   "params": [
+    "X",
+    "W",
+    "OUT",
+    "M",
+    "x_stride",
+    "N",
+    "K",
+    "SK",
+    "BM",
+    "BLOCK_N",
+    "BK",
+    "F32",
+    "GROUP"
+   ],
+   "constexprs": {
+    "N": {
+     "int": 640
+    },
+    "K": {
+     "int": 2560
+    },
+    "SK": {
+     "int": 8
+    },
+    "BM": {
+     "int": 128
+    },
+    "BLOCK_N": {
+     "int": 64
+    },
+    "BK": {
+     "int": 64
+    },
+    "F32": {
+     "bool": false
+    },
+    "GROUP": {
+     "int": 8
+    }
+   },
+   "attrs": {
+    "X": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "W": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "OUT": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "M": [],
+    "x_stride": [
+     [
+      "tt.divisibility",
+      16
+     ]
+    ],
+    "N": [],
+    "K": [],
+    "SK": [],
+    "BM": [],
+    "BLOCK_N": [],
+    "BK": [],
+    "F32": [],
+    "GROUP": []
+   },
+   "options": {
+    "num_warps": 4,
+    "num_ctas": 1,
+    "num_stages": 3,
+    "warp_size": 32,
+    "maxnreg": null,
+    "ptx_version": null,
+    "ptx_options": null,
+    "ir_override": null,
+    "enable_fp_fusion": true,
+    "enable_reflect_ftz": true,
+    "launch_cooperative_grid": false,
+    "launch_pdl": false,
+    "supported_fp8_dtypes": [
+     "fp8e4b15",
+     "fp8e4nv",
+     "fp8e5"
+    ],
+    "deprecated_fp8_dot_operand_dtypes": [
+     "fp8e4b15"
+    ],
+    "default_dot_input_precision": "tf32",
+    "allowed_dot_input_precisions": [
+     "tf32",
+     "tf32x3",
+     "ieee",
+     "bf16x3",
+     "bf16x6"
+    ],
+    "max_num_imprecise_acc_default": 0,
+    "extern_libs": [
+     [
+      "libdevice",
+      "/usr/local/lib/python3.12/dist-packages/triton/backends/nvidia/lib/libdevice.10.bc"
+     ]
+    ],
+    "debug": false,
+    "backend_name": "cuda",
+    "sanitize_overflow": true,
+    "arch": "sm121",
+    "instrumentation_mode": ""
+   },
+   "tp": [
+    1,
+    2
+   ],
+   "rule": "int4ar _b16mm_ks the indexer's index_qk_proj (4 x 128 q + 128 k rows), replicated, SK 8",
+   "cloned_from": null
+  }
+ ]
+}

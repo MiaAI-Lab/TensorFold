@@ -251,3 +251,11 @@ test "peak reset preserves an allocation between its read and store" {
     try std.testing.expectEqual(before.device + 100, after.device);
     try std.testing.expectEqual(before.device + 400, after.peak);
 }
+
+/// `rows` rows of `width` bytes from `src` (row pitch `src_pitch`) to `dst` (row pitch `dst_pitch`), device to device on
+/// `stream`: the contiguous clone of a strided activation block (Python's `x.clone(memory_format=contiguous_format)`).
+pub fn copyRows(d: *const Driver, dst: abi.DevicePtr, dst_pitch: usize, src: abi.DevicePtr, src_pitch: usize, width: usize, rows: usize, stream: abi.Stream) Error!void {
+    if (rows == 0 or width == 0) return;
+    const m: abi.Memcpy2D = .{ .src_device = src, .src_pitch = src_pitch, .dst_device = dst, .dst_pitch = dst_pitch, .width_bytes = width, .height = rows };
+    try d.check(d.api.cuMemcpy2DAsync_v2(&m, stream), "cuMemcpy2DAsync");
+}

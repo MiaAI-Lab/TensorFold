@@ -21,12 +21,17 @@ pub const Api = struct {
     ncclCommInitRank: *const fn (*Comm, c_int, UniqueId, c_int) callconv(.c) R,
     ncclCommInitAll: *const fn ([*]Comm, c_int, ?[*]const c_int) callconv(.c) R,
     ncclCommDestroy: *const fn (Comm) callconv(.c) R,
+    /// frees the communicator and ends its pending operations (a lost peer: NCCL then returns instead of waiting)
+    ncclCommAbort: *const fn (Comm) callconv(.c) R,
     ncclGetErrorString: *const fn (R) callconv(.c) ?[*:0]const u8,
     ncclAllReduce: *const fn (D, D, usize, DataType, RedOp, Comm, abi.Stream) callconv(.c) R,
     ncclAllGather: *const fn (D, D, usize, DataType, Comm, abi.Stream) callconv(.c) R,
     ncclBroadcast: *const fn (D, D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
     ncclGroupStart: *const fn () callconv(.c) R,
     ncclGroupEnd: *const fn () callconv(.c) R,
+    /// point to point (NCCL 2.7+): `count` elements to / from `peer`, matched in issue order on both sides
+    ncclSend: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
+    ncclRecv: *const fn (D, usize, DataType, c_int, Comm, abi.Stream) callconv(.c) R,
 };
 
 pub const Library = struct {

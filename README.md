@@ -2,7 +2,14 @@
 
 TensorFold 1.0.7 serves language models from a Zig binary on Apple Silicon and NVIDIA GPUs.
 The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
-Serving needs no Python or MLX installation.
+Default serving needs no Python or MLX installation. The optional GLM display-memory
+`dispram` backend uses the installed kindling Python client and a shared CPython library.
+
+[Ash Hart (ashhart)](https://github.com/ashhart) and the TensorFold contributors authored TensorFold.
+[jschmied](https://github.com/jschmied) authored the Zig CUDA serving path and family registry
+([PR #443](https://github.com/ashhart/TensorFold/pull/443)).
+[b12x / local-inference-lab](https://github.com/local-inference-lab) authored the RoCEnante protocol
+used by the GLM RoCE transport (Apache-2.0).
 
 ## Install and serve
 

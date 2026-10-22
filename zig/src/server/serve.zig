@@ -1,7 +1,7 @@
 //! A server's life: keys, the listening socket, the startup lines, the live line, and a clean stop on SIGTERM or SIGINT.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const auth = @import("auth.zig");
 const cli = @import("cli.zig");
 const log = @import("log.zig");
@@ -70,9 +70,13 @@ pub const Setup = struct {
     /// Sampling defaults from generation_config.json and the flags, as a JSON object; null: greedy.
     sampling: ?json.Value = null,
     environ: ?*const std.process.Environ.Map = null,
+    /// The GLM recipe's switches (main reads them before the weights load).
+    recipe: @import("recipe.zig").Recipe = .{},
     started: i96 = 0,
     /// Called once the socket listens, with its port (tests read it).
     on_listen: ?*const fn (port: u16) void = null,
+    /// --vision: the started helper (picture and clip prompts)
+    vision: ?*@import("vision_server.zig").Vision = null,
 };
 
 fn env(s: Setup, name: []const u8) ?[]const u8 {
@@ -113,6 +117,7 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         .reasoning_effort = args.reasoning_effort,
         .thinking_budget = args.thinking_budget,
         .loop_guard = args.loop_guard,
+        .recipe = s.recipe,
         .keep_warm_s = args.keep_warm,
         .default_sampling = s.sampling,
         .use_drafts = !args.no_drafts,
@@ -129,6 +134,14 @@ pub fn run(gpa: Allocator, io: std.Io, args: cli.Args, s: Setup) u8 {
         return 1;
     };
     defer srv.deinit();
+    if (s.vision) |h| {
+        if (!srv.info.media) {
+            std.debug.print("tensorfold: --vision: this engine takes no picture or clip rows\n", .{});
+            return 2;
+        }
+        srv.vision = h;
+        @import("http_body.zig").limit = 96 * 1024 * 1024;
+    }
     if (args.loop_guard and !srv.info.loop_guard) {
         std.debug.print("tensorfold: --loop-guard is not supported by this native engine\n", .{});
         return 2;

@@ -31,6 +31,8 @@ pub const CallGate = struct {
     names: []const []const u8 = &.{},
     think_open: ?u32 = null,
     think_end: ?u32 = null,
+    /// Ids of the tokens that are only whitespace, sorted: they may precede the opener (the server scans the vocabulary).
+    blank: []const u32 = &.{},
 };
 
 /// response_format and the guided_* fields: every token keeps the reply inside this grammar.
@@ -45,6 +47,10 @@ pub const Structure = struct {
 };
 
 pub const grammar = lanes.grammar;
+
+/// A prompt's pictures and clips, prepared by the vision frontend (rows, canvases or features).
+pub const Media = lanes.Media;
+pub const MediaItem = lanes.MediaItem;
 
 /// A reply to decode. The request and every slice in it stay valid until its ``finished`` event.
 pub const Request = struct {
@@ -78,10 +84,15 @@ pub const Request = struct {
     structure: ?Structure = null,
     /// Stop a short exact cycle while the think block is open.
     loop_guard: bool = false,
+    /// The recipe's loop rule (an exact cycle of 16 tokens or fewer held for 256, or one token taking half of the last
+    /// 256), not the short-cycle rule of the Mac server.
+    loop_recipe: bool = false,
     /// The prompt row (the assistant header's last) where routed lessons decide whether they act (null: none acts).
     decide: ?u32 = null,
     /// Logprob rows for each reply token with this many best tokens (0..20), when ``Info.logprobs``; null: none.
     logprobs: ?u8 = null,
+    /// The prompt's pictures and clips (``Info.media`` engines only); such a prompt is never kept or resumed.
+    media: ?*const Media = null,
 };
 
 pub const Reason = enum { stop, length, cancelled, failed };
@@ -138,6 +149,8 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
+    /// The engine takes ``Request.media`` (picture and clip rows).
+    media: bool = false,
     /// The policy the engine runs under, one line (`/health` shows it); empty: none.
     policy: []const u8 = "",
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
@@ -190,6 +203,13 @@ pub const Open = struct {
     speed_up: ?[]const u8 = null,
     prompt_cache_gib: ?f64 = null,
     prompt_cache_over_cap: bool = false,
+    /// The spill tier (--snapshot-dir, --spill-*; GLM CUDA): kept states written to disk and read back. gib 0: off.
+    spill_dir: ?[]const u8 = null,
+    spill_gib: f64 = 0,
+    spill_highwater: f64 = 0.70,
+    spill_min_tokens: u32 = 8192,
+    spill_min_free_gib: f64 = 50,
+    spill_flush_s: ?f64 = null,
     /// --learn: where shared prompt states are kept on disk for later sessions and servers (null: off).
     learn: ?[]const u8 = null,
     /// --learn-min-free-gib: filesystem space kept free before any learned-state write.
@@ -213,10 +233,15 @@ pub const Open = struct {
     master_port: u16 = 29551,
     /// --policy: the engine's policy as `key=value,...`; empty: its defaults.
     policy: []const u8 = "",
+    /// --vision (rank 0): picture and clip input, the engine hosts the vision tower.
+    vision: bool = false,
+    /// --vision-backend zig: rank 0's engine loads the vision tower itself
+    vision_zig: bool = false,
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.
-pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque };
+/// ``follow``: a rank other than 0 runs it instead of serving, until rank 0 stops (two-rank engines only).
+pub const Opened = struct { engine: Engine, close: *const fn (ctx: *anyopaque) void, ctx: *anyopaque, follow: ?*const fn (ctx: *anyopaque) anyerror!void = null };
 
 pub const Memory = struct { active: u64 = 0, cache: u64 = 0, peak: u64 = 0, pinned: u64 = 0 };
 
@@ -245,6 +270,11 @@ pub const Status = struct {
     streams: usize = 0,
     /// Generated tokens held by live streams, excluding their prompts.
     generation_tokens: u64 = 0,
+    /// The shared cache pool's rows and the free ones, for an engine that pools them (null: no pool to report).
+    pool_tokens: ?u64 = null,
+    pool_free_tokens: ?u64 = null,
+    /// The kept prompt states (/health's kept_prompts, kept_bytes, kept_mix); null without a prompt cache.
+    kept: ?prompt_cache.KeptStats = null,
 };
 
 pub const SubmitError = error{ Closed, Busy, InvalidSpans };

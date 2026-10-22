@@ -1,7 +1,7 @@
 //! GET /health, /v1/models, /metrics, and the opt-in dashboard.
 const std = @import("std");
 const api = @import("engine_api");
-const json = @import("json.zig");
+const json = @import("json");
 const live = @import("live.zig");
 const routes = @import("routes.zig");
 const Server = @import("server.zig").Server;
@@ -23,6 +23,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     var status: api.Status = .{};
     srv.engine.status(&status, &.{});
     try o.put(a, "warming", .{ .bool = status.warming });
+    try @import("glm_health.zig").put(a, o, status);
     const memory = try json.newObject(a);
     if (srv.engine.memory(std.mem.indexOf(u8, conn.path, "reset_peak=1") != null)) |mem| {
         try memory.put(a, "active", try json.intValue(a, mem.active));
@@ -30,8 +31,44 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
         try memory.put(a, "peak", try json.intValue(a, mem.peak));
     }
     try o.put(a, "memory", .{ .object = memory });
+    if (status.kept) |k| try keptFields(a, o, k);
     try o.put(a, "live", try live.snapshot(a, srv.engine));
+    if (srv.config.recipe.glm) try @import("glm_health.zig").add(srv, a, o, status);
     routes.sendValue(conn, a, 200, .{ .object = o });
+}
+
+/// The recipe's /health fields for the kept prompt states: kept_prompts, kept_bytes, kept_bytes_cap, kept_mix.
+fn keptFields(a: Allocator, o: *json.Object, k: api.prompt_cache.KeptStats) !void {
+    try o.put(a, "kept_prompts", try json.intValue(a, k.prompts));
+    try o.put(a, "kept_bytes", try json.intValue(a, k.bytes));
+    try o.put(a, "kept_bytes_cap", try json.intValue(a, k.bytes_cap));
+    try o.put(a, "kept_entries_cap", try json.intValue(a, k.entries_cap));
+    try o.put(a, "kept_budget", try json.intValue(a, k.budget));
+    const mix = try json.newObject(a);
+    try mix.put(a, "own", try json.intValue(a, k.own));
+    try mix.put(a, "shared", try json.intValue(a, k.shared));
+    try mix.put(a, "chats", try json.intValue(a, k.chats));
+    try mix.put(a, "rows", try json.intValue(a, k.rows));
+    const by = try a.alloc(Value, k.by_chat_n);
+    for (by, k.by_chat[0..k.by_chat_n]) |*slot, row| {
+        const triple = try a.alloc(Value, 3);
+        for (triple, row) |*v, n| v.* = try json.intValue(a, n);
+        slot.* = .{ .array = triple };
+    }
+    try mix.put(a, "by_chat", .{ .array = by });
+    try o.put(a, "kept_mix", .{ .object = mix });
+    const pc = try json.newObject(a);
+    try pc.put(a, "hits", try json.intValue(a, k.hits));
+    try pc.put(a, "misses", try json.intValue(a, k.misses));
+    try pc.put(a, "evicted", try json.intValue(a, k.evicted));
+    try pc.put(a, "restored_from_disk", try json.intValue(a, k.restored));
+    try o.put(a, "prompt_cache", .{ .object = pc });
+    if (k.spill_on) {
+        const sp = try json.newObject(a);
+        const names = [_][]const u8{ "entries", "bytes", "writes", "write_bytes", "reads", "read_bytes", "skipped", "failed" };
+        for (names, k.spill) |name, v| try sp.put(a, name, try json.intValue(a, v));
+        try o.put(a, "spill", .{ .object = sp });
+    }
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
@@ -64,6 +101,7 @@ fn modelValue(a: Allocator, id: []const u8, info: api.Info, created: i64) Alloca
 pub fn metrics(srv: *Server, conn: *Conn, a: Allocator) void {
     var out: std.Io.Writer.Allocating = .init(a);
     srv.metrics.render(srv.io, &out.writer, srv.engine, srv.info.context_window) catch return;
+    if (srv.config.recipe.glm) @import("glm_health.zig").metrics(srv, &out.writer) catch return;
     const body = out.written();
     conn.startResponse(200, null) catch return;
     conn.addHeader("Content-Type", "text/plain; version=0.0.4; charset=utf-8") catch return;
@@ -153,4 +191,21 @@ test "stats snapshot exposes counters and omits unknown memory" {
     for ([_][]const u8{ "running", "waiting", "generation_tokens_running", "prompt_tokens_total", "generation_tokens_total", "mtp_drafted_total", "mtp_accepted_total", "decode_rounds_total", "memory" }) |key|
         try std.testing.expect(object.contains(key));
     try std.testing.expectEqual(@as(usize, 0), object.get("memory").?.object.count());
+}
+
+test "health shows the kept prompt states: count, bytes, caps, the own/shared mix by conversation, the cache's counters and the spill tier" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const o = try json.newObject(a);
+    var k: api.prompt_cache.KeptStats = .{ .prompts = 3, .bytes = 1000, .bytes_cap = 4096, .own = 2, .shared = 1, .chats = 2, .rows = 300, .entries_cap = 32, .budget = 1 << 20, .hits = 5, .misses = 2, .evicted = 1, .restored = 1 };
+    k.by_chat[0] = .{ 1, 2, 200 };
+    k.by_chat[1] = .{ 2, 1, 100 };
+    k.by_chat_n = 2;
+    k.spill_on = true;
+    k.spill = .{ 4, 5000, 6, 7000, 1, 1000, 2, 0 };
+    try keptFields(a, o, k);
+    const text = try json.stringify(a, .{ .object = o }, .{});
+    for ([_][]const u8{ "\"kept_prompts\": 3", "\"kept_bytes\": 1000", "\"kept_bytes_cap\": 4096", "\"own\": 2", "\"shared\": 1", "\"chats\": 2", "\"rows\": 300", "\"by_chat\": [[1, 2, 200], [2, 1, 100]]", "\"hits\": 5", "\"restored_from_disk\": 1", "\"spill\"", "\"writes\": 6" }) |want|
+        try std.testing.expect(std.mem.indexOf(u8, text, want) != null);
 }

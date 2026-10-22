@@ -25,6 +25,10 @@ const Outcome = struct { got: []const u32, path: []const u32, cut: ?usize, follo
 const Result = struct { rows: u32, keep: u32, got: []const u32 };
 const Unread = struct { event: usize, handle: u64 };
 
+/// The host's hook for incremental fills: `err` null once the stream joined the rounds (or finished at its first
+/// token), else why its fill ended (error.Cancelled for a cancel); the stream is then released.
+pub const FillHook = struct { ptr: *anyopaque, done: *const fn (ptr: *anyopaque, s: *Stream, err: ?anyerror) void };
+
 pub const Engine = struct {
     gpa: Allocator,
     cfg: *const Config,
@@ -40,6 +44,8 @@ pub const Engine = struct {
     steps: u64 = 0,
     arena: std.heap.ArenaAllocator, // a round's temporaries
     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
+    filling: std.ArrayList(*Stream) = .empty, // streams whose prompts fill between rounds (backends with fill_step)
+    fill_hook: ?FillHook = null, // told when a filling stream's prompt is in (null error) or its fill ended without it
 
     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
         return .{
@@ -58,6 +64,8 @@ pub const Engine = struct {
                 .mtp_step_ms = cfg.mtp_step_ms,
                 .plain_guard = cfg.plain_guard,
                 .node_probabilities = cfg.node_probabilities,
+                .head_stops = cfg.head_stops,
+                .head_stops_most = cfg.head_stops_most,
                 .batch_rows = cfg.batch_rows,
             },
         };
@@ -65,6 +73,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         e.live.deinit(e.gpa);
+        e.filling.deinit(e.gpa);
         e.unread.deinit(e.gpa);
         e.rule.deinit();
         e.arena.deinit();
@@ -81,6 +90,100 @@ pub const Engine = struct {
     pub const opened = open.opened;
     pub const fills = open.fills;
     pub const fillStream = open.fillStream;
+
+    /// Whether the backend prefills a burst of prompts together.
+    pub fn batches(e: *const Engine) bool {
+        return e.backend.vtable.prefill_many != null and !e.slices();
+    }
+
+    /// Prefill several streams' prompts in one backend call (`batches`); each is then joined with `addPrefilled`.
+    /// `error.BurstRefused`: nothing ran, `addStream` them one at a time.
+    pub fn prefillBurst(e: *Engine, ss: []const *Stream) !void {
+        _ = e.arena.reset(.retain_capacity);
+        for (ss) |s| try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        const many = e.backend.vtable.prefill_many orelse return error.BurstRefused;
+        many(e.backend.ptr, ss) catch |err| {
+            if (err == error.Cancelled) for (ss) |s| e.backend.release(s);
+            return err;
+        };
+    }
+
+    /// A stream prefilled by `prefillBurst`: draw its first token and ask for its first drafts (addStream's second half).
+    pub fn addPrefilled(e: *Engine, s: *Stream) !void {
+        return e.opened(s);
+    }
+
+    /// Whether the backend fills prompts in slices between rounds (prefill_begin and fill_step).
+    pub fn slices(e: *const Engine) bool {
+        return e.backend.vtable.prefill_begin != null and e.backend.vtable.fill_step != null;
+    }
+
+    /// Admit a stream: with incremental fills its prompt starts filling (true; `fill_hook` hears when it is in),
+    /// else addStream prefills it now (false).
+    pub fn beginStream(e: *Engine, s: *Stream) !bool {
+        if (!e.slices()) {
+            try e.addStream(s);
+            return false;
+        }
+        _ = e.arena.reset(.retain_capacity);
+        try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+        e.backend.vtable.prefill_begin.?(e.backend.ptr, s) catch |err| {
+            if (err == error.Cancelled) e.backend.release(s);
+            return err;
+        };
+        e.filling.append(e.gpa, s) catch |err| {
+            e.backend.release(s);
+            return err;
+        };
+        return true;
+    }
+
+    /// Streams whose prompts are still filling.
+    pub fn fillingCount(e: *const Engine) usize {
+        return e.filling.items.len;
+    }
+
+    /// One slice of every filling prompt; a prompt that is in joins the rounds (its first token, first drafts).
+    fn advanceFills(e: *Engine) !void {
+        const n = e.filling.items.len;
+        const streams = try e.gpa.dupe(*Stream, e.filling.items);
+        defer e.gpa.free(streams);
+        const states = try e.gpa.alloc(be.FillState, n);
+        defer e.gpa.free(states);
+        @memset(states, .filling);
+        e.backend.vtable.fill_step.?(e.backend.ptr, streams, states) catch |err| {
+            e.filling.clearRetainingCapacity();
+            for (streams) |s| e.endFill(s, err, false);
+            return;
+        };
+        var kept: usize = 0;
+        for (streams, states) |s, st| {
+            if (st == .filling) {
+                e.filling.items[kept] = s;
+                kept += 1;
+            }
+        }
+        e.filling.shrinkRetainingCapacity(kept);
+        for (streams, states) |s, st| switch (st) {
+            .filling => {},
+            .cancelled => e.endFill(s, error.Cancelled, false),
+            .done => {
+                if (e.opened(s)) |_| {
+                    if (e.fill_hook) |h| h.done(h.ptr, s, null);
+                } else |err| e.endFill(s, err, err == error.Cancelled); // a cancel at its end released it already
+            },
+        };
+    }
+
+    /// A fill that ended without its stream joining: the stream is released and the host told why.
+    fn endFill(e: *Engine, s: *Stream, err: anyerror, released: bool) void {
+        if (!s.finished) {
+            s.finished = true;
+            s.reason = if (err == error.Cancelled) .cancelled else .@"error";
+            if (!released) e.backend.release(s);
+        }
+        if (e.fill_hook) |h| h.done(h.ptr, s, err);
+    }
 
     /// A stream another driver prefilled and drew `token` for: drafts asked, the token committed, rounds from here.
     pub fn adoptPrefilled(e: *Engine, s: *Stream, token: u32) !void {
@@ -104,6 +207,35 @@ pub const Engine = struct {
         try e.live.append(e.gpa, s);
     }
 
+    /// The first drafts of every stream that joined since the last round, in one request batch: the head reads each
+    /// prompt's last row and its first token (already sent) and drafts the ones after it.
+    fn joinDrafts(e: *Engine) !void {
+        var reqs: std.ArrayList(be.DraftRequest) = .empty;
+        defer reqs.deinit(e.gpa);
+        for (e.live.items) |s| {
+            if (!s.join_draft) continue;
+            s.join_draft = false;
+            if (s.finished or s.paused) continue;
+            const d: u32 = @intCast(try e.rule.depth(win.who(s)));
+            try reqs.append(e.gpa, .{ .stream = s, .follow = &.{}, .first = .{ .value = s.pending.? }, .rows = null, .start = s.prompt_len, .position = s.prompt_len + 1, .depth = d });
+        }
+        if (reqs.items.len == 0) return;
+        // in batches of the streams one head step takes (one at a time for a backend without shared rounds)
+        const per: usize = @max(1, e.cfg.batch_streams);
+        var at: usize = 0;
+        while (at < reqs.items.len) : (at += per) try e.backend.draft(reqs.items[at..@min(reqs.items.len, at + per)]);
+        for (reqs.items) |r| {
+            const s = r.stream;
+            s.dropHeld(e.gpa);
+            s.next = .{ .count = r.depth };
+            // the drafts the head holds (a stop rule may end the chain short of the ask), as askDrafts reads them
+            if (e.backend.vtable.tree) |tree| {
+                if (try tree(e.backend.ptr, s, e.gpa)) |held| s.next = held;
+            }
+            try trail.event(e, &.{ f("ev", str("draft")), f("stream", str(s.id)), f("depth", int(r.depth)), f("position", int(r.position)), f("follow", .{ .u32s = &.{s.pending.?} }), f("rows", .null) });
+        }
+    }
+
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {
         try e.live.append(e.gpa, s);
@@ -113,6 +245,12 @@ pub const Engine = struct {
     pub fn discard(e: *Engine, s: *Stream) void {
         s.finished = true;
         s.reason = .cancelled;
+        for (e.filling.items, 0..) |x, i| {
+            if (x == s) {
+                _ = e.filling.orderedRemove(i);
+                break;
+            }
+        }
         for (e.live.items, 0..) |x, i| {
             if (x == s) {
                 _ = e.live.orderedRemove(i);
@@ -124,6 +262,14 @@ pub const Engine = struct {
 
     /// One round for every live stream (Python `_family_step`).
     pub fn step(e: *Engine) !void {
+        // prompts filling between rounds take their slice first; one that is in joins this round
+        if (e.filling.items.len > 0) {
+            _ = e.arena.reset(.retain_capacity);
+            try e.advanceFills();
+        }
+        // the stop rule the head uses may depend on how many streams are live (cuda_lanes' served hybrid)
+        e.rule.live = e.live.items.len;
+        try e.joinDrafts();
         _ = e.arena.reset(.retain_capacity);
         const a = e.arena.allocator();
         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
@@ -154,7 +300,7 @@ pub const Engine = struct {
         } else {
             for (live.items) |s| {
                 // logprobs and grammars take verify windows: rows' logits are read, or bits made, before a forward
-                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null;
+                const windowed = (e.cfg.family_mtp and s.drafts) or !e.cfg.pipelined or s.logprobs != null or s.grammar != null or s.gateWatching();
                 const r = if (windowed) try e.familyRound(s, null) else try e.pipelinedRound(s);
                 s.min_rows = if (s.min_rows == 0) r.rows else @min(s.min_rows, r.rows);
             }
@@ -167,6 +313,7 @@ pub const Engine = struct {
                 e.release(s);
                 continue;
             }
+            if (s.reprefill) continue; // the host prefills the prompt plus the fix; this cache is not decoded on
             e.live.items[kept] = s;
             kept += 1;
         }
@@ -231,7 +378,7 @@ pub const Engine = struct {
         const o = try e.conclude(s, plan, out[0].sampled, out[0].rows, tokens, parents, windows[0].positions);
         if (o.path.len < rows or plan.parents != null) try e.backend.keep(&windows, &.{o.path});
         const held_levels = s.held_levels;
-        if (e.cfg.family_mtp and s.drafts) {
+        if (!s.reprefill and e.cfg.family_mtp and s.drafts) {
             if (early and o.cut == null) {
                 var w = win.who(s);
                 const d: u32 = @intCast(try e.rule.headDepth(&w, null, win.probe(e)));
@@ -293,7 +440,7 @@ pub const Engine = struct {
         }
         var heads: std.ArrayList(usize) = .empty;
         for (plans, 0..) |p, i| {
-            if (e.cfg.family_mtp and p.stream.drafts) try heads.append(a, i);
+            if (e.cfg.family_mtp and p.stream.drafts and !p.stream.reprefill) try heads.append(a, i);
         }
         const whos = try a.alloc(depth.Who, heads.items.len);
         for (whos, heads.items) |*w, i| w.* = win.who(plans[i].stream);
@@ -374,8 +521,15 @@ pub const Engine = struct {
         const budget_cut = s.thinkCut(committed.items);
         const loop_cut = sm.loopCut(s, committed.items);
         const loop_wins = if (loop_cut) |c| budget_cut == null or c < budget_cut.? else false;
+        const gate_cut = s.gateCut(committed.items);
+        const gate_wins = if (gate_cut) |g| (if (loop_wins) g < loop_cut.? else budget_cut == null or g < budget_cut.?) else false;
         var cut: ?usize = null;
-        if (loop_wins) {
+        if (gate_wins) {
+            cut = gate_cut;
+            path = path[0 .. gate_cut.? + 1];
+            committed.shrinkRetainingCapacity(gate_cut.?);
+            try committed.append(a, s.gate.?.spec.opener);
+        } else if (loop_wins) {
             cut = loop_cut;
             path = path[0 .. loop_cut.? + 1];
             committed.shrinkRetainingCapacity(loop_cut.? + 1);
@@ -397,6 +551,7 @@ pub const Engine = struct {
         const keep = path.len;
         s.cache_len += keep;
         s.pending = committed.items[keep - 1];
+        if (gate_wins and !s.finished) s.reprefill = true;
         const chain = accept.isChain(parents);
         try trail.event(e, &.{
             f("ev", str("round")),                                    f("stream", str(s.id)),
