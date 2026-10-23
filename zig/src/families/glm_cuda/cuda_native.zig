@@ -15,6 +15,11 @@ const cache_plan = @import("cuda_cache_plan.zig");
 const spill_mod = @import("cuda_spill.zig");
 const choice_mod = @import("cuda_mtp_choice.zig");
 const shard = @import("cuda_shard.zig");
+const identity = @import("cuda_spill_identity.zig");
+const spill_state = @import("cuda_spill_state.zig");
+const spill_wire = @import("cuda_spill_wire.zig");
+const spill_tier = @import("cuda_spill_tier.zig");
+const format = @import("core").spill.format;
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3"};
@@ -39,6 +44,13 @@ pub const Options = struct {
     spill_min_tokens: u32 = 8192,
     spill_min_free_gib: f64 = 50,
     spill_flush_s: ?f64 = null,
+    /// spill v2's knobs (the server's cli.spill: TF_GLM_SPILL_QUOTA, _TURNS, _READ_BLOCKS, _STAGE_MIB, and the flush
+    /// bound), used with TF_GLM_SPILL_V2=1 only
+    spill_quota: f64 = 0,
+    spill_turns: u32 = 4,
+    spill_read_blocks: u32 = 16,
+    spill_stage_mib: u32 = 256,
+    spill_flush_ms: u32 = 60_000,
     tp: u32 = 1,
     rank: u32 = 0,
     master: []const u8 = "",
@@ -67,7 +79,13 @@ pub const Loaded = struct {
     kv_parts: ?lanes.kv_parts.Source = null,
     /// the window a request may use when the engine had to shorten --context (TF_GLM_KV_SHARD: a part's; null: as asked)
     context: ?usize = null,
+    /// TF_GLM_SPILL_V2=1 on rank 0: the prompt cache's tier (native/cuda.zig sets it on the store; null: off)
+    tier: ?*SpillLeader = null,
 };
+
+/// Spill v2's tier on rank 0 and on the other ranks (cuda_spill_tier).
+pub const SpillLeader = spill_tier.Leader(engine.Engine);
+pub const SpillFollower = spill_tier.Follower(engine.Engine);
 
 const link_timeout_ms: u32 = 10 * 60 * 1000;
 
@@ -82,6 +100,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     // TF_GLM_KV_SHARD: every rank reads its own; a rank that cannot fails with the others, after the agreement
     const kv = shard.Switches.read();
     var kv_switches: shard.Switches = .{};
+    // TF_GLM_SPILL_V2 and the recipe's identity with it: the same (each rank's own, refused after the agreement)
+    const v2 = spillV2(o, choice);
+    var spill_env: ?identity.Env = null;
     const own = try gpa.create(Own);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .rank = o.rank, .world = o.tp };
@@ -102,20 +123,25 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             own.link = try link.Link.join(io, address, link_timeout_ms);
             try own.link.?.hello(o.rank);
         }
-        const text = try settings(gpa, io, dir, kernels, o, kv);
+        const text = try settings(gpa, io, dir, kernels, o, kv, v2);
         defer gpa.free(text);
         own.link.?.agreeRanks(gpa, o.rank, text) catch |e| {
             if (e == error.RanksDisagree) std.log.err("rank {d} loads with \"{s}\"; the other rank's settings differ", .{ o.rank, text });
-            // a rank that could not read its TF_GLM_KV_SHARD* (its text said `unreadable`) says why
+            // a rank that could not read its TF_GLM_KV_SHARD* or spill v2 identity (its text said `unreadable`) says why
             _ = kv catch |bad| return kvRefused(bad);
+            _ = v2 catch |bad| return kvRefused(bad);
             return e;
         };
         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
+        spill_env = spillAdmit(v2, o, choice, kv_switches) catch |e| return kvRefused(e);
         own.comm = try comm.Comm.init(gpa, own.link.?, o.rank, o.tp);
         std.log.info("rank {d}: settings agreed, NCCL joined", .{o.rank});
         own.watch = .{ .io = io, .fd = own.link.?.fd, .more = own.link.?.more, .rank = o.rank, .comm = mirror.Coll.of(comm.Comm, &own.comm.?) };
         try own.watch.?.start();
-    } else kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
+    } else {
+        kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
+        spill_env = spillAdmit(v2, o, choice, kv_switches) catch |e| return kvRefused(e);
+    }
     const streams: usize = @max(@as(usize, 1), @min(@as(usize, o.parallel), lane_backend.max_streams));
     own.engine = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{
         .context = o.context,
@@ -130,8 +156,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .vision = o.vision,
         .tower = o.tower,
         .kv_shard = if (kv_switches.on) kv_switches else null,
+        .spill_v2 = if (spill_env != null) tierSettings(o, 0) else null,
     });
     errdefer own.engine.?.deinit();
+    // spill v2: every rank's fingerprint, agreed over the control link before any store opens (TP=2: spillAdmit)
+    const agreement: ?identity.Agreement = if (spill_env) |env| try spillAgree(gpa, io, own, ctx, dir, kernels, o, choice, draft_dir, env, kv_switches, streams) else null;
     // TF_GLM_KV_SHARD may shorten the window a request uses to a part's (cuda_shard.fit); as asked otherwise
     const context = own.engine.?.context;
     const window: usize = 16;
@@ -146,7 +175,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     }
     try own.serving.?.init(gpa, own.engine.?, context, o.drafts, streams, window, @as(usize, o.rank), if (own.records) |*r| r.channel() else null);
     if (own.agreement) |*a| own.serving.?.setAgreement(a.gate(), if (own.watch) |*w| w else null);
-    const build_key = buildKey(gpa, io, dir, kernels, o) catch 0;
+    const build_key = if (agreement == null) buildKey(gpa, io, dir, kernels, o) catch 0 else 0;
+    var budget: u64 = 0;
+    const cache = cacheFor(own, o, build_key, agreement != null, &budget);
+    if (agreement) |a| openTier(own, gpa, io, o, a, budget) catch |e| return kvRefused(e);
     return .{
         .backend = own.serving.?.laneBackend(),
         .facts = own.serving.?.facts(),
@@ -155,10 +187,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .ctx = own,
         .deinit = Own.release,
         .follow = if (o.tp > 1 and o.rank >= 1) Own.follow else null,
-        .cache = cacheFor(own, o, build_key),
+        .cache = cache,
         .read_status = Own.readStatus,
         .kv_parts = if (own.engine.?.shard != null) .{ .ctx = own.engine.?, .read = engine.Engine.readKvParts } else null,
         .context = if (context != o.context) context else null,
+        .tier = own.tier,
     };
 }
 
@@ -173,13 +206,128 @@ fn kvAdmit(read: anyerror!shard.Switches, o: Options, choice: choice_mod.Choice)
 
 /// The refusal in the start-up's log, in words.
 fn kvRefused(err: anyerror) anyerror {
-    std.log.err("{s}", .{shard.why(err) orelse @errorName(err)});
+    std.log.err("{s}", .{refusal(err) orelse @errorName(err)});
     return err;
 }
 
 /// The words for a refusal this family explains (native/cuda.zig shows them in place of the error's name).
 pub fn refusal(err: anyerror) ?[]const u8 {
-    return shard.why(err);
+    return shard.why(err) orelse identity.why(err) orelse switch (err) {
+        error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
+        error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
+        error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: the prompt cache is off with MTP drafts, so spill v2 would keep nothing (DFlash2 drafts or none)",
+        error.SpillV2WithKvShard => "TF_GLM_SPILL_V2=1 with TF_GLM_KV_SHARD=1: spill v2 of sharded kept states is not in this build yet",
+        error.SpillV2NoPromptCache => "TF_GLM_SPILL_V2=1 needs the prompt cache, and a rank's kept-state budget is 0 (--prompt-cache-gib; with PROMPT_CACHE_GIB a lower KV_POOL_GIB)",
+        error.SpillV2StoreFailed => "TF_GLM_SPILL_V2=1: a rank's spill v2 store did not open (that rank's log says why)",
+        error.StagingTooSmall => "TF_GLM_SPILL_STAGE_MIB: spill v2's write ring holds two blocks at least (25 MiB), TF_GLM_SPILL_READ_BLOCKS one",
+        else => null,
+    };
+}
+
+/// TF_GLM_SPILL_V2=1 with the spill on (--spill-gib above 0 and --snapshot-dir): spill v2 instead of v1, and this rank's
+/// identity from the recipe (cuda_spill_identity.Env). Null: off (unset, blank or 0; or the spill off, and then nothing is
+/// read). Any other value is this rank's error, as a missing identity is.
+fn spillV2(o: Options, choice: choice_mod.Choice) anyerror!?identity.Env {
+    if (!(o.spill_gib > 0) or o.spill_dir == null) return null;
+    const v = std.mem.trim(u8, envText("TF_GLM_SPILL_V2") orelse return null, " ");
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return null;
+    if (!std.mem.eql(u8, v, "1")) return error.BadSpillV2;
+    return try identity.Env.read(envText, o.drafts and choice == .dflash2);
+}
+
+/// Spill v2 once the ranks agreed on it (its switch and knobs are in the settings text, so every rank answers alike):
+/// this rank's own read error, a world it does not run on yet (the recipe's two ranks; the identity agreement and the
+/// rank protocol are the pair's), MTP drafts (the prompt cache is off with them), KV sharding (round 3), or a staging
+/// too small for its blocks.
+fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choice, kv: shard.Switches) !?identity.Env {
+    const env = (try read) orelse return null;
+    if (o.tp != 2) return error.SpillV2NeedsTwoRanks;
+    if (o.drafts and choice == .mtp) return error.SpillV2WithMtp;
+    if (kv.on) return error.SpillV2WithKvShard;
+    try spill_tier.check(tierSettings(o, 0));
+    return env;
+}
+
+/// Spill v2's settings from the server's (`hold`: the release guard's limit, a quarter of the kept-state budget: held
+/// buffers sit outside it until their blocks are out).
+fn tierSettings(o: Options, budget: u64) spill_tier.Settings {
+    return .{ .dir = o.spill_dir orelse "", .gib = o.spill_gib, .min_free_gib = o.spill_min_free_gib, .min_tokens = o.spill_min_tokens, .quota = o.spill_quota, .turns = o.spill_turns, .read_blocks = o.spill_read_blocks, .stage_mib = o.spill_stage_mib, .hold_bytes = budget / 4 };
+}
+
+/// Spill v2's tier on this rank, once the ranks agreed on their identities and on one kept-state budget: this rank's
+/// store under its own compat (Agreement.storeCommon) over the staging the engine took before its pool, every rank's
+/// open agreed (one that failed fails the start on all), rank 0's tier for the prompt cache, the other ranks' on
+/// their lane backends.
+fn openTier(own: *Own, gpa: std.mem.Allocator, io: std.Io, o: Options, a: identity.Agreement, budget: u64) !void {
+    if (budget == 0) return error.SpillV2NoPromptCache;
+    const e = own.engine.?;
+    e.current();
+    const layout = try e.spillLayout();
+    const s = tierSettings(o, budget);
+    const compat = format.compatDigest(a.storeCommon(@intCast(o.rank)), .replicated, @intCast(spill_state.block_tokens), layout.block_bytes);
+    const opened = SpillLeader.S.open(gpa, io, e, layout, s, o.rank, compat, @intCast(e.context), e.tierStaging(), .{});
+    const ok = if (opened) |_| true else |err| blk: {
+        std.log.err("rank {d}: spill v2's store under {s} did not open ({s})", .{ o.rank, s.dir, @errorName(err) });
+        break :blk false;
+    };
+    const all = e.smallestOverRanks(@intFromBool(ok)) catch 0;
+    const side = try opened;
+    if (all == 0) {
+        side.close();
+        return error.SpillV2StoreFailed;
+    }
+    const handed = spill_tier.giveFolders(side.store);
+    const c = side.store.counts();
+    std.log.info("rank {d}: spill v2 tier: {s}, up to {d:.0} GiB, {d} points ({d} MiB) found; each kept state written at keep from {d} tokens, keeping {d:.0} GiB of disk free{s}", .{ o.rank, s.dir, s.gib, c.points, c.stored_bytes >> 20, s.min_tokens, s.min_free_gib, if (handed) "; its folders given to the spill directory's owner" else "" });
+    // a following rank outlives a stop signal this long: rank 0's flush has it drain its own writes first
+    e.spill_wait_ns = @as(u64, o.spill_flush_ms) * std.time.ns_per_ms;
+    if (o.rank == 0) {
+        var boot: [16]u8 = undefined;
+        io.random(&boot);
+        own.tier = SpillLeader.create(gpa, side, &own.serving.?.local, s, boot) catch |err| {
+            side.close();
+            return err;
+        };
+    } else {
+        own.follower_tier = SpillFollower.create(gpa, side, &own.serving.?.local) catch |err| {
+            side.close();
+            return err;
+        };
+        own.serving.?.local.spill_side = own.follower_tier.?.spillSide();
+    }
+}
+
+/// Spill v2's identity of this rank (cuda_spill_identity) from the opened engine, agreed with every other rank over the
+/// control link: the pair's Agreement (each rank's store opens under its `storeCommon`), or the start fails on every
+/// rank, the rank and field named in each one's log.
+fn spillAgree(gpa: std.mem.Allocator, io: std.Io, own: *Own, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options, choice: choice_mod.Choice, draft_dir: ?[]const u8, env: identity.Env, kv: shard.Switches, streams: usize) !identity.Agreement {
+    const e = own.engine.?;
+    const layout = try e.spillLayout();
+    var fbuf: [256]u8 = undefined;
+    const r: identity.Rank = .{
+        .dir = dir,
+        .kernels = kernels,
+        .drafter = if (!o.drafts) .off else if (choice == .dflash2) .dflash2 else .mtp,
+        .draft_dir = draft_dir,
+        .draft_quant = envText("TF_GLM_DRAFT_QUANT") orelse "minmax",
+        .world = o.tp,
+        .rank = o.rank,
+        .ring = e.caches.ring,
+        .layout = layout.digest(),
+        .capability = try ctx.capability(),
+        .driver = try ctx.d.version(),
+        .state_format = spill_state.format_version,
+        .wire = spill_wire.version,
+        .features = try identity.featureString(&fbuf, .{ .spill_min_tokens = o.spill_min_tokens, .kv_shard = kv.on, .drafts = o.drafts, .streams = @intCast(streams), .prefill_rows = @intCast(e.prefill_rows) }),
+        .env = env,
+    };
+    const fp = try identity.build(gpa, io, r);
+    var m: identity.Mismatch = .{};
+    return identity.agree(own.link.?, gpa, o.rank, o.tp, &fp, &m) catch |err| {
+        var buf: [192]u8 = undefined;
+        if (err == error.SpillIdentityMismatch) std.log.err("rank {d}: {s}", .{ o.rank, identity.mismatchLine(&buf, m) });
+        return err;
+    };
 }
 
 fn envText(name: [:0]const u8) ?[]const u8 {
@@ -260,13 +408,21 @@ fn openSpill(own: *Own, o: Options, build_key: u64) ?SpillSettings {
 
 /// The recipe's prompt cache for this process (rank 0 holds the store; both ranks hold the states and the reserve):
 /// budget and caps from the environment as the Python engine reads them, the machine's memory less the reserve.
-fn cacheFor(own: *Own, o: Options, build_key: u64) ?lane_backend.CacheHooks {
+/// `v2` (TF_GLM_SPILL_V2=1): every rank meets one gather for the smallest budget (a rank's kept states and restores
+/// follow rank 0's decisions), `agreed`, and v1's tier stays shut.
+fn cacheFor(own: *Own, o: Options, build_key: u64, v2: bool, agreed: *u64) ?lane_backend.CacheHooks {
+    agreed.* = 0;
     // MTP drafts: the head's taps pair a continuation's rows with the prompt's tokens from its start (promptTaps,
     // prompt_at), so a prefill that goes on from a kept or live state would misplace them; kept states wait for that
     if (own.engine.?.mtp != null) {
         if (o.rank == 0) std.log.info("prompt cache: off (MTP drafts do not resume from kept states yet)", .{});
         return null;
     }
+    // (spill v2: a rank that returns before its plan still meets the gather, with 0)
+    var met = false;
+    defer if (v2 and !met) {
+        _ = agreeBudget(own, 0);
+    };
     const env: cache_plan.Env = .{
         .entries = envText("TF_GLM_CACHE_ENTRIES"),
         .share_pct = envText("TF_GLM_CACHE_SHARE_PCT"),
@@ -295,19 +451,33 @@ fn cacheFor(own: *Own, o: Options, build_key: u64) ?lane_backend.CacheHooks {
     // refused (cuda_lanes pass agrees on the room first); the headroom only shapes the budget, so the kept states stay
     // that far above the floor and the prompts' own buffers have it
     e.keep_reserve = p.reserve;
+    met = true;
+    const budget = if (v2) agreeBudget(own, p.budget) else p.budget;
+    agreed.* = budget;
     // every rank writes and reads its own copies (rank 0 decides, rank 1 follows its notes)
-    const spill = if (p.budget > 0) openSpill(own, o, build_key) else null;
+    const spill = if (budget > 0 and !v2) openSpill(own, o, build_key) else null;
     if (o.rank != 0) return null;
-    if (p.budget == 0) {
+    if (budget == 0) {
         std.log.info("prompt cache: off (budget 0)", .{});
         return null;
     }
     std.log.info("prompt cache: {d:.1} GiB for kept states, at most {d} (fixed {d} MiB each){s}; per chat {d}, bytes cap {d} MiB, shared prefix {d}; {d:.1} GiB reserved, {d:.1} GiB headroom for the prompts' buffers", .{
-        @as(f64, @floatFromInt(p.budget)) / cache_plan.gib,                                        p.entries,                                     e.snapBytes(0) >> 20,
+        @as(f64, @floatFromInt(budget)) / cache_plan.gib,                                          p.entries,                                     e.snapBytes(0) >> 20,
         if (p.entries_capped) " (cut to three quarters of the budget)" else "",                    p.per_chat,                                    p.bytes_cap >> 20,
         p.shared_least,                                                                            @as(f64, @floatFromInt(p.reserve)) / cache_plan.gib,                              @as(f64, @floatFromInt(p.headroom)) / cache_plan.gib,
     });
-    return own.serving.?.local.cacheHooks(p.budget, .{ .grid = 64, .min_gap = 256, .min_prompt = 64, .entries = p.entries, .bytes_cap = p.bytes_cap, .per_chat = p.per_chat, .shared_least = p.shared_least }, if (spill) |sp| sp.highwater else 0, if (spill) |sp| sp.flush_s else 60);
+    return own.serving.?.local.cacheHooks(budget, .{ .grid = 64, .min_gap = 256, .min_prompt = 64, .entries = p.entries, .bytes_cap = p.bytes_cap, .per_chat = p.per_chat, .shared_least = p.shared_least }, if (spill) |sp| sp.highwater else 0, if (spill) |sp| sp.flush_s else 60);
+}
+
+/// Spill v2: the smallest kept-state budget over the ranks (one gather; 0 when it cannot be agreed: v2 is then refused).
+fn agreeBudget(own: *Own, mine: u64) u64 {
+    const e = own.engine.?;
+    const all = e.smallestOverRanks(mine) catch |err| {
+        std.log.err("rank {d}: spill v2's kept-state budget could not be agreed ({s})", .{ own.rank, @errorName(err) });
+        return 0;
+    };
+    if (all < mine) std.log.info("rank {d}: spill v2: the kept-state budget is {d:.1} GiB, another rank's (this rank's {d:.1} GiB)", .{ own.rank, @as(f64, @floatFromInt(all)) / cache_plan.gib, @as(f64, @floatFromInt(mine)) / cache_plan.gib });
+    return all;
 }
 
 const Own = struct {
@@ -323,6 +493,9 @@ const Own = struct {
     agreement: ?mirror.Agreement = null,
     records: ?mirror.Records = null,
     watch: ?mirror.Watch = null,
+    /// spill v2's tier: rank 0's (the prompt cache's) or this rank's lane backend's
+    tier: ?*SpillLeader = null,
+    follower_tier: ?*SpillFollower = null,
 
     fn readStatus(p: *anyopaque, tokens: *?u64, free: *?u64) void {
         const own: *Own = @ptrCast(@alignCast(p));
@@ -350,6 +523,16 @@ const Own = struct {
     fn release(p: *anyopaque) void {
         const own: *Own = @ptrCast(@alignCast(p));
         if (own.watch) |*w| w.quiet();
+        // spill v2's tier before the kept states and the engine it holds buffers of (the store's own release already
+        // ran: native/cuda.zig deinitializes the prompt cache first)
+        if (own.engine) |e| if (own.tier != null or own.follower_tier != null) e.current();
+        if (own.tier) |t| t.destroy();
+        own.tier = null;
+        if (own.follower_tier) |t| {
+            if (own.serving) |s| s.local.spill_side = null;
+            t.destroy();
+        }
+        own.follower_tier = null;
         if (own.serving) |s| {
             s.deinit();
             own.gpa.destroy(s);
@@ -427,8 +610,8 @@ fn onStop(_: std.posix.SIG) callconv(.c) void {
 }
 
 /// What both ranks must load alike, as text (its sha256 crosses the link). TF_GLM_KV_SHARD's words close it when on (or
-/// unreadable); off, the text is as before.
-fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []const u8, o: Options, kv: anyerror!shard.Switches) ![]u8 {
+/// unreadable), then spill v2's; off, the text is as before.
+fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []const u8, o: Options, kv: anyerror!shard.Switches, v2: anyerror!?identity.Env) ![]u8 {
     var snapshot = std.crypto.hash.sha2.Sha256.init(.{});
     for ([_][]const u8{ "config.json", "model.safetensors.index.json", "tokenizer.json" }) |name| try hashFile(gpa, io, &snapshot, dir, name);
     const choice = try choice_mod.environment();
@@ -447,9 +630,19 @@ fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []cons
     const memory = @import("cuda_display_kv.zig");
     var kv_buf: [80]u8 = undefined;
     const kv_words = if (kv) |sw| sw.text(&kv_buf) else |_| shard.unreadable;
-    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}", .{
-        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words,
+    // spill v2: on (its identity read) with the knobs every rank's store and tier must share, or a rank that cannot read
+    // either says so (a word no rank sends when it can)
+    var v2_buf: [192]u8 = undefined;
+    const v2_words: []const u8 = if (v2) |env| (if (env != null) try spillWords(&v2_buf, o) else "") else |_| " spill_v2=unreadable";
+    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}{s}", .{
+        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words, v2_words,
     });
+}
+
+/// Spill v2's words in the settings text: on, and what each rank's store and tier must share (its cap and floor, the
+/// quota, the turns kept, the staging, the flush bound).
+fn spillWords(buf: []u8, o: Options) ![]const u8 {
+    return std.fmt.bufPrint(buf, " spill_v2=1 gib={d} free={d} quota={d} turns={d} reads={d} stage={d} flush={d}", .{ o.spill_gib, o.spill_min_free_gib, o.spill_quota, o.spill_turns, o.spill_read_blocks, o.spill_stage_mib, o.spill_flush_ms });
 }
 
 fn hashFile(gpa: std.mem.Allocator, io: std.Io, h: *std.crypto.hash.sha2.Sha256, dir: []const u8, name: []const u8) !void {
@@ -547,17 +740,17 @@ pub fn prefillChunk(ctx: *anyopaque, rows: usize, pos: usize, parity: *[34]u1, h
 test "TF_GLM_KV_SHARD: the settings text carries it only when on, a rank that cannot read it a word no rank sends, and every rank refuses alike after the agreement" {
     const gpa = std.testing.allocator;
     const o: Options = .{ .context = 8192, .drafts = false, .parallel = 4, .tp = 2 };
-    const off = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{});
+    const off = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
     defer gpa.free(off);
     try std.testing.expect(std.mem.indexOf(u8, off, "kv_shard") == null);
-    const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true });
+    const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true }, null);
     defer gpa.free(on);
     try std.testing.expect(std.mem.endsWith(u8, on, " kv_shard=1 carry=1 twins=1 check=1024 lone=0"));
     try std.testing.expectEqualStrings(off, on[0..off.len]); // the same text, the words appended
-    const every = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true, .check = 64 });
+    const every = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true, .check = 64 }, null);
     defer gpa.free(every);
     try std.testing.expect(std.mem.endsWith(u8, every, " check=64 lone=0")); // another digest count: the ranks disagree
-    const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, error.BadKvShard);
+    const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, error.BadKvShard, null);
     defer gpa.free(bad);
     try std.testing.expect(std.mem.endsWith(u8, bad, shard.unreadable));
     try std.testing.expect(!std.mem.eql(u8, bad, on) and !std.mem.eql(u8, bad, off));
@@ -571,6 +764,69 @@ test "TF_GLM_KV_SHARD: the settings text carries it only when on, a rank that ca
     try std.testing.expectError(error.KvShardNotBuilt, kvAdmit(shard.Switches{ .on = true }, o, .dflash2));
     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
     try std.testing.expect(refusal(error.OutOfMemory) == null);
+}
+
+test "TF_GLM_SPILL_V2: the settings text carries it only when on and after KV sharding's words, a rank that cannot read it or its identity a word no rank sends; two ranks only; every refusal in words" {
+    const gpa = std.testing.allocator;
+    const o: Options = .{ .context = 8192, .drafts = false, .parallel = 4, .tp = 2, .spill_gib = 64, .spill_dir = "/spill" };
+    const env: identity.Env = .{ .engine = "a1b2c3d", .patches = "sha256:0014", .model_revision = "4f2e9a1" };
+    const off = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, null);
+    defer gpa.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "spill_v2") == null);
+    const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, @as(?identity.Env, env));
+    defer gpa.free(on);
+    try std.testing.expect(std.mem.endsWith(u8, on, " spill_v2=1 gib=64 free=50 quota=0 turns=4 reads=16 stage=256 flush=60000"));
+    try std.testing.expectEqualStrings(off, on[0..off.len]); // the same text, the words appended
+    var other = o;
+    other.spill_turns = 0;
+    const turns = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", other, shard.Switches{}, @as(?identity.Env, env));
+    defer gpa.free(turns);
+    try std.testing.expect(!std.mem.eql(u8, turns, on)); // a rank with other knobs: the ranks disagree
+    const both = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true }, @as(?identity.Env, env));
+    defer gpa.free(both);
+    try std.testing.expect(std.mem.indexOf(u8, both, " kv_shard=1 carry=1 twins=1 check=1024 lone=0 spill_v2=1 ") != null);
+    const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{}, error.NoEngineId);
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.endsWith(u8, bad, " spill_v2=unreadable"));
+    try std.testing.expect(!std.mem.eql(u8, bad, on) and !std.mem.eql(u8, bad, off));
+    // after the agreement: off passes; this rank's own error; a world other than two ranks; MTP drafts; KV sharding; a
+    // staging too small for two blocks; on
+    const kv: shard.Switches = .{};
+    try std.testing.expectEqual(@as(?identity.Env, null), try spillAdmit(null, o, .dflash2, kv));
+    try std.testing.expectError(error.NoModelRevision, spillAdmit(error.NoModelRevision, o, .dflash2, kv));
+    for ([_]u32{ 1, 3, 4 }) |tp| {
+        var x = o;
+        x.tp = tp;
+        try std.testing.expectError(error.SpillV2NeedsTwoRanks, spillAdmit(env, x, .dflash2, kv));
+    }
+    var mtp = o;
+    mtp.drafts = true;
+    try std.testing.expectError(error.SpillV2WithMtp, spillAdmit(env, mtp, .mtp, kv));
+    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, mtp, .dflash2, kv)).?.engine);
+    try std.testing.expectError(error.SpillV2WithKvShard, spillAdmit(env, o, .dflash2, .{ .on = true }));
+    var small = o;
+    small.spill_stage_mib = 24;
+    try std.testing.expectError(error.StagingTooSmall, spillAdmit(env, small, .dflash2, kv));
+    small.spill_stage_mib = 25;
+    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, small, .dflash2, kv)).?.engine);
+    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, o, .dflash2, kv)).?.engine);
+    // the tier's settings from the server's (the guard's limit a quarter of the agreed budget)
+    const ts = tierSettings(.{ .context = 8, .drafts = false, .spill_gib = 64, .spill_dir = "/spill", .spill_quota = 0.25, .spill_turns = 2, .spill_read_blocks = 8, .spill_stage_mib = 128, .spill_min_tokens = 4096, .spill_min_free_gib = 10 }, 8 << 30);
+    try std.testing.expectEqualStrings("/spill", ts.dir);
+    try std.testing.expectEqual(@as(f64, 64), ts.gib);
+    try std.testing.expectEqual(@as(f64, 0.25), ts.quota);
+    try std.testing.expectEqual(@as(u32, 2), ts.turns);
+    try std.testing.expectEqual(@as(u32, 8), ts.read_blocks);
+    try std.testing.expectEqual(@as(u32, 128), ts.stage_mib);
+    try std.testing.expectEqual(@as(u32, 4096), ts.min_tokens);
+    try std.testing.expectEqual(@as(f64, 10), ts.min_free_gib);
+    try std.testing.expectEqual(@as(u64, 2 << 30), ts.hold_bytes);
+    // with the spill off (no --spill-gib, or no --snapshot-dir) nothing is read: off whatever the environment holds
+    try std.testing.expectEqual(@as(?identity.Env, null), try spillV2(.{ .context = 8, .drafts = false }, .dflash2));
+    try std.testing.expectEqual(@as(?identity.Env, null), try spillV2(.{ .context = 8, .drafts = false, .spill_gib = 64 }, .dflash2));
+    for ([_]anyerror{ error.BadSpillV2, error.SpillV2NeedsTwoRanks, error.SpillV2WithMtp, error.SpillV2WithKvShard, error.SpillV2NoPromptCache, error.SpillV2StoreFailed, error.StagingTooSmall, error.NoEngineId, error.NoRecipePatches, error.NoModelRevision, error.NoDrafterRevision, error.SpillIdentityMismatch }) |e|
+        try std.testing.expect(std.mem.startsWith(u8, refusal(e).?, "TF_GLM_SPILL_"));
+    try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
 }
 
 test "serving refuses more than eight lanes before any CUDA call" {

@@ -23,13 +23,17 @@ pub fn Serving(comptime E: type) type {
                     self.local.notes = self.leader.?.notes();
                 } else {
                     self.follower = mirror.Follower.init(gpa, self.local.backend(), wire);
-                    self.follower.?.family = .{ .ptr = &self.local, .note = noteFn, .saved = savedFn };
+                    self.follower.?.family = .{ .ptr = &self.local, .note = noteFn, .saved = savedFn, .ask = askFn };
                 }
             } else if (rank != 0) return error.MissingMirrorChannel;
         }
         fn noteFn(ptr: *anyopaque, bytes: []const u8) !void {
             const local: *backend.Lanes(E) = @ptrCast(@alignCast(ptr));
             try local.applyNote(bytes);
+        }
+        fn askFn(ptr: *anyopaque, bytes: []const u8) !void {
+            const local: *backend.Lanes(E) = @ptrCast(@alignCast(ptr));
+            try local.applyAsk(bytes);
         }
         fn savedFn(ptr: *anyopaque, key: u64) ?*anyopaque {
             const local: *backend.Lanes(E) = @ptrCast(@alignCast(ptr));

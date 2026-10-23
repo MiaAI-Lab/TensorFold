@@ -29,6 +29,8 @@
 //!   unspeculate  key u64
 //!   release      key u64
 //!   note         bytes (a u32 count and the bytes): the lane backend's prompt-cache decision for rank 1
+//!   spill        bytes: GLM spill v2's ask (glm_cuda/cuda_spill_wire), sent at once; every rank then answers it in one
+//!                all-gather on the engine's stream (Agreement's gather), rank 1 from its lane backend's handler
 //! where `u32s` is a u32 count and the values, `opt X` a u8 (0 none, 1 present) then X, `feed` a u8 (0 handle,
 //! 1 value) and a u64, `sampling` seed u64, temperature f64, top_k u32, top_p f64, min_p f64 (f64 as their bits),
 //! `windows` a u32 count then each: key u64, pending u32, held u32, tokens u32s, parents opt i32s, positions u64s
@@ -84,7 +86,23 @@ const Stream = lanes.Stream;
 const Sampling = lanes.Sampling;
 const Allocator = std.mem.Allocator;
 
-pub const Op = enum(u8) { prefill = 1, first = 2, queue = 3, verify = 4, keep = 5, draft = 6, unspeculate = 7, release = 8, note = 9, prefill_begin = 10, prefill_step = 11, prefill_many = 12, _ };
+pub const Op = enum(u8) {
+    prefill = 1,
+    first = 2,
+    queue = 3,
+    verify = 4,
+    keep = 5,
+    draft = 6,
+    unspeculate = 7,
+    release = 8,
+    note = 9,
+    prefill_begin = 10,
+    prefill_step = 11,
+    prefill_many = 12,
+    // GLM spill v2 (wojo's 0110 HAS / LOADED): the lane backend's question every rank answers in one gather
+    spill = 13,
+    _,
+};
 
 pub const StreamSpec = struct {
     key: u64,
@@ -152,6 +170,8 @@ pub const Call = union(enum) {
     prefill_step: []const u64,
     /// a burst of prompts prefilled together (each stream's prefill fields)
     prefill_many: []const StreamSpec,
+    /// GLM spill v2: the lane backend's ask, opaque here; collective (every rank answers it in the gather after it)
+    spill: []const u8,
 
     fn op(c: Call) Op {
         return switch (c) {
@@ -167,6 +187,7 @@ pub const Call = union(enum) {
             .prefill_begin => .prefill_begin,
             .prefill_step => .prefill_step,
             .prefill_many => .prefill_many,
+            .spill => .spill,
         };
     }
 };
@@ -291,7 +312,7 @@ pub fn encode(list: *std.ArrayList(u8), gpa: Allocator, call: Call) !void {
             }
         },
         .unspeculate, .release => |key| try o.int(u64, key),
-        .note => |bytes| try o.many(u8, bytes),
+        .note, .spill => |bytes| try o.many(u8, bytes),
         .prefill_step => |keys| try o.many(u64, keys),
     }
 }
@@ -421,6 +442,7 @@ pub fn decode(arena: Allocator, bytes: []const u8) !Call {
         .unspeculate => .{ .unspeculate = try i.int(u64) },
         .release => .{ .release = try i.int(u64) },
         .note => .{ .note = try i.many(u8) },
+        .spill => .{ .spill = try i.many(u8) },
         _ => return error.UnknownOp,
     };
     if (i.at != bytes.len) return error.TrailingBytes;
@@ -886,7 +908,8 @@ pub const Watch = struct {
 };
 
 /// The lane backend's gate at two ranks (cuda_lanes.Gate): each rank's prepare outcome in one 1-int all-gather on
-/// the engine's stream before the call's first collective; a failure after it goes to the watchdog (exit).
+/// the engine's stream before the call's first collective; a failure after it goes to the watchdog (exit). GLM spill
+/// v2's asks gather wider answers (`gather`) in buffers of their own, made at the first ask.
 pub const Agreement = struct {
     comm: Coll,
     stream: cuda.abi.Stream,
@@ -894,6 +917,14 @@ pub const Agreement = struct {
     host: cuda.HostBuffer,
     watch: *Watch,
     count: u64 = 0,
+    /// GLM spill v2's answers: this rank's words, then every rank's (gather_words a rank, up to 4 ranks)
+    words: ?cuda.DeviceBuffer = null,
+    words_host: ?cuda.HostBuffer = null,
+    gathers: u64 = 0,
+
+    /// The most words a rank answers an ask with (glm_cuda/cuda_spill_wire.stats_words).
+    pub const gather_words = 64;
+    const gather_bytes = (1 + 4) * gather_words * 8;
 
     pub fn init(d: *const cuda.Driver, comm: Coll, stream: cuda.abi.Stream, watch: *Watch) !Agreement {
         var device = try cuda.DeviceBuffer.alloc(d, 32); // 2 ints of room, then up to 4 ranks' answers
@@ -902,12 +933,14 @@ pub const Agreement = struct {
     }
 
     pub fn deinit(a: *Agreement) void {
+        if (a.words_host) |*h| h.free();
+        if (a.words) |*d| d.free();
         a.host.free();
         a.device.free();
     }
 
     pub fn gate(a: *Agreement) @import("cuda_lanes.zig").Gate {
-        return .{ .ptr = a, .agree = agreeFn, .fatal = fatalFn };
+        return .{ .ptr = a, .agree = agreeFn, .fatal = fatalFn, .gather = gatherFn };
     }
 
     fn of(p: *anyopaque) *Agreement {
@@ -926,6 +959,35 @@ pub const Agreement = struct {
         try cuda.Stream.synchronize(.{ .d = a.device.d, .handle = a.stream });
         for (h[2 .. 2 + world]) |v| if (v != 1) return false;
         return true;
+    }
+
+    /// Every rank's `mine` (the same count on each: the ask fixes it) in one all-gather on the engine's stream, in rank
+    /// order into `out`. A rank waiting here for another's answer is under the watchdog's deadline (armed when no call
+    /// armed it: rank 0 asks between calls; rank 1 answers inside the mirror's call).
+    fn gatherFn(p: *anyopaque, mine: []const u64, out: []u64) anyerror!usize {
+        const a = of(p);
+        const world: usize = a.comm.world;
+        if (mine.len == 0 or mine.len > gather_words or world > 4 or out.len < world * mine.len) return error.BadGather;
+        if (a.words == null) {
+            var d = try cuda.DeviceBuffer.alloc(a.device.d, gather_bytes);
+            errdefer d.free();
+            a.words_host = try cuda.HostBuffer.alloc(a.device.d, gather_bytes);
+            a.words = d;
+        }
+        const armed = a.watch.deadline_ms.load(.acquire) != 0;
+        if (!armed) a.watch.arm(a.watch.base_s);
+        defer if (!armed) a.watch.disarm();
+        a.gathers += 1;
+        const dev = &a.words.?;
+        const h = a.words_host.?.slice(u64);
+        const n = mine.len;
+        @memcpy(h[0..n], mine);
+        try dev.uploadAsync(0, a.words_host.?.bytes[0 .. 8 * n], a.stream);
+        try a.comm.allGather(dev.ptr, try dev.at(8 * gather_words), n, .u64, a.stream);
+        try dev.downloadAsync(8 * gather_words, a.words_host.?.bytes[8 * gather_words ..][0 .. 8 * n * world], a.stream);
+        try cuda.Stream.synchronize(.{ .d = dev.d, .handle = a.stream });
+        @memcpy(out[0 .. n * world], h[gather_words..][0 .. n * world]);
+        return world;
     }
 
     fn fatalFn(p: *anyopaque, what: []const u8, err: anyerror) void {
@@ -1006,14 +1068,34 @@ pub const Leader = struct {
         if (collective) try self.flush();
     }
 
-    /// The lane backend's notes to rank 1 (cuda_lanes.Notes): each rides with the next call that has collectives.
+    /// The lane backend's notes to rank 1 (cuda_lanes.Notes): each rides with the next call that has collectives,
+    /// unless the backend flushes them (GLM spill v2) or asks (a collective of its own).
     pub fn notes(self: *Leader) @import("cuda_lanes.zig").Notes {
-        return .{ .ptr = self, .send = noteFn };
+        return .{ .ptr = self, .send = noteFn, .ask = askFn, .flush = flushFn };
     }
 
     fn noteFn(p: *anyopaque, bytes: []const u8) void {
         const self = of(p);
         self.send(.{ .note = bytes }, false) catch |e| std.log.err("rank 0: a prompt-cache note not sent to rank 1 ({s})", .{@errorName(e)});
+    }
+
+    /// GLM spill v2's ask: the batch goes now with it (rank 1 must reach the gather that follows; an idle rank 1 is
+    /// woken by the record), then the caller's gather.
+    fn askFn(p: *anyopaque, bytes: []const u8) anyerror!void {
+        const self = of(p);
+        try self.send(.{ .spill = bytes }, true);
+    }
+
+    /// GLM spill v2: the notes waiting in the batch go now; with no stream open rank 1 is sent back to its idle wait
+    /// (after an ask too: then only once its gather is done, so both ranks' collectives stay in one order).
+    fn flushFn(p: *anyopaque) void {
+        const self = of(p);
+        if (self.broken or self.stopped) return;
+        self.flush() catch |e| return std.log.err("rank 0: spill notes not sent to rank 1 ({s})", .{@errorName(e)});
+        if (self.open.count() == 0) self.channel.idle() catch |e| {
+            self.broken = true;
+            std.log.err("rank 0: idle not sent to rank 1 ({s})", .{@errorName(e)});
+        };
     }
 
     fn arm(self: *Leader, seconds: u64) void {
@@ -1255,6 +1337,9 @@ pub const Follower = struct {
         ptr: *anyopaque,
         note: *const fn (ptr: *anyopaque, bytes: []const u8) anyerror!void,
         saved: *const fn (ptr: *anyopaque, key: u64) ?*anyopaque,
+        /// GLM spill v2: rank 0's ask, answered in the gather that follows (the handler reaches it whatever its own
+        /// outcome: rank 0 waits there)
+        ask: ?*const fn (ptr: *anyopaque, bytes: []const u8) anyerror!void = null,
     };
 
     pub fn init(gpa: Allocator, inner: be.Backend, channel: Channel) Follower {
@@ -1407,6 +1492,11 @@ pub const Follower = struct {
                 const f = self.family orelse return error.NoFamilyForNotes;
                 try f.note(f.ptr, bytes);
             },
+            .spill => |bytes| {
+                const f = self.family orelse return error.NoFamilyForNotes;
+                const ask = f.ask orelse return error.NoFamilyForAsks;
+                try ask(f.ptr, bytes);
+            },
         }
     }
 };
@@ -1449,6 +1539,8 @@ test "every call survives its frame bit for bit, and a cut frame is refused" {
         try std.testing.expectEqualSlices(u32, &.{ 1500, 31000 }, r.prefill.marks);
         const n = try roundTrip(ar, .{ .note = &.{ 1, 0, 0, 0, 0 } });
         try std.testing.expectEqualSlices(u8, &.{ 1, 0, 0, 0, 0 }, n.note);
+        const q = try roundTrip(ar, .{ .spill = &.{ 16, 9, 9 } });
+        try std.testing.expectEqualSlices(u8, &.{ 16, 9, 9 }, q.spill);
     }
     {
         const c = try roundTrip(ar, .{ .prefill = .{ .key = 1, .max_new = 0, .drafts = false, .sampling = null, .prompt = &.{}, .eos = &.{}, .chunks = &.{} } });
@@ -1540,6 +1632,120 @@ test "the frame layout is the documented one" {
     try std.testing.expectError(error.UnknownOp, decode(arena.allocator(), &.{99}));
     try std.testing.expectError(error.TrailingBytes, decode(arena.allocator(), &.{ 8, 1, 0, 0, 0, 0, 0, 0, 0, 0 }));
     try std.testing.expectError(error.BadFrame, decode(arena.allocator(), &.{ 3, 1, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }));
+}
+
+/// A channel that keeps what rank 0 sends and logs its calls in order: `s` a batch, `i` idle, `t` stop.
+const Spy = struct {
+    gpa: Allocator,
+    sent: std.ArrayList([]u8) = .empty,
+    log: std.ArrayList(u8) = .empty,
+
+    fn channel(s: *Spy) Channel {
+        return .{ .ptr = s, .vtable = &.{ .send = sendFn, .recv = recvFn, .idle = idleFn, .stop = stopFn } };
+    }
+    fn of(p: *anyopaque) *Spy {
+        return @ptrCast(@alignCast(p));
+    }
+    fn sendFn(p: *anyopaque, bytes: []const u8) anyerror!void {
+        const s = of(p);
+        try s.sent.append(s.gpa, try s.gpa.dupe(u8, bytes));
+        try s.log.append(s.gpa, 's');
+    }
+    fn recvFn(_: *anyopaque) anyerror!?[]const u8 {
+        return error.NotUsed;
+    }
+    fn idleFn(p: *anyopaque) anyerror!void {
+        try of(p).log.append(of(p).gpa, 'i');
+    }
+    fn stopFn(p: *anyopaque) anyerror!void {
+        try of(p).log.append(of(p).gpa, 't');
+    }
+    fn deinit(s: *Spy) void {
+        for (s.sent.items) |b| s.gpa.free(b);
+        s.sent.deinit(s.gpa);
+        s.log.deinit(s.gpa);
+    }
+};
+
+/// Rank 1's lane backend side of notes and asks, recorded in order (`n` a note, `a` an ask, then its bytes).
+const FamilyLog = struct {
+    gpa: Allocator,
+    got: std.ArrayList(u8) = .empty,
+
+    fn family(f: *FamilyLog, asks: bool) Follower.Family {
+        return .{ .ptr = f, .note = noteFn, .saved = savedFn, .ask = if (asks) askFn else null };
+    }
+    fn noteFn(p: *anyopaque, bytes: []const u8) anyerror!void {
+        const f: *FamilyLog = @ptrCast(@alignCast(p));
+        try f.got.append(f.gpa, 'n');
+        try f.got.appendSlice(f.gpa, bytes);
+    }
+    fn askFn(p: *anyopaque, bytes: []const u8) anyerror!void {
+        const f: *FamilyLog = @ptrCast(@alignCast(p));
+        try f.got.append(f.gpa, 'a');
+        try f.got.appendSlice(f.gpa, bytes);
+    }
+    fn savedFn(_: *anyopaque, _: u64) ?*anyopaque {
+        return null;
+    }
+};
+
+test "GLM spill v2: an ask goes at once with the notes before it, a flush sends notes without a collective and leaves an idle rank 1 idle, and rank 1 hands both to its lane backend in order" {
+    const gpa = std.testing.allocator;
+    var spy: Spy = .{ .gpa = gpa };
+    defer spy.deinit();
+    var rank0: fake.Fake = .{ .gpa = gpa };
+    defer rank0.deinit();
+    var leader = Leader.init(gpa, rank0.backend(), spy.channel());
+    defer leader.deinit();
+    const n = leader.notes();
+    // 1. no stream open: a note waits in the batch; the flush sends it and rank 1 goes back to its idle wait
+    n.send(n.ptr, "a");
+    try std.testing.expectEqualStrings("", spy.log.items);
+    n.flush.?(n.ptr);
+    try std.testing.expectEqualStrings("si", spy.log.items);
+    // 2. an ask goes at once with the note before it (one batch), and the flush after its gather idles rank 1 again
+    n.send(n.ptr, "b");
+    try n.ask.?(n.ptr, "q");
+    try std.testing.expectEqualStrings("sis", spy.log.items);
+    n.flush.?(n.ptr); // nothing waits: no batch, only the idle
+    try std.testing.expectEqualStrings("sisi", spy.log.items);
+    // 3. with a stream open the flush sends the notes and leaves rank 1 on the wire
+    const prompt = [_]u32{ 3, 1, 4, 1, 5 };
+    var s = try Stream.init(gpa, .{ .id = "s", .prompt = &prompt, .max_new = 4 });
+    defer s.deinit(gpa);
+    const b = leader.backend();
+    try b.vtable.prefill(b.ptr, &s);
+    n.send(n.ptr, "c");
+    n.flush.?(n.ptr);
+    try std.testing.expectEqualStrings("sisiss", spy.log.items); // the prefill's batch, then the note's: no idle
+    b.vtable.release(b.ptr, &s); // the last stream: its release goes, then idle
+    try std.testing.expectEqualStrings("sisisssi", spy.log.items);
+    // rank 1: the batches in order hand the notes and the ask to its lane backend, the prefill to its engine
+    var rank1: fake.Fake = .{ .gpa = gpa };
+    defer rank1.deinit();
+    var follower = Follower.init(gpa, rank1.backend(), spy.channel());
+    defer follower.deinit();
+    var log: FamilyLog = .{ .gpa = gpa };
+    defer log.got.deinit(gpa);
+    follower.family = log.family(true);
+    for (spy.sent.items) |batch| {
+        var calls = try Calls.of(batch);
+        while (try calls.next()) |call| try follower.apply(call);
+    }
+    try std.testing.expectEqualStrings("nanbaqnc", log.got.items);
+    try std.testing.expectEqual(@as(u64, 0), follower.failed);
+    try std.testing.expectEqual(leader.calls, follower.calls);
+    // a lane backend without asks: the ask fails there (logged; rank 0's gather then meets the watchdog)
+    var bare = Follower.init(gpa, rank1.backend(), spy.channel());
+    defer bare.deinit();
+    var bare_log: FamilyLog = .{ .gpa = gpa };
+    defer bare_log.got.deinit(gpa);
+    bare.family = bare_log.family(false);
+    var calls = try Calls.of(spy.sent.items[1]);
+    while (try calls.next()) |call| try bare.apply(call);
+    try std.testing.expectEqual(@as(u64, 1), bare.failed);
+    try std.testing.expectEqualStrings("nb", bare_log.got.items);
 }
 
 const fake = lanes.fake;

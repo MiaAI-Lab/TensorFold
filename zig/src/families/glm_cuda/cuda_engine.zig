@@ -31,6 +31,8 @@ const draft_pkg = @import("cuda_dflash_package.zig");
 const dflash = @import("cuda_dflash.zig");
 const dflash_config = @import("cuda_dflash_config.zig");
 const snapshot = @import("cuda_snapshot.zig");
+const spill_state = @import("cuda_spill_state.zig");
+const spill_tier = @import("cuda_spill_tier.zig");
 const cache_plan = @import("cuda_cache_plan.zig");
 const spill_mod = @import("cuda_spill.zig");
 const mtp_mod = @import("cuda_mtp.zig");
@@ -58,6 +60,8 @@ pub const Options = struct {
     tower: bool = false,
     /// TF_GLM_KV_SHARD's switches, read and agreed by cuda_native (null: off, every rank's caches the whole pool's)
     kv_shard: ?shard_mod.Switches = null,
+    /// TF_GLM_SPILL_V2=1: spill v2's settings, whose pinned staging is taken before the pool is sized (null: off)
+    spill_v2: ?spill_tier.Settings = null,
 };
 
 /// TF_GLM_KV_SHARD's counters (/health's kv_shard): layout digests sent or compared (TF_GLM_KV_SHARD_CHECK; a
@@ -182,6 +186,9 @@ pub const Engine = struct {
     shard: ?shard_mod.Shard = null,
     kv_switches: shard_mod.Switches = .{},
     kv_counts: KvCounts = .{},
+    /// spill v2: its pinned staging (Options.spill_v2, taken before the pool) and one event a staging slot
+    tier_staging: ?cuda.HostBuffer = null,
+    tier_events: []cuda.Event = &.{},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         if (o.world < 1 or o.world > 4) return error.UnsupportedTp;
@@ -371,6 +378,19 @@ pub const Engine = struct {
             });
             errdefer e.drafter.?.deinit();
         }
+        // spill v2 (Options.spill_v2): its pinned staging (the write ring, the read-ahead slots, the small states') taken
+        // before the pool is sized, so the pool and the kept-state budget are what it leaves and it never takes pool rows
+        // mid-run. Sized for the largest index ring the caches can end with (the final ring is set below).
+        e.tier_staging = null;
+        e.tier_events = &.{};
+        if (o.spill_v2) |sv| {
+            const ring = @max(e.caches.ring, G.indexRing(std.math.maxInt(usize), 2048));
+            const l = try spill_state.Layout.init(e.g, ring, if (e.drafter) |p| .{ .kv = p.forward.rank.kv, .ring = dflash_config.Config.ring } else null);
+            const p = try spill_tier.plan(sv, &l);
+            e.tier_staging = try cuda.HostBuffer.alloc(ctx.d, @intCast(p.bytes() + 4096));
+            std.log.info("rank {d}: spill v2's pinned staging, {d} MiB (a write ring of {d} blocks, {d} read-ahead blocks, {d} small states and {d} restores' at {d} MiB each), taken before the KV pool", .{ o.rank, p.bytes() >> 20, p.write, p.read, p.small, p.restore, p.small_slot >> 20 });
+        }
+        errdefer if (e.tier_staging) |*b| b.free();
         // Size after the fixed Zig arenas and drafter: free memory at startup, less the recipe reserve.
         // Cache surplus has the same cap as Python. No fictitious kept-state charge: this engine has no prompt cache.
         var pool_rows = extent;
@@ -452,6 +472,9 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         const gpa = e.gpa;
         e.spillStop();
+        for (e.tier_events) |*ev| ev.deinit();
+        gpa.free(e.tier_events);
+        if (e.tier_staging) |*b| b.free();
         e.spill_hit.deinit(e.gpa);
         if (e.spill) |t| {
             t.deinit();
@@ -709,6 +732,92 @@ pub const Engine = struct {
     /// What a kept state of `at` tokens holds on the device.
     pub fn snapBytes(e: *const Engine, at: usize) usize {
         return e.sectionsFor(at).total;
+    }
+
+    /// Spill v2's layout of this engine's kept states (cuda_spill_state): its geometry, index ring and drafter.
+    pub fn spillLayout(e: *const Engine) !spill_state.Layout {
+        return spill_state.Layout.init(e.g, e.caches.ring, if (e.drafter) |p| .{ .kv = p.forward.rank.kv, .ring = dflash_config.Config.ring } else null);
+    }
+
+    // -- spill v2's device side (cuda_spill_tier): copies on the engine's stream, one event a staging slot ----------
+
+    /// The pinned staging taken before the pool (Options.spill_v2), 4 KiB aligned; empty without spill v2.
+    pub fn tierStaging(e: *const Engine) []align(4096) u8 {
+        const b = e.tier_staging orelse return &.{};
+        const off = std.mem.alignForward(usize, @intFromPtr(b.bytes.ptr), 4096) - @intFromPtr(b.bytes.ptr);
+        return @alignCast(b.bytes[off..]);
+    }
+
+    pub fn tierKept(_: *const Engine, snap: *const Snap) spill_state.Kept {
+        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec };
+    }
+
+    fn tierD2h(ptr: *anyopaque, dst: []u8, src: u64) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ptr));
+        try e.stream.d.check(e.stream.d.api.cuMemcpyDtoHAsync_v2(dst.ptr, src, dst.len, e.stream.handle), "cuMemcpyDtoHAsync");
+    }
+
+    fn tierH2d(ptr: *anyopaque, dst: u64, src: []const u8) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ptr));
+        try e.stream.d.check(e.stream.d.api.cuMemcpyHtoDAsync_v2(dst, src.ptr, src.len, e.stream.handle), "cuMemcpyHtoDAsync");
+    }
+
+    fn tierFill(ptr: *anyopaque, dst: u64, byte: u8, n: usize) anyerror!void {
+        const e: *Engine = @ptrCast(@alignCast(ptr));
+        try e.stream.d.check(e.stream.d.api.cuMemsetD8Async(dst, byte, n, e.stream.handle), "cuMemsetD8Async");
+    }
+
+    /// The tier's copies: pinned staging to and from kept-state buffers, in the engine stream's order.
+    pub fn tierCopier(e: *Engine) spill_state.Copier {
+        return .{ .ptr = e, .d2h = tierD2h, .h2d = tierH2d, .fill = tierFill };
+    }
+
+    /// `n` events, one a staging slot and one for the tier's own waits (made once, when the tier opens).
+    pub fn tierEvents(e: *Engine, n: usize) !void {
+        if (e.tier_events.len >= n) return;
+        const evs = try e.gpa.alloc(cuda.Event, n);
+        var made: usize = 0;
+        errdefer {
+            for (evs[0..made]) |*ev| ev.deinit();
+            e.gpa.free(evs);
+        }
+        while (made < n) : (made += 1) evs[made] = try cuda.Event.init(e.stream.d, false);
+        for (e.tier_events) |*ev| ev.deinit();
+        e.gpa.free(e.tier_events);
+        e.tier_events = evs;
+    }
+
+    /// Event `ev` after what the tier just enqueued; a record that fails waits for the stream instead (the event then
+    /// reads as complete).
+    pub fn tierRecord(e: *Engine, ev: usize) void {
+        e.tier_events[ev].record(e.stream) catch e.stream.synchronize() catch {};
+    }
+
+    pub fn tierDone(e: *Engine, ev: usize) bool {
+        return e.tier_events[ev].done() catch true;
+    }
+
+    pub fn tierWait(e: *Engine, ev: usize) void {
+        e.tier_events[ev].synchronize() catch e.stream.synchronize() catch {};
+    }
+
+    /// The smallest of every rank's `mine` (one all-gather; one rank: its own). Every rank calls it at the same point.
+    pub fn smallestOverRanks(e: *Engine, mine: u64) !u64 {
+        const c = e.comm orelse return mine;
+        const all = try gatherWord(e.ctx.?, c, e.stream, mine);
+        return std.mem.min(u64, all[0..c.world]);
+    }
+
+    /// A restore's destination: a new kept-state buffer for `at` tokens, refused under the keep floor (as a save is).
+    pub fn tierDest(e: *Engine, at: usize) !*Snap {
+        const sec = e.sectionsFor(at);
+        if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
+        const snap = try e.gpa.create(Snap);
+        errdefer e.gpa.destroy(snap);
+        const buf = try cuda.DeviceBuffer.alloc(e.stream.d, sec.total);
+        e.snap_next += 1;
+        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec };
+        return snap;
     }
 
     fn copyBytes(ptr: *anyopaque, dst: u64, src: u64, n: usize) anyerror!void {

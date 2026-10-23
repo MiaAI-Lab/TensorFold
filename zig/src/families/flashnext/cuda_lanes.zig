@@ -39,10 +39,22 @@ pub const Gate = struct {
     ptr: *anyopaque,
     agree: *const fn (ptr: *anyopaque, ok: bool) anyerror!bool,
     fatal: *const fn (ptr: *anyopaque, what: []const u8, err: anyerror) void,
+    /// GLM spill v2: after an ask (Notes.ask), every rank's `mine` words in one all-gather, rank order, into `out`
+    /// (room for 4 ranks); returns the ranks. Null: a gate without asks (Flash Next).
+    gather: ?*const fn (ptr: *anyopaque, mine: []const u64, out: []u64) anyerror!usize = null,
 };
 
 /// Where rank 0's prompt-cache decisions go (cuda_mirror's Leader: a note call to rank 1).
-pub const Notes = struct { ptr: *anyopaque, send: *const fn (ptr: *anyopaque, bytes: []const u8) void };
+pub const Notes = struct {
+    ptr: *anyopaque,
+    send: *const fn (ptr: *anyopaque, bytes: []const u8) void,
+    /// GLM spill v2: a question every rank answers in the gather that follows it (Gate.gather), sent now with the
+    /// notes before it. Null: no asks (Flash Next).
+    ask: ?*const fn (ptr: *anyopaque, bytes: []const u8) anyerror!void = null,
+    /// GLM spill v2: the notes now, not with the next collective (rank 1 has no idle hook, it waits in a receive);
+    /// with no stream open rank 1 waits idle again after them, also after an ask's gather.
+    flush: ?*const fn (ptr: *anyopaque) void = null,
+};
 
 pub const Note = enum(u8) { pass = 1, drop = 2, _ };
 

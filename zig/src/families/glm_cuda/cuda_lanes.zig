@@ -6,6 +6,7 @@ const std = @import("std");
 const lanes = @import("lanes");
 const decode = @import("flashnext").decode;
 const shard = @import("cuda_shard.zig");
+const wire = @import("cuda_spill_wire.zig");
 
 const be = lanes.backend;
 
@@ -33,8 +34,23 @@ pub const Gate = @import("flashnext").lane_backend.Gate;
 pub const Notes = @import("flashnext").lane_backend.Notes;
 
 /// `place`: TF_GLM_KV_SHARD's record of where rank 0 placed a stream's extent (cuda_shard.Placement), checked on rank 1;
-/// `layout`: TF_GLM_KV_SHARD_CHECK's digest of rank 0's whole pool every that many decode rounds, compared on rank 1.
-pub const Note = enum(u8) { pass = 1, drop = 2, spill = 3, load = 4, place = 5, layout = 6, _ };
+/// `layout`: TF_GLM_KV_SHARD_CHECK's digest of rank 0's whole pool every that many decode rounds, compared on rank 1;
+/// `tier`: spill v2's one-way message (cuda_spill_wire) for rank 1's own disk tier.
+pub const Note = enum(u8) { pass = 1, drop = 2, spill = 3, load = 4, place = 5, layout = 6, tier = 7, _ };
+
+/// Spill v2's tier on a following rank (cuda_spill_wire): rank 0's messages in its call order. `note` takes a one-way
+/// message, with this rank's kept state when it is a keep (rank 0's key, once this rank's pass adopted it at the same
+/// position: the pass's `.pass` note comes after its keeps). `answer` gives this rank's words to an ask (`m.width()` of
+/// them; its own failure is a code, never an error: every rank must reach the gather), `settle` every rank's words in
+/// rank order after the gather, the same on every rank, so every rank acts on one verdict. `release`: a kept state this
+/// rank lets go at rank 0's `.drop` note, before its free (the tier's release guard for a write still reading it).
+pub const SpillSide = struct {
+    ptr: *anyopaque,
+    note: *const fn (ptr: *anyopaque, m: *const wire.Msg, kept: ?*anyopaque) anyerror!void,
+    answer: *const fn (ptr: *anyopaque, m: *const wire.Msg, out: []u64) void,
+    settle: *const fn (ptr: *anyopaque, m: *const wire.Msg, all: []const u64) anyerror!void,
+    release: ?*const fn (ptr: *anyopaque, kept: *anyopaque) void = null,
+};
 
 /// The prompt cache's family calls (core/prompt_cache.zig Snapshots.VTable, same signatures) and its budget:
 /// native/cuda.zig makes the Store from them (this module cannot import the engine API's types).
@@ -156,6 +172,13 @@ pub fn Lanes(comptime E: type) type {
         /// rank 1: rank 0 asked for a state to be written that this rank has not adopted yet (its `.pass` note comes
         /// after the early write's): written when the pass's note arrives
         spill_wait: std.ArrayList(u64) = .empty,
+        /// rank 1: spill v2's tier, which takes rank 0's `.tier` notes and asks (null: spill v2 off)
+        spill_side: ?SpillSide = null,
+        /// rank 1: spill v2's keeps of states this rank's pass has not adopted yet, given to the tier when the `.pass`
+        /// note adopts their key at their position; what the note does not adopt (the store dropped it) goes there
+        spill_keeps: std.ArrayList([]u8) = .empty,
+        /// rank 0: spill v2's message being sent (spillNote, spillAsk)
+        spill_buf: std.ArrayList(u8) = .empty,
         /// rank 1 at two ranks: the last pass's kept states wait for rank 0's note of which the store took
         follower: bool = false,
         /// rank 0 at two ranks: where the store's decisions go to rank 1 (cuda_mirror's Leader.note)
@@ -190,6 +213,9 @@ pub fn Lanes(comptime E: type) type {
             self.opened.deinit(self.gpa);
             self.dropTentative();
             self.spill_wait.deinit(self.gpa);
+            self.dropKeeps();
+            self.spill_keeps.deinit(self.gpa);
+            self.spill_buf.deinit(self.gpa);
             self.tentative.deinit(self.gpa);
             for (self.kept.items) |k| self.freeKept(k);
             self.kept.deinit(self.gpa);
@@ -412,7 +438,7 @@ pub fn Lanes(comptime E: type) type {
 
         /// A new sequence for the stream, then its prompt (chunks and the head's absorb inside the engine) and the
         /// first draw at the prompt's length, keyed with the stream's sampling.
-        fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+        pub fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
             const self = of(ptr);
             const e = self.e;
             const l = self.preparePrefill(s) catch |err| {
@@ -797,6 +823,146 @@ pub fn Lanes(comptime E: type) type {
             self.freeKept(k);
         }
 
+        // -- spill v2's rank protocol (cuda_spill_wire; the GLM tier calls these) -------------------------------
+
+        /// Rank 0: spill v2's one-way message `m` to every other rank, in call order; `eager`: now, not with the next
+        /// collective (a restore's progress, staged writes and the flush: rank 1 has no idle hook). One rank: nothing.
+        pub fn spillNote(self: *Self, m: wire.Msg, eager: bool) !void {
+            if (m.width() != null) return error.NotANote;
+            const n = self.notes orelse return;
+            self.spill_buf.clearRetainingCapacity();
+            try self.spill_buf.append(self.gpa, @backingInt(Note.tier));
+            try wire.encode(&self.spill_buf, self.gpa, m);
+            n.send(n.ptr, self.spill_buf.items);
+            if (eager) if (n.flush) |f| f(n.ptr);
+        }
+
+        /// Rank 0: spill v2's ask `m` (has, validate, stats), sent now with the notes before it; every rank's answer in
+        /// rank order into `out` (room for wire.max_world x `m.width()` words), `mine` this rank's; returns the ranks
+        /// (one rank: its own). A failed send or gather ends the pair (`fatal`): the ranks' tiers would disagree.
+        pub fn spillAsk(self: *Self, m: wire.Msg, mine: []const u64, out: []u64) !usize {
+            const w = m.width() orelse return error.NotAnAsk;
+            if (mine.len != w or out.len < wire.max_world * w) return error.BadAnswer;
+            const n = self.notes orelse {
+                @memcpy(out[0..w], mine);
+                return 1;
+            };
+            const g = self.gate orelse return error.NoGate;
+            const ask = n.ask orelse return error.NoAsks;
+            const gather = g.gather orelse return error.NoAsks;
+            self.spill_buf.clearRetainingCapacity();
+            try wire.encode(&self.spill_buf, self.gpa, m);
+            ask(n.ptr, self.spill_buf.items) catch |e| {
+                g.fatal(g.ptr, "a spill ask", e);
+                return e;
+            };
+            const ranks = gather(g.ptr, mine, out) catch |e| {
+                g.fatal(g.ptr, "a spill ask's gather", e);
+                return e;
+            };
+            // with no stream open, rank 1 goes back to its idle wait (only now: it answered in the gather)
+            if (n.flush) |f| f(n.ptr);
+            return ranks;
+        }
+
+        /// Rank 1: rank 0's ask (the mirror's spill call): this rank's answer, every rank's in one gather, then the
+        /// tier's verdict. One this rank cannot read ends the pair (`fatal`): rank 0 already waits in the gather.
+        pub fn applyAsk(self: *Self, bytes: []const u8) !void {
+            const g = self.gate orelse return error.NoGate;
+            const gather = g.gather orelse return error.NoAsks;
+            var arena: std.heap.ArenaAllocator = .init(self.gpa);
+            defer arena.deinit();
+            const m = wire.decode(arena.allocator(), bytes) catch |e| {
+                g.fatal(g.ptr, "a spill ask this rank cannot read", e);
+                return e;
+            };
+            const w = m.width() orelse {
+                g.fatal(g.ptr, "a spill ask this rank cannot read", error.NotAnAsk);
+                return error.NotAnAsk;
+            };
+            var mine: [wire.stats_words]u64 = undefined;
+            if (self.spill_side) |sd| sd.answer(sd.ptr, &m, mine[0..w]) else wire.disabled(m, mine[0..w]);
+            var all: [wire.max_world * wire.stats_words]u64 = undefined;
+            const ranks = gather(g.ptr, mine[0..w], &all) catch |e| {
+                g.fatal(g.ptr, "a spill ask's gather", e);
+                return e;
+            };
+            if (self.spill_side) |sd| try sd.settle(sd.ptr, &m, all[0 .. ranks * w]);
+        }
+
+        /// Spill v2: a kept state's wrapper made before its state exists (a restore's destination, from its begin), so
+        /// rank 0's key (the wrapper's address: the mirror's resume key) can name it to every rank first; on rank 1 the
+        /// key rank 0's begin carried. `adoptReserved` fills and keeps it, `unreserve` frees one never filled.
+        pub fn reserveKept(self: *Self, key: ?u64) !*Kept {
+            const k = try self.gpa.create(Kept);
+            k.* = .{ .snap = undefined, .keeper = null, .at = 0, .bytes = 0 };
+            k.key = key orelse @intFromPtr(k);
+            return k;
+        }
+
+        /// A restored state into its reserved wrapper (`tokens`, gpa-owned, its first `at` ids): kept from here, as
+        /// one the pass kept. On an error the caller still owns `snap` and `tokens`.
+        pub fn adoptReserved(self: *Self, k: *Kept, snap: SnapPtr, at: u32, tokens: []u32) !void {
+            if (comptime !holds_rows) return error.NoStateBuffer;
+            try self.kept.ensureUnusedCapacity(self.gpa, 1);
+            k.snap = snap;
+            k.at = at;
+            k.tokens = tokens;
+            k.bytes = self.stateBytes(at);
+            self.kept.appendAssumeCapacity(k);
+            self.kept_bytes += k.bytes;
+        }
+
+        pub fn unreserve(self: *Self, k: *Kept) void {
+            self.gpa.destroy(k);
+        }
+
+        /// Rank 0: a reserved wrapper every other rank filled (its restore committed there) that this rank cannot keep:
+        /// the others drop theirs (a `.drop` note under its key), and it is freed here.
+        pub fn forgetReserved(self: *Self, k: *Kept) void {
+            if (self.notes) |n| {
+                var buf: [9]u8 = undefined;
+                buf[0] = @backingInt(Note.drop);
+                std.mem.writeInt(u64, buf[1..9], k.key, .little);
+                n.send(n.ptr, &buf);
+            }
+            self.unreserve(k);
+        }
+
+        fn keptAt(self: *Self, key: u64, at: u32) ?*Kept {
+            for (self.kept.items) |k| if (k.key == key and k.at == at) return k;
+            return null;
+        }
+
+        /// Rank 1: the keeps waiting for `k` (rank 0's key at its position), to the tier now that this rank holds it. A
+        /// write the tier refuses costs only this rank's copy (a later has answers `missing`), never the adoption.
+        fn keepsFor(self: *Self, k: *Kept) void {
+            const sd = self.spill_side orelse return;
+            var i: usize = 0;
+            while (i < self.spill_keeps.items.len) {
+                const bytes = self.spill_keeps.items[i];
+                var arena: std.heap.ArenaAllocator = .init(self.gpa);
+                defer arena.deinit();
+                // (each was read once already, when it came: only memory can fail here, and the note drops it then)
+                const m = wire.decode(arena.allocator(), bytes) catch {
+                    i += 1;
+                    continue;
+                };
+                if (m.keep.kept != k.key or m.keep.at != k.at) {
+                    i += 1;
+                    continue;
+                }
+                _ = self.spill_keeps.orderedRemove(i);
+                self.gpa.free(bytes);
+                sd.note(sd.ptr, &m, k) catch |e| std.log.warn("spill v2: rank 1 keeps no copy of a state at {d} ({s})", .{ k.at, @errorName(e) });
+            }
+        }
+
+        fn dropKeeps(self: *Self) void {
+            for (self.spill_keeps.items) |b| self.gpa.free(b);
+            self.spill_keeps.clearRetainingCapacity();
+        }
+
         // -- rank 1: rank 0's prompt cache decisions ----------------------------------------------------------
 
         /// A note of rank 0's store (cuda_mirror carries it): the last pass's adopted states, or a dropped one.
@@ -818,15 +984,22 @@ pub fn Lanes(comptime E: type) type {
                                 _ = self.spill_wait.swapRemove(w);
                                 self.e.spillOut(t.kept.snap, t.kept.tokens, t.kept.at);
                             };
+                            self.keepsFor(t.kept);
                             break;
                         };
                     }
                     self.dropTentative();
+                    // spill v2: a keep the note did not adopt was of a state the store dropped inside the pass
+                    self.dropKeeps();
                 },
                 .drop => {
                     if (bytes.len != 9) return error.BadNote;
                     const key = std.mem.readInt(u64, bytes[1..9], .little);
-                    for (self.kept.items) |k| if (k.key == key) return self.forgetKept(k);
+                    for (self.kept.items) |k| if (k.key == key) {
+                        // spill v2: this rank's write of it stages what it still reads first (as rank 0's store does)
+                        if (self.spill_side) |sd| if (sd.release) |f| f(sd.ptr, k);
+                        return self.forgetKept(k);
+                    };
                 },
                 .spill => {
                     if (bytes.len != 9) return error.BadNote;
@@ -845,6 +1018,20 @@ pub fn Lanes(comptime E: type) type {
                     if (comptime !@hasDecl(E, "checkDigest")) return error.BadNote;
                     if (bytes.len != 9) return error.BadNote;
                     try self.e.checkDigest(std.mem.readInt(u64, bytes[1..9], .little));
+                },
+                .tier => {
+                    const sd = self.spill_side orelse return error.NoSpillTier;
+                    var arena: std.heap.ArenaAllocator = .init(self.gpa);
+                    defer arena.deinit();
+                    const m = try wire.decode(arena.allocator(), bytes[1..]);
+                    if (m.width() != null) return error.BadNote;
+                    if (m != .keep) return sd.note(sd.ptr, &m, null);
+                    // a keep comes inside the pass that kept the state, before the `.pass` note that adopts it here
+                    if (self.keptAt(m.keep.kept, m.keep.at)) |k| return sd.note(sd.ptr, &m, k);
+                    if (self.spill_keeps.items.len >= 64) self.gpa.free(self.spill_keeps.orderedRemove(0));
+                    const copy = try self.gpa.dupe(u8, bytes[1..]);
+                    errdefer self.gpa.free(copy);
+                    try self.spill_keeps.append(self.gpa, copy);
                 },
                 .load => {
                     if (bytes.len != 21) return error.BadNote;
@@ -926,7 +1113,7 @@ pub fn Lanes(comptime E: type) type {
             };
         }
 
-        fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+        pub fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
             const self = of(ptr);
             if (position != s.prompt_len) return error.PositionMismatch;
             if (self.lanes.get(s)) |l| if (l.first) |h| {
@@ -942,7 +1129,7 @@ pub fn Lanes(comptime E: type) type {
             return error.NotPipelined;
         }
 
-        fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
+        pub fn readFn(ptr: *anyopaque, handle: u64) anyerror!u32 {
             const self = of(ptr);
             if (handle >= self.next or self.next - handle > ring) return error.NoSuchToken;
             return self.drawn[handle % ring];
@@ -1135,7 +1322,7 @@ pub fn Lanes(comptime E: type) type {
             return .{ .count = @intCast(l.held_n) };
         }
 
-        fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+        pub fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
             const self = of(ptr);
             const kv = self.lanes.fetchRemove(s) orelse return;
             if (kv.value.fill != null) {
@@ -1517,14 +1704,31 @@ const Adopter = struct {
 
 const NoteSink = struct {
     gpa: std.mem.Allocator,
+    /// rank 0's notes in order; spill v2's asks (the mirror's spill call) among them behind `ask_mark`
     notes: std.ArrayList([]u8) = .empty,
+    /// spill v2's eager flushes asked for
+    flushes: usize = 0,
+    /// no note starts with it (Note's tags are small)
+    const ask_mark = 0xff;
     fn send(ptr: *anyopaque, bytes: []const u8) void {
         const s: *NoteSink = @ptrCast(@alignCast(ptr));
         s.notes.append(s.gpa, s.gpa.dupe(u8, bytes) catch return) catch {};
     }
+    fn ask(ptr: *anyopaque, bytes: []const u8) anyerror!void {
+        const s: *NoteSink = @ptrCast(@alignCast(ptr));
+        const b = try s.gpa.alloc(u8, 1 + bytes.len);
+        errdefer s.gpa.free(b);
+        b[0] = ask_mark;
+        @memcpy(b[1..], bytes);
+        try s.notes.append(s.gpa, b);
+    }
+    fn flush(ptr: *anyopaque) void {
+        const s: *NoteSink = @ptrCast(@alignCast(ptr));
+        s.flushes += 1;
+    }
     fn take(s: *NoteSink, into: anytype) !void {
         for (s.notes.items) |n| {
-            try into.applyNote(n);
+            if (n.len > 0 and n[0] == ask_mark) try into.applyAsk(n[1..]) else try into.applyNote(n);
             s.gpa.free(n);
         }
         s.notes.clearRetainingCapacity();
@@ -2050,4 +2254,501 @@ test "a keep batch with a bad path commits nothing and leaves every window pendi
     try std.testing.expectEqual(@as(?usize, null), b.lanes.get(&s2).?.pending_rows);
     B.releaseFn(&b, &s1);
     B.releaseFn(&b, &s2);
+}
+
+// -- spill v2's rank protocol (cuda_spill_wire) ---------------------------------------------------------------------
+
+/// Spill v2's tier on one rank for the protocol tests: its disk a list of points, its restore, its counters, and a log
+/// of what reached it (k keep, b begin, p progress, c cancel, t touch, s share, f forget, u pump, l flush; H, V, S an
+/// ask settled). Rank 0's test code makes the decisions (`write`, `begin`, `ask`) and applies them to its own tier as it
+/// sends them; rank 1's gets them through its lane backend (`side`).
+const FakeTier = struct {
+    const B = Lanes(MiniEngine);
+    const Point = struct { key: wire.Digest, at: u32, tokens: []u32 };
+    const Restore = struct { m: wire.Begin, dest: *B.Kept, copied: u32 = 0, why: wire.Failure = .none };
+
+    gpa: std.mem.Allocator,
+    lanes: *B,
+    e: *MiniEngine,
+    points: std.ArrayList(Point) = .empty,
+    log: std.ArrayList(u8) = .empty,
+    /// what `has` answers instead of looking (null: present when held, else missing)
+    absent: ?wire.Absence = null,
+    /// what `validate` answers once every block is copied
+    fail: wire.Failure = .none,
+    restore: ?Restore = null,
+    counters: core.spill.store.Counters = .{},
+    /// the last ask's verdict and every rank's answer words
+    verdict: ?wire.Verdict = null,
+    answers: [wire.max_world * wire.stats_words]u64 = undefined,
+    ranks: usize = 0,
+    /// keeps whose ids did not give the point
+    skipped: usize = 0,
+
+    const core = @import("core");
+
+    fn side(t: *FakeTier) SpillSide {
+        return .{ .ptr = t, .note = noteFn, .answer = answerFn, .settle = settleFn };
+    }
+    fn of(p: *anyopaque) *FakeTier {
+        return @ptrCast(@alignCast(p));
+    }
+    fn keyOf(tokens: []const u32) wire.Digest {
+        return core.spill.format.pointKey(tokens, 2048, &.{});
+    }
+    fn find(t: *const FakeTier, key: wire.Digest) ?usize {
+        for (t.points.items, 0..) |p, i| if (std.mem.eql(u8, &p.key, &key)) return i;
+        return null;
+    }
+    fn holds(t: *const FakeTier, key: wire.Digest) bool {
+        return t.find(key) != null;
+    }
+    fn remove(t: *FakeTier, key: wire.Digest) void {
+        const i = t.find(key) orelse return;
+        t.gpa.free(t.points.orderedRemove(i).tokens);
+    }
+    fn deinit(t: *FakeTier) void {
+        for (t.points.items) |p| t.gpa.free(p.tokens);
+        t.points.deinit(t.gpa);
+        t.log.deinit(t.gpa);
+        if (t.restore) |r| t.lanes.unreserve(r.dest);
+    }
+
+    /// Rank 0: the tier writes a state the store kept (Tier.keep): its own copy, and rank 1's through a keep.
+    fn write(t: *FakeTier, k: *B.Kept) !void {
+        const m: wire.Msg = .{ .keep = .{ .kept = k.key, .at = k.at, .point = keyOf(k.tokens), .group = 1 << 32 | 1, .shared = false, .lineage = .{ .root = @splat(5) } } };
+        try t.apply(&m, k);
+        try t.lanes.spillNote(m, false);
+    }
+    /// Rank 0: a restore of `point` begins: the destination's wrapper first, so its key names it to every rank.
+    fn begin(t: *FakeTier, txn: u64, point: Point) !*B.Kept {
+        const dest = try t.lanes.reserveKept(null);
+        const m: wire.Msg = .{ .begin = .{ .txn = txn, .kept = dest.key, .point = point.key, .at = point.at, .blocks = 1 } };
+        t.restore = .{ .m = m.begin, .dest = dest };
+        try t.lanes.spillNote(m, false);
+        return dest;
+    }
+    /// Rank 0: an ask, answered here and on every rank, and the verdict every rank settled on.
+    fn ask(t: *FakeTier, m: wire.Msg) !?wire.Verdict {
+        var mine: [wire.stats_words]u64 = undefined;
+        const w = m.width().?;
+        answerFn(t, &m, mine[0..w]);
+        var out: [wire.max_world * wire.stats_words]u64 = undefined;
+        const ranks = try t.lanes.spillAsk(m, mine[0..w], &out);
+        try settleFn(t, &m, out[0 .. ranks * w]);
+        return t.verdict;
+    }
+
+    fn apply(t: *FakeTier, m: *const wire.Msg, kept: ?*anyopaque) !void {
+        switch (m.*) {
+            .keep => |k| {
+                const kp: *B.Kept = @ptrCast(@alignCast(kept orelse return error.TestKeepWithoutState));
+                if (kp.at != k.at or !std.mem.eql(u8, &keyOf(kp.tokens), &k.point)) {
+                    t.skipped += 1;
+                    return;
+                }
+                const tokens = try t.gpa.dupe(u32, kp.tokens);
+                errdefer t.gpa.free(tokens);
+                try t.points.append(t.gpa, .{ .key = k.point, .at = k.at, .tokens = tokens });
+                t.counters.keeps += 1;
+                try t.log.append(t.gpa, 'k');
+            },
+            .begin => |b| {
+                if (t.restore != null) return error.TestTwoRestores;
+                t.restore = .{ .m = b, .dest = try t.lanes.reserveKept(b.kept), .why = if (t.holds(b.point)) .none else .missing };
+                try t.log.append(t.gpa, 'b');
+            },
+            .progress => |p| {
+                const r = &(t.restore orelse return error.TestNoRestore);
+                if (p.txn != r.m.txn) return error.TestOtherRestore;
+                r.copied = @max(r.copied, @min(p.upto, r.m.blocks));
+                try t.log.append(t.gpa, 'p');
+            },
+            .cancel => |c| {
+                if (t.restore) |r| if (r.m.txn == c.txn) {
+                    t.lanes.unreserve(r.dest);
+                    t.restore = null;
+                    if (c.forget) t.remove(r.m.point);
+                };
+                try t.log.append(t.gpa, 'c');
+            },
+            .forget => |p| {
+                t.remove(p);
+                try t.log.append(t.gpa, 'f');
+            },
+            .touch, .share, .pump, .flush => try t.log.append(t.gpa, switch (m.*) {
+                .touch => 't',
+                .share => 's',
+                .pump => 'u',
+                else => 'l',
+            }),
+            .has, .validate, .stats => return error.TestAskAsNote,
+        }
+    }
+
+    fn noteFn(p: *anyopaque, m: *const wire.Msg, kept: ?*anyopaque) anyerror!void {
+        return of(p).apply(m, kept);
+    }
+    fn answerFn(p: *anyopaque, m: *const wire.Msg, out: []u64) void {
+        const t = of(p);
+        switch (m.*) {
+            .has => |h| out[0] = @backingInt(t.absent orelse if (t.holds(h.point)) wire.Absence.present else .missing),
+            .validate => |v| {
+                const r = &(t.restore orelse {
+                    out[0] = @backingInt(wire.Failure.unknown);
+                    return;
+                });
+                if (r.m.txn != v.txn) {
+                    out[0] = @backingInt(wire.Failure.unknown);
+                    return;
+                }
+                r.copied = r.m.blocks; // the rest copied now
+                out[0] = @backingInt(if (r.why != .none) r.why else t.fail);
+            },
+            .stats => wire.words(core.spill.store.Counters, &t.counters, out),
+            else => @memset(out, 0),
+        }
+    }
+    fn settleFn(p: *anyopaque, m: *const wire.Msg, all: []const u64) anyerror!void {
+        const t = of(p);
+        @memcpy(t.answers[0..all.len], all);
+        t.ranks = all.len / m.width().?;
+        switch (m.*) {
+            .has => |h| {
+                const v = wire.presence(all);
+                if (!v.ok and v.forget) t.remove(h.point);
+                t.verdict = v;
+                try t.log.append(t.gpa, 'H');
+            },
+            .validate => {
+                const v = wire.validation(all);
+                t.verdict = v;
+                try t.log.append(t.gpa, 'V');
+                const r = t.restore orelse return;
+                t.restore = null;
+                if (!v.ok) {
+                    t.lanes.unreserve(r.dest);
+                    if (v.forget) t.remove(r.m.point);
+                    return;
+                }
+                const pt = t.points.items[t.find(r.m.point).?];
+                const snap = try t.e.snapOf(pt.tokens);
+                errdefer t.e.freeSnapshot(snap);
+                const tokens = try t.gpa.dupe(u32, pt.tokens);
+                errdefer t.gpa.free(tokens);
+                try t.lanes.adoptReserved(r.dest, snap, pt.at, tokens);
+            },
+            .stats => {
+                t.verdict = null;
+                try t.log.append(t.gpa, 'S');
+            },
+            else => return error.TestNoteAsAsk,
+        }
+    }
+};
+
+/// The store's mark hook with spill v2's write at keep: each state the store keeps, rank 0's tier writes (Tier.keep).
+const KeepWriter = struct {
+    hooks: CacheHooks,
+    tier: *FakeTier,
+    fn at(ptr: *anyopaque, _: *lanes.Stream, mark: u32) void {
+        const w: *KeepWriter = @ptrCast(@alignCast(ptr));
+        const saved = w.hooks.save(w.hooks.ptr, null, mark) catch return;
+        w.tier.write(@ptrCast(@alignCast(saved))) catch |e| std.debug.panic("the tier's write: {s}", .{@errorName(e)});
+    }
+};
+
+/// Two ranks' gather in one thread: rank 0's hands what waits in `sink` (the notes, then the ask) to rank 1 first, whose
+/// gather (inside its ask's handler) finds rank 0's answer there. `fatals` counts the pair's ends.
+const PairGather = struct {
+    sink: *NoteSink,
+    r1: *Lanes(MiniEngine),
+    mine0: [wire.stats_words]u64 = undefined,
+    mine1: [wire.stats_words]u64 = undefined,
+    n: usize = 0,
+    fatals: usize = 0,
+
+    fn gate(g: *PairGather, rank: u32) Gate {
+        return .{ .ptr = g, .agree = agree, .fatal = fatal, .gather = if (rank == 0) gather0 else gather1 };
+    }
+    fn of(p: *anyopaque) *PairGather {
+        return @ptrCast(@alignCast(p));
+    }
+    fn agree(_: *anyopaque, ok: bool) anyerror!bool {
+        return ok;
+    }
+    fn fatal(p: *anyopaque, _: []const u8, _: anyerror) void {
+        of(p).fatals += 1;
+    }
+    fn gather0(p: *anyopaque, mine: []const u64, out: []u64) anyerror!usize {
+        const g = of(p);
+        g.n = mine.len;
+        @memcpy(g.mine0[0..mine.len], mine);
+        try g.sink.take(g.r1);
+        return g.both(out);
+    }
+    fn gather1(p: *anyopaque, mine: []const u64, out: []u64) anyerror!usize {
+        const g = of(p);
+        if (mine.len != g.n) return error.TestWidthsDiffer;
+        @memcpy(g.mine1[0..mine.len], mine);
+        return g.both(out);
+    }
+    fn both(g: *PairGather, out: []u64) usize {
+        @memcpy(out[0..g.n], g.mine0[0..g.n]);
+        @memcpy(out[g.n..][0..g.n], g.mine1[0..g.n]);
+        return 2;
+    }
+};
+
+/// Two ranks with spill v2's tier on each, rank 1 following rank 0's notes and asks.
+const SpillPair = struct {
+    const B = Lanes(MiniEngine);
+    e0: MiniEngine,
+    e1: MiniEngine,
+    r0: B,
+    r1: B,
+    sink: NoteSink,
+    pg: PairGather,
+    t0: FakeTier,
+    t1: FakeTier,
+
+    fn init(p: *SpillPair, gpa: std.mem.Allocator, tier1: bool) void {
+        p.e0 = .{ .gpa = gpa };
+        p.e1 = .{ .gpa = gpa };
+        p.r0 = B.init(gpa, &p.e0, true, 1 << 20, 8);
+        p.r1 = B.init(gpa, &p.e1, true, 1 << 20, 8);
+        p.r1.follower = true;
+        p.sink = .{ .gpa = gpa };
+        p.r0.notes = .{ .ptr = &p.sink, .send = NoteSink.send, .ask = NoteSink.ask, .flush = NoteSink.flush };
+        p.pg = .{ .sink = &p.sink, .r1 = &p.r1 };
+        p.r0.gate = p.pg.gate(0);
+        p.r1.gate = p.pg.gate(1);
+        p.t0 = .{ .gpa = gpa, .lanes = &p.r0, .e = &p.e0 };
+        p.t1 = .{ .gpa = gpa, .lanes = &p.r1, .e = &p.e1 };
+        if (tier1) p.r1.spill_side = p.t1.side();
+    }
+    fn deinit(p: *SpillPair) void {
+        p.t0.deinit();
+        p.t1.deinit();
+        p.r0.deinit();
+        p.r1.deinit();
+        p.sink.deinit();
+        p.e0.deinit();
+        p.e1.deinit();
+    }
+    /// A pass of `prompt` with marks at 64 and 128 on both ranks; rank 0's tier writes what the store keeps.
+    fn keepPass(p: *SpillPair, gpa: std.mem.Allocator, prompt: []const u32) !void {
+        const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
+        var writer: KeepWriter = .{ .hooks = hooks, .tier = &p.t0 };
+        var s = try lanes.Stream.init(gpa, .{ .id = "k", .prompt = prompt, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &writer, .at = KeepWriter.at } } });
+        defer s.deinit(gpa);
+        try B.prefillFn(&p.r0, &s);
+        try B.prefillFn(&p.r1, &s);
+        B.releaseFn(&p.r0, &s);
+        B.releaseFn(&p.r1, &s);
+    }
+};
+
+test "spill v2: rank 1 writes what rank 0's tier keeps once its pass adopts the state; a keep the store dropped inside the pass is written by no rank" {
+    const gpa = std.testing.allocator;
+    var p: SpillPair = undefined;
+    p.init(gpa, true);
+    defer p.deinit();
+    const prompt = testPrompt(7);
+    try p.keepPass(gpa, &prompt);
+    try std.testing.expectEqual(@as(usize, 2), p.t0.points.items.len);
+    // the keeps precede the pass's `.pass` note, which adopts the states on rank 1: they wait for it
+    try std.testing.expectEqual(@as(usize, 3), p.sink.notes.items.len);
+    try std.testing.expectEqual(@as(u8, @backingInt(Note.tier)), p.sink.notes.items[0][0]);
+    try std.testing.expectEqual(@as(u8, @backingInt(Note.pass)), p.sink.notes.items[2][0]);
+    try p.r1.applyNote(p.sink.notes.items[0]);
+    try p.r1.applyNote(p.sink.notes.items[1]);
+    try std.testing.expectEqual(@as(usize, 2), p.r1.spill_keeps.items.len);
+    try std.testing.expectEqual(@as(usize, 0), p.t1.points.items.len);
+    try p.r1.applyNote(p.sink.notes.items[2]);
+    try std.testing.expectEqual(@as(usize, 0), p.r1.spill_keeps.items.len);
+    try std.testing.expectEqualStrings("kk", p.t1.log.items);
+    try std.testing.expectEqual(@as(usize, 0), p.t1.skipped);
+    for (p.t0.points.items, p.t1.points.items) |a, b| {
+        try std.testing.expectEqualSlices(u8, &a.key, &b.key);
+        try std.testing.expectEqual(a.at, b.at);
+        try std.testing.expectEqualSlices(u32, a.tokens, b.tokens);
+    }
+    for (p.sink.notes.items) |n| gpa.free(n);
+    p.sink.notes.clearRetainingCapacity();
+    // a keep of a state the pass did not adopt (the store dropped it inside the pass): it goes at the `.pass` note
+    const other = testPrompt(11);
+    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
+    var adopter: Adopter = .{ .hooks = hooks, .drop_first = true };
+    var s = try lanes.Stream.init(gpa, .{ .id = "d", .prompt = &other, .max_new = 4, .reuse = .{ .marks = &.{ 64, 128 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s.deinit(gpa);
+    try Lanes(MiniEngine).prefillFn(&p.r0, &s);
+    try Lanes(MiniEngine).prefillFn(&p.r1, &s);
+    // what rank 0's tier would have sent for the first state before the store dropped it
+    const k128 = p.r0.keptOf(adopter.saved[1]).?;
+    var bogus: std.ArrayList(u8) = .empty;
+    defer bogus.deinit(gpa);
+    try bogus.append(gpa, @backingInt(Note.tier));
+    try wire.encode(&bogus, gpa, .{ .keep = .{ .kept = 0xbad, .at = 64, .point = FakeTier.keyOf(other[0..64]), .group = 0, .shared = false, .lineage = .{ .root = @splat(1) } } });
+    try p.r1.applyNote(bogus.items);
+    try std.testing.expectEqual(@as(usize, 1), p.r1.spill_keeps.items.len);
+    try p.sink.take(&p.r1); // the drop, then the pass's list of one (the 128 state)
+    try std.testing.expectEqual(@as(usize, 0), p.r1.spill_keeps.items.len);
+    try std.testing.expectEqual(@as(usize, 2), p.t1.points.items.len); // nothing written for the dropped state
+    try std.testing.expect(p.r1.savedFor(k128.key) != null);
+    Lanes(MiniEngine).releaseFn(&p.r0, &s);
+    Lanes(MiniEngine).releaseFn(&p.r1, &s);
+}
+
+test "spill v2: a point one rank lacks restores on no rank and every rank forgets it; one still being written there is kept; a rank without the tier keeps it too" {
+    const gpa = std.testing.allocator;
+    var p: SpillPair = undefined;
+    p.init(gpa, true);
+    defer p.deinit();
+    const prompt = testPrompt(7);
+    try p.keepPass(gpa, &prompt);
+    try p.sink.take(&p.r1);
+    const p64 = p.t0.points.items[0];
+    const p128 = p.t0.points.items[1];
+    // rank 1 lost the 128 point (its own cap): no rank restores it, and both forget it
+    p.t1.remove(p128.key);
+    const missing: wire.Verdict = .{ .ok = false, .forget = true, .rank = 1, .code = @backingInt(wire.Absence.missing) };
+    try std.testing.expectEqual(@as(?wire.Verdict, missing), try p.t0.ask(.{ .has = .{ .point = p128.key, .at = 128, .blocks = 1 } }));
+    try std.testing.expectEqual(@as(?wire.Verdict, missing), p.t1.verdict);
+    try std.testing.expect(!p.t0.holds(p128.key) and !p.t1.holds(p128.key));
+    try std.testing.expectEqual(@as(usize, 2), p.t0.ranks);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1 }, p.t0.answers[0..2]);
+    try std.testing.expectEqualSlices(u64, &.{ 0, 1 }, p.t1.answers[0..2]);
+    // still being written on rank 1: refused, both keep it
+    p.t1.absent = .incomplete;
+    const incomplete: wire.Verdict = .{ .ok = false, .rank = 1, .code = @backingInt(wire.Absence.incomplete) };
+    try std.testing.expectEqual(@as(?wire.Verdict, incomplete), try p.t0.ask(.{ .has = .{ .point = p64.key, .at = 64, .blocks = 1 } }));
+    try std.testing.expect(p.t0.holds(p64.key) and p.t1.holds(p64.key));
+    p.t1.absent = null;
+    try std.testing.expect((try p.t0.ask(.{ .has = .{ .point = p64.key, .at = 64, .blocks = 1 } })).?.ok);
+    try std.testing.expectEqualStrings("kkHHH", p.t1.log.items);
+    // with no stream open, every ask leaves rank 1 idle again after its gather
+    try std.testing.expectEqual(@as(usize, 3), p.sink.flushes);
+    // a rank 1 without the tier answers `disabled`: refused, kept
+    p.r1.spill_side = null;
+    const off: wire.Verdict = .{ .ok = false, .rank = 1, .code = @backingInt(wire.Absence.disabled) };
+    try std.testing.expectEqual(@as(?wire.Verdict, off), try p.t0.ask(.{ .has = .{ .point = p64.key, .at = 64, .blocks = 1 } }));
+    try std.testing.expect(p.t0.holds(p64.key));
+    try std.testing.expectEqual(@as(usize, 0), p.pg.fatals);
+}
+
+test "spill v2: a restore commits on every rank under rank 0's key only when every rank validates it, and resumes as a fresh pass; progress goes at once; damage on one rank forgets the point everywhere; a cancel frees every rank's destination" {
+    const gpa = std.testing.allocator;
+    const B = Lanes(MiniEngine);
+    var p: SpillPair = undefined;
+    p.init(gpa, true);
+    defer p.deinit();
+    const prompt = testPrompt(7);
+    try p.keepPass(gpa, &prompt);
+    try p.sink.take(&p.r1);
+    // the kept states leave memory on both ranks (the store dropped them): only the disks hold them
+    const hooks = p.r0.cacheHooks(1 << 30, .{}, 0, 5);
+    while (p.r0.kept.items.len > 0) hooks.drop(hooks.ptr, p.r0.kept.items[0]);
+    try p.sink.take(&p.r1);
+    try std.testing.expectEqual(@as(usize, 0), p.r1.kept.items.len);
+    const p64 = p.t0.points.items[0];
+    // 1. has, begin, progress (at once), validate: the state on both ranks under rank 0's key
+    try std.testing.expect((try p.t0.ask(.{ .has = .{ .point = p64.key, .at = 64, .blocks = 1 } })).?.ok);
+    const flushes = p.sink.flushes;
+    const dest = try p.t0.begin(1, p64);
+    try p.r0.spillNote(.{ .progress = .{ .txn = 1, .upto = 1 } }, true);
+    try std.testing.expectEqual(flushes + 1, p.sink.flushes);
+    try std.testing.expect((try p.t0.ask(.{ .validate = .{ .txn = 1, .shared = false } })).?.ok);
+    try std.testing.expectEqualStrings("kkHbpV", p.t1.log.items);
+    try std.testing.expect(p.r0.savedFor(dest.key) != null and p.r0.savedFor(dest.key).? == @as(*anyopaque, @ptrCast(dest)));
+    const k1: *B.Kept = @ptrCast(@alignCast(p.r1.savedFor(dest.key) orelse return error.TestNotRestored));
+    try std.testing.expectEqualSlices(u32, prompt[0..64], k1.tokens);
+    // a longer prompt resumes from it on both ranks and draws what a fresh pass draws
+    var longer: [180]u32 = undefined;
+    @memcpy(longer[0..150], &prompt);
+    for (longer[150..], 0..) |*t, i| t.* = @intCast(900 + i);
+    var s0 = try lanes.Stream.init(gpa, .{ .id = "r", .prompt = &longer, .max_new = 4, .reuse = .{ .saved = dest, .at = 64 } });
+    defer s0.deinit(gpa);
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "r", .prompt = &longer, .max_new = 4, .reuse = .{ .saved = k1, .at = 64 } });
+    defer s1.deinit(gpa);
+    const resumed0, const resumed1 = .{ p.e0.resumed, p.e1.resumed };
+    try B.prefillFn(&p.r0, &s0);
+    try B.prefillFn(&p.r1, &s1);
+    try std.testing.expectEqual(resumed0 + 1, p.e0.resumed);
+    try std.testing.expectEqual(resumed1 + 1, p.e1.resumed);
+    try std.testing.expectEqual(MiniEngine.hash(&longer), try firstToken(B, &p.r0, &s0));
+    try std.testing.expectEqual(MiniEngine.hash(&longer), try firstToken(B, &p.r1, &s1));
+    B.releaseFn(&p.r0, &s0);
+    B.releaseFn(&p.r1, &s1);
+    // 2. a cancel before validate: every rank's destination goes, the point stays
+    _ = try p.t0.begin(2, p64);
+    p.r0.unreserve(p.t0.restore.?.dest);
+    p.t0.restore = null;
+    try p.r0.spillNote(.{ .cancel = .{ .txn = 2, .why = .cancelled, .forget = false } }, true);
+    try p.sink.take(&p.r1);
+    try std.testing.expect(p.t1.restore == null and p.t1.holds(p64.key));
+    // 3. rank 1's read finds a block damaged: aborted on every rank, both forget the point, no rank holds the state
+    try std.testing.expect((try p.t0.ask(.{ .has = .{ .point = p64.key, .at = 64, .blocks = 1 } })).?.ok);
+    const dest3 = try p.t0.begin(3, p64);
+    const key3 = dest3.key;
+    p.t1.fail = .crc;
+    const crc: wire.Verdict = .{ .ok = false, .forget = true, .rank = 1, .code = @backingInt(wire.Failure.crc) };
+    try std.testing.expectEqual(@as(?wire.Verdict, crc), try p.t0.ask(.{ .validate = .{ .txn = 3, .shared = false } }));
+    try std.testing.expectEqual(@as(?wire.Verdict, crc), p.t1.verdict);
+    try std.testing.expect(!p.t0.holds(p64.key) and !p.t1.holds(p64.key));
+    try std.testing.expect(p.r1.savedFor(key3) == null);
+    try std.testing.expectEqual(@as(usize, 1), p.r0.kept.items.len); // the state restored in 1
+    try std.testing.expectEqualStrings("kkHbpVbcHbV", p.t1.log.items);
+    // 4. a validate whose txn rank 1 does not hold (its begin never came): `unknown`, aborted, kept elsewhere
+    p.t1.fail = .none;
+    try std.testing.expect((try p.t0.ask(.{ .has = .{ .point = p.t0.points.items[0].key, .at = 128, .blocks = 1 } })).?.ok);
+    const dest4 = try p.r0.reserveKept(null);
+    p.t0.restore = .{ .m = .{ .txn = 4, .kept = dest4.key, .point = p.t0.points.items[0].key, .at = 128, .blocks = 1 }, .dest = dest4 };
+    p.t1.restore = .{ .m = .{ .txn = 9, .kept = 9, .point = p.t0.points.items[0].key, .at = 128, .blocks = 1 }, .dest = try p.r1.reserveKept(9) };
+    const unknown: wire.Verdict = .{ .ok = false, .rank = 1, .code = @backingInt(wire.Failure.unknown) };
+    try std.testing.expectEqual(@as(?wire.Verdict, unknown), try p.t0.ask(.{ .validate = .{ .txn = 4, .shared = false } }));
+    try std.testing.expect(p.t0.holds(p.t0.points.items[0].key));
+    try std.testing.expectEqual(@as(usize, 0), p.pg.fatals);
+    // every snapshot left is a kept state's (the testing allocator checks the wrappers and buffers at the end)
+    try std.testing.expectEqual(p.r0.kept.items.len, p.e0.snaps);
+    try std.testing.expectEqual(p.r1.kept.items.len, p.e1.snaps);
+}
+
+test "spill v2: rank 1's counters reach rank 0 in one gather; one rank answers itself; an ask rank 1 cannot read ends the pair; an ask inside a note is refused" {
+    const gpa = std.testing.allocator;
+    var p: SpillPair = undefined;
+    p.init(gpa, true);
+    defer p.deinit();
+    p.t0.counters.keeps = 3;
+    p.t1.counters = .{ .keeps = 5, .written_bytes = 1 << 40, .crc_errors = 2, .disk_free_bytes = 7 };
+    try std.testing.expectEqual(@as(?wire.Verdict, null), try p.t0.ask(.stats));
+    try std.testing.expectEqual(@as(usize, 2), p.t0.ranks);
+    const C = FakeTier.core.spill.store.Counters;
+    try std.testing.expectEqual(p.t0.counters, wire.fromWords(C, p.t0.answers[0..wire.stats_words]));
+    try std.testing.expectEqual(p.t1.counters, wire.fromWords(C, p.t0.answers[wire.stats_words..][0..wire.stats_words]));
+    try std.testing.expectEqual(p.t1.counters, wire.fromWords(C, p.t1.answers[wire.stats_words..][0..wire.stats_words]));
+    // an ask rank 1 cannot read: the pair ends (rank 0 already waits in the gather)
+    try std.testing.expectError(error.UnknownOp, p.r1.applyAsk(&.{99}));
+    try std.testing.expectError(error.NotAnAsk, p.r1.applyAsk(&.{ @backingInt(wire.Op.pump), 0, 0, 0, 0, 0, 0, 0, 0 }));
+    try std.testing.expectEqual(@as(usize, 2), p.pg.fatals);
+    // an ask inside a note, a note as an ask, and a tier note on a rank without the tier
+    var b: std.ArrayList(u8) = .empty;
+    defer b.deinit(gpa);
+    try b.append(gpa, @backingInt(Note.tier));
+    try wire.encode(&b, gpa, .stats);
+    try std.testing.expectError(error.BadNote, p.r1.applyNote(b.items));
+    try std.testing.expectError(error.NotANote, p.r0.spillNote(.stats, false));
+    var room: [wire.max_world]u64 = undefined;
+    try std.testing.expectError(error.NotAnAsk, p.r0.spillAsk(.{ .pump = 1 }, &.{0}, &room));
+    p.r1.spill_side = null;
+    try std.testing.expectError(error.NoSpillTier, p.r1.applyNote(b.items));
+    // one rank: an ask answers itself, a note goes nowhere
+    var e: MiniEngine = .{ .gpa = gpa };
+    defer e.deinit();
+    var lone = Lanes(MiniEngine).init(gpa, &e, true, 1 << 20, 8);
+    defer lone.deinit();
+    var out: [4]u64 = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try lone.spillAsk(.{ .has = .{ .point = @splat(1), .at = 64, .blocks = 1 } }, &.{2}, &out));
+    try std.testing.expectEqual(@as(u64, 2), out[0]);
+    try lone.spillNote(.{ .pump = 5 }, true);
 }

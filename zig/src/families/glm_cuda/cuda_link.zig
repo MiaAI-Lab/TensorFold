@@ -20,6 +20,11 @@ pub const Tag = enum(u32) {
     hello = 7,
     /// Rank 0's answer to the settings agreement at TP>2: one byte, 1 when every rank's settings matched.
     verdict = 8,
+    /// Spill v2's compatibility fingerprint (cuda_spill_identity.Exchange) once the settings agreed: rank 0's to every
+    /// follower, then each follower's to rank 0.
+    fields = 9,
+    /// Rank 0's answer to the fingerprints: the agreement, or the first rank and field that differ.
+    fields_verdict = 10,
     _,
 };
 

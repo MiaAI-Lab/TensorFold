@@ -170,6 +170,7 @@ const Host = struct {
     kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
     store_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family-kept store's snapshot calls (Loaded.cache)
     flush_ns: u64 = 0, // a clean stop stores the kept states not on disk yet, within this long (0: not at all)
+    spill: ?api.Spill = null, // spill v2's service bounds (LaneHost.configure) when the family set a tier on the store
 
     fn readExtraStatus(p: *anyopaque, out: *api.Status) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -229,6 +230,7 @@ const Host = struct {
         if (h.read_status != null) h.host.extra_status = .{ .ctx = h, .read = readExtraStatus };
         h.host.kv_parts = h.kv_parts;
         h.host.cache = h.store;
+        if (h.spill) |sp| h.host.configure(sp); // (after the tier is set: it publishes telemetry only over one)
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         if (h.learn != null) h.host.learner = h.learner();
         try h.host.start();
@@ -467,6 +469,14 @@ fn openOwn(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Op
         fo.spill_min_free_gib = o.spill_min_free_gib;
         fo.spill_flush_s = o.spill_flush_s;
     }
+    // spill v2's knobs (cli.spill read them once; the family uses them with its TF_GLM_SPILL_V2=1)
+    if (@hasField(F.Options, "spill_quota")) {
+        fo.spill_quota = o.spill.quota;
+        fo.spill_turns = o.spill.turns;
+        fo.spill_read_blocks = o.spill.read_blocks;
+        fo.spill_stage_mib = o.spill.stage_mib;
+        fo.spill_flush_ms = o.spill.flush_ms;
+    }
     if (@hasField(F.Options, "vision")) fo.vision = o.vision;
     if (@hasField(F.Options, "tower")) fo.tower = o.vision_zig;
     if (o.vision and !@hasField(F.Options, "vision")) {
@@ -512,6 +522,14 @@ fn openOwn(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Op
         else if (@hasDecl(F, "cache_rules")) .{ .lookahead = F.cache_rules.lookahead, .planned = F.cache_rules.planned, .min_prompt = if (@hasField(@TypeOf(F.cache_rules), "min_prompt")) F.cache_rules.min_prompt else (api.prompt_cache.Rules{}).min_prompt } else .{}, c.budget);
         // a family with the recipe's kept-state rules (GLM): its caps, order and shared points
         if (@hasField(@TypeOf(c), "rules")) store.policy = .{ .entries = c.rules.entries, .bytes_cap = c.rules.bytes_cap, .per_chat = c.rules.per_chat, .recipe = true, .shared_least = c.rules.shared_least, .spill = h.store_vt.evict != null, .spill_highwater = if (h.store_vt.evict != null) c.spill.?.highwater else 0 };
+        // spill v2 (GLM's TF_GLM_SPILL_V2=1): the family's tier, written at keep and read back by restore jobs; the
+        // family's v1 tier is off with it (setTier), and the lane host services it (configure, in serve)
+        if (@hasField(@TypeOf(loaded), "tier")) if (loaded.tier) |t| {
+            var seed: [4]u8 = undefined;
+            io.random(&seed);
+            store.setTier(@TypeOf(t.*).Tier(api.prompt_cache).tier(t), std.mem.readInt(u32, &seed, .little));
+            h.spill = o.spill;
+        };
         h.store = store;
     };
     errdefer if (h.store) |store| {
@@ -784,4 +802,84 @@ test "a cancel during a long prompt stops it, and the next request's reply is un
         try history.append(gpa, t);
     }
     try std.testing.expectEqual(@as(usize, 40), restored.tokens.items.len);
+}
+
+/// The prompt cache's mark hook in a two-rank GLM pass: the store keeps the state there (write at keep with a tier).
+const SpillKeeper = struct {
+    store: *api.prompt_cache.Store,
+    chat: u32,
+    fn at(ptr: *anyopaque, s: *lanes.Stream, mark: u32) void {
+        const k: *SpillKeeper = @ptrCast(@alignCast(ptr));
+        _ = k.store.keepWith(s.prompt(), mark, null, &.{}, &.{}, .{ .chat = k.chat });
+    }
+};
+
+test "GLM spill v2 under the prompt cache: kept states written at keep, evicted for room, found on disk; a full tier defers; a restore adopted on both ranks resumes exactly" {
+    const gpa = std.testing.allocator;
+    const pc = api.prompt_cache;
+    const rig = glm_cuda.spill_tier_rig;
+    var p: rig.Pair = undefined;
+    try p.init(gpa, "native", rig.Pair.settingsFor(1));
+    defer p.deinit();
+    // the store as openOwn makes it over rank 0's lane backend (room for one kept state), its tier the GLM one
+    var vt: pc.Snapshots.VTable = .{ .bytes = p.hooks.bytes, .save = p.hooks.save, .restore = p.hooks.restore, .drop = p.hooks.drop };
+    const one = p.e[0].snapBytes(2176);
+    var store = pc.Store.init(gpa, .{ .ptr = p.hooks.ptr, .vtable = &vt }, .{ .planned = true, .grid = 64, .min_gap = 256, .min_prompt = 64 }, one + one / 2);
+    defer store.deinit();
+    store.policy = .{ .recipe = true, .spill = true };
+    store.setTier(rig.Leader.Tier(pc).tier(p.lead0()), 7);
+    try std.testing.expect(!store.policy.spill); // (v1 off under a tier)
+    // three passes keep three states through the store, each written at keep on both ranks; each evicts the last
+    var b1: [2200]u32 = undefined;
+    var b2: [2300]u32 = undefined;
+    var b3: [2300]u32 = undefined;
+    const a = rig.idsOf(&b1, 70);
+    const b = rig.idsOf(&b2, 71);
+    const c = rig.idsOf(&b3, 72);
+    var k: SpillKeeper = .{ .store = &store, .chat = 1 };
+    for ([_][]const u32{ a, b, c }, [_]u32{ 2112, 2176, 2176 }, 1..) |ids, mark, chat| {
+        k.chat = @intCast(chat);
+        _ = try p.passBoth(ids, &.{mark}, .{ .ptr = &k, .at = SpillKeeper.at }, null);
+        try p.settle();
+    }
+    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
+    try std.testing.expectEqual(@as(u64, 3), store.tier_stats.writes_enqueued);
+    try std.testing.expectEqual(@as(usize, 1), p.r[1].kept.items.len); // (rank 1 dropped what rank 0's store did)
+    // a's and b's prompts: memory holds nothing of them, the tier their points
+    const pa = store.probe(a, &.{}, &.{});
+    const pb = store.probe(b, &.{}, &.{});
+    try std.testing.expect(pa.memory == null and pb.memory == null);
+    try std.testing.expectEqual(@as(u32, 2112), pa.durable.?.at);
+    try std.testing.expectEqual(@as(u32, 2176), pb.durable.?.at);
+    // a's restore in flight is the tier's one: b's is refused before any room is made, and may be asked again
+    const r = try store.restoreBeginOver(pa.durable.?, a, .{});
+    const held, const restoring = .{ store.held, store.restoring_bytes };
+    try std.testing.expectError(error.TierFull, store.restoreBeginOver(pb.durable.?, b, .{}));
+    try std.testing.expectEqual(held, store.held); // (nothing evicted or charged for b)
+    try std.testing.expectEqual(restoring, store.restoring_bytes);
+    try std.testing.expect(store.deferrable(error.TierFull));
+    for ([_]anyerror{ error.TooManyRestores, error.TooMany, error.NoSlot }) |e| try std.testing.expect(store.deferrable(e));
+    var got: pc.Restored = .pending;
+    var i: usize = 0;
+    while (got == .pending and i < 10_000) : (i += 1) {
+        got = store.restorePoll(r, 5 * std.time.ns_per_ms);
+        try p.sink.take(&p.r[1]);
+        if (got == .pending) std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(pc.Restored.adopted, got);
+    try std.testing.expectEqual(@as(u64, 1), store.tier_stats.disk_hits_committed);
+    // the adopted entry resumes a's prompt on both ranks exactly (rank 1's copy under rank 0's key)
+    const e = for (store.entries.items) |x| {
+        if (x.at == 2112) break x;
+    } else return error.TestNotAdopted;
+    try std.testing.expect(e.point != null and !e.own);
+    const exact = p.e[0].exact;
+    try std.testing.expectEqual(rig.HostEngine.first(a), try p.passBoth(a, &.{}, null, e.saved));
+    try std.testing.expectEqual(exact + 1, p.e[0].exact);
+    // every rank's counters through the store (rank 1's from its last stats answer)
+    p.lead0().stats_at = 0;
+    store.pump(1);
+    const counts = store.tierCounts().?;
+    try std.testing.expectEqual(@as(u32, 2), counts.n);
+    for (counts.slice()) |x| try std.testing.expectEqual(@as(u64, 3), x.points);
 }

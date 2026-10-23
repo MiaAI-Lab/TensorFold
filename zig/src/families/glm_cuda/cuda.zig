@@ -191,6 +191,19 @@ test {
     _ = spill;
 }
 
+pub const spill_state = @import("cuda_spill_state.zig"); // spill v2: a kept state in shared blocks and per-point sections
+pub const spill_wire = @import("cuda_spill_wire.zig"); // spill v2: the ranks' messages over the mirror
+pub const spill_identity = @import("cuda_spill_identity.zig"); // spill v2: the ranks' compatibility fingerprint
+pub const spill_tier = @import("cuda_spill_tier.zig"); // spill v2: the GLM tier over every rank's block store
+// spill v2: the tier on the host, for this module's tests and native/cuda.zig's (a test build's only: it uses std.testing)
+pub const spill_tier_rig = if (@import("builtin").is_test) @import("cuda_spill_tier_rig.zig") else struct {};
+test {
+    _ = spill_state;
+    _ = spill_wire;
+    _ = spill_identity;
+    _ = spill_tier;
+}
+
 pub const l2pf = @import("cuda_l2pf.zig");
 test {
     _ = l2pf;
