@@ -85,6 +85,45 @@ test "a conversation holds at most per_chat own states; a retry that branches ea
     try std.testing.expectEqual(@as(usize, 3), s.entries.items.len);
 }
 
+/// A conversation behind a 16-token system prompt every conversation shares: `n` tokens, `chat` first after it.
+fn behind(buf: []u32, chat: u32, n: usize) []u32 {
+    for (0..16) |i| buf[i] = @intCast(900 + i);
+    buf[16] = chat;
+    for (17..n) |i| buf[i] = @intCast(i);
+    return buf[0..n];
+}
+
+test "two conversations behind one kept system-prompt cut are two: per_chat lets neither evict the other's turns" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 4, .min_prompt = 0, .min_gap = 4 }, 1 << 20);
+    defer s.deinit();
+    s.policy = .{ .recipe = true, .per_chat = 2, .shared_least = 1000 };
+    var bufs: [5][64]u32 = undefined;
+    const a1 = behind(&bufs[0], 1, 25); // A's first turn keeps the system block's cut (16, shared) and its own 24
+    const plan = try s.begin(a, a1, 24, &.{16}, &.{}, null, &.{});
+    try std.testing.expectEqualSlices(u32, &.{ 16, 24 }, plan.marks);
+    _ = f.pass(&s, a1, plan);
+    const b1 = behind(&bufs[1], 2, 25); // B resumes the shared cut and keeps its own 24
+    const plan_b = try s.begin(a, b1, 24, &.{16}, &.{}, null, &.{});
+    try std.testing.expectEqual(@as(u32, 16), plan_b.from);
+    try std.testing.expectEqual(fresh(b1), f.pass(&s, b1, plan_b));
+    var chat_a: u32 = 0;
+    var chat_b: u32 = 0;
+    for (s.entries.items) |e| if (e.at == 24) {
+        if (e.tokens[16] == 1) chat_a = e.chat else chat_b = e.chat;
+    };
+    try std.testing.expect(chat_a != 0 and chat_b != 0 and chat_a != chat_b);
+    _ = try turn(&f, &s, a, behind(&bufs[2], 1, 37), 36); // A's turns 2 and 3: A holds two of its own, its 24 goes
+    _ = try turn(&f, &s, a, behind(&bufs[3], 1, 49), 48);
+    try std.testing.expectEqual(@as(u32, 24), s.find(behind(&bufs[4], 2, 30), &.{}, &.{}).?.at); // B's turn is still kept
+    try std.testing.expectEqual(@as(u32, 16), s.find(behind(&bufs[4], 1, 30), &.{}, &.{}).?.at);
+    try std.testing.expectEqual(@as(usize, 4), s.entries.items.len); // the cut, B's 24, A's 36 and 48
+}
+
 test "the bytes cap drops by the same order and keeps the newest" {
     const gpa = std.testing.allocator;
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -122,10 +161,11 @@ test "a shared cut is never superseded, only aged out with the rest, and /health
     try std.testing.expectEqual(@as(u32, 2), k.prompts);
     try std.testing.expectEqual(@as(u32, 1), k.own);
     try std.testing.expectEqual(@as(u32, 1), k.shared);
-    try std.testing.expectEqual(@as(u32, 1), k.chats);
+    try std.testing.expectEqual(@as(u32, 2), k.chats); // the turn kept after the cut does not take its id: chatOf passes over shared cuts
     try std.testing.expectEqual(@as(u64, 52), k.rows);
-    try std.testing.expectEqual(@as(u8, 1), k.by_chat_n);
-    try std.testing.expectEqual([3]u64{ 1, 2, 36 }, k.by_chat[0]);
+    try std.testing.expectEqual(@as(u8, 2), k.by_chat_n);
+    try std.testing.expectEqual([3]u64{ 1, 1, 16 }, k.by_chat[0]);
+    try std.testing.expectEqual([3]u64{ 2, 1, 36 }, k.by_chat[1]);
     // the shorter state is the shared one: with the cap at 1 the own, longer one is "superseded"? no: the shared one is
     // exempt, so the oldest of all (the shared cut, kept first) is what the cap takes
     s.policy.entries = 1;

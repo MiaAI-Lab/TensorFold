@@ -9,6 +9,127 @@ const Event = api.Event;
 const Request = api.Request;
 const Reason = api.Reason;
 
+/// A lane host over the fake lane backend with GLM's kept-state policy: two own states a conversation, the host's
+/// shared cuts kept. One request at a time (`run`); `deinit` stops it.
+const RecipeHost = struct {
+    cfg: lanes.Config,
+    target: lanes.fake.Fake,
+    clock: lanes.fake.FixedClock = .{},
+    core: lanes.Engine,
+    store: pc.Store,
+    host: LaneHost,
+
+    const vt: pc.Snapshots.VTable = .{ .bytes = bytes, .save = save, .restore = restore, .drop = drop };
+    fn bytes(_: *anyopaque, at: u32) u64 {
+        return 64 + 4 * @as(u64, at);
+    }
+    fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
+        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+        return f.save(@ptrCast(@alignCast(owner.?)), at);
+    }
+    fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
+        return error.BackendRestores;
+    }
+    fn drop(ptr: *anyopaque, saved: pc.Saved) void {
+        const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
+        f.drop(saved);
+    }
+
+    fn start(r: *RecipeHost) !void {
+        const gpa = std.testing.allocator;
+        r.cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+        r.target = .{ .gpa = gpa };
+        r.clock = .{};
+        r.core = lanes.Engine.init(gpa, &r.cfg, r.target.backend(), r.clock.clock());
+        r.store = pc.Store.init(gpa, .{ .ptr = &r.target, .vtable = &vt }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
+        r.store.policy = .{ .recipe = true, .per_chat = 2, .shared_least = 1000 };
+        r.host = LaneHost.init(gpa, std.testing.io, &r.core, .{ .lanes = 2 });
+        r.host.cache = &r.store;
+        try r.host.start();
+    }
+
+    fn deinit(r: *RecipeHost) void {
+        r.host.stop();
+        r.store.deinit();
+        r.core.deinit();
+        r.target.deinit();
+        r.cfg.deinit(std.testing.allocator);
+    }
+
+    /// The conversations of the own states whose ninth token (the first after the system block) is `first`.
+    fn chatOf(r: *RecipeHost, first: u32) u32 {
+        for (r.store.entries.items) |x| if (!x.shared and x.tokens.len > 8 and x.tokens[8] == first) return x.chat;
+        return 0;
+    }
+};
+
+/// One request to its end: a prompt whose last two tokens are the generation prompt, behind the 8-token system block.
+const Turn = struct {
+    mutex: std.Io.Mutex = .init,
+    tokens: std.ArrayList(u32) = .empty,
+    cached: ?u32 = null,
+    done: ?Reason = null,
+
+    fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
+        const b: *Turn = @ptrCast(@alignCast(ctx));
+        b.mutex.lockUncancelable(std.testing.io);
+        defer b.mutex.unlock(std.testing.io);
+        switch (e.*) {
+            .prefilled => |c| b.cached = c,
+            .logprobs => {},
+            .tokens => |t| b.tokens.appendSlice(std.testing.allocator, t) catch {},
+            .finished => |f| b.done = f.reason,
+        }
+    }
+
+    fn run(b: *Turn, e: api.Engine, id: Id, prompt: []const u32) !void {
+        const r: Request = .{ .prompt = prompt, .max_tokens = 6, .history_len = @intCast(prompt.len - 2), .shared_prefixes = &.{8} };
+        try e.submit(id, &r, .{ .ctx = b, .event = event });
+        while (true) {
+            b.mutex.lockUncancelable(std.testing.io);
+            const d = b.done;
+            b.mutex.unlock(std.testing.io);
+            if (d) |reason| return std.testing.expectEqual(Reason.length, reason);
+            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
+        }
+    }
+};
+
+const system = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
+
+test "a lane host keeps two conversations behind one kept system-prompt cut apart: per_chat evicts neither's turns" {
+    const gpa = std.testing.allocator;
+    var r: RecipeHost = undefined;
+    try r.start();
+    defer r.deinit();
+    const e = r.host.engine();
+    var turns: [5]Turn = @splat(.{});
+    defer for (&turns) |*t| t.tokens.deinit(gpa);
+    var prompts: [5]std.ArrayList(u32) = @splat(.empty);
+    defer for (&prompts) |*p| p.deinit(gpa);
+    try prompts[0].appendSlice(gpa, &system ++ [_]u32{ 11, 12, 13, 14, 7, 7 }); // A: keeps the cut at 8 and its own 12
+    try turns[0].run(e, 1, prompts[0].items);
+    try prompts[1].appendSlice(gpa, &system ++ [_]u32{ 21, 22, 23, 24, 7, 7 }); // B: resumes the cut, keeps its own 12
+    try turns[1].run(e, 2, prompts[1].items);
+    try std.testing.expectEqual(@as(?u32, 8), turns[1].cached);
+    const chat_a = r.chatOf(11);
+    const chat_b = r.chatOf(21);
+    try std.testing.expect(chat_a != 0 and chat_b != 0 and chat_a != chat_b);
+    for ([_]usize{ 2, 3 }) |k| { // A's next two turns: resumed from its last, a reply and a tool result on each
+        const prev: usize = if (k == 2) 0 else 2;
+        try prompts[k].appendSlice(gpa, prompts[prev].items);
+        try prompts[k].appendSlice(gpa, turns[prev].tokens.items[0..4]);
+        try prompts[k].appendSlice(gpa, &.{ 15, @intCast(k), 7, 7 });
+        try turns[k].run(e, @intCast(k + 1), prompts[k].items);
+        try std.testing.expectEqual(@as(?u32, @intCast(prompts[prev].items.len - 2)), turns[k].cached);
+    }
+    try prompts[4].appendSlice(gpa, prompts[1].items); // B's next turn still resumes its own 12
+    try prompts[4].appendSlice(gpa, turns[1].tokens.items[0..4]);
+    try prompts[4].appendSlice(gpa, &.{ 25, 26, 7, 7 });
+    try turns[4].run(e, 5, prompts[4].items);
+    try std.testing.expectEqual(@as(?u32, 12), turns[4].cached);
+}
+
 test "a lane host resumes a conversation from its kept prompt state and reports the cached tokens" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
@@ -338,6 +459,7 @@ test "a lane host fills prompts between rounds: requests arriving together fill 
             defer b.mutex.unlock(std.testing.io);
             switch (e.*) {
                 .prefilled => b.prefilled = true,
+                .logprobs => {},
                 .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
                 .finished => |f| b.done = f.reason,
             }

@@ -709,7 +709,7 @@ pub const Store = struct {
     fn chatOf(s: *Store, prompt: []const u32, at: u32) u32 {
         var best: ?*Entry = null;
         for (s.entries.items) |e| {
-            if (e.at >= at or e.tokens.len > prompt.len) continue;
+            if (e.shared or e.at >= at or e.tokens.len > prompt.len) continue;
             if (best != null and e.at <= best.?.at) continue;
             if (std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) best = e;
         }

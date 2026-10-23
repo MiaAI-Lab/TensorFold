@@ -99,6 +99,10 @@ fn until(value: *const std.atomic.Value(u32), want: u32) !void {
 test "the ticker commits while idle and holds while a request runs" {
     var gated = Gated{};
     const k = try Keepalive.start(testing.allocator, std.testing.io, .{ .ctx = &gated, .tick = Gated.tick }, 900 * std.time.ns_per_s);
+    defer { // a failed check stops the thread too: a tick parked in the gate is let go first
+        gated.gate.store(1, .release);
+        Keepalive.stop(k);
+    }
     k.interval_ns = 10 * std.time.ns_per_ms;
     // armed and idle: a commit arrives and parks in the gate
     try until(&gated.commits, 1);
@@ -121,8 +125,6 @@ test "the ticker commits while idle and holds while a request runs" {
     // the request ended: commits resume
     k.end();
     try until(&gated.commits, 2);
-    gated.gate.store(1, .release);
-    Keepalive.stop(k);
 }
 
 test "ticks stop once the keep-warm window has passed and resume when a request ends" {
@@ -133,16 +135,24 @@ test "ticks stop once the keep-warm window has passed and resume when a request 
         }
     };
     const k = try Keepalive.start(testing.allocator, std.testing.io, .{ .ctx = &commits, .tick = Count.tick }, 60 * std.time.ns_per_ms);
+    defer Keepalive.stop(k); // a failed check stops the thread too: its ticks write to `commits` on this stack
     k.interval_ns = 10 * std.time.ns_per_ms;
     try until(&commits, 1); // the window is open: commits flow
     std.Io.sleep(std.testing.io, .fromMilliseconds(120), .awake) catch {}; // the window closes at 60 ms
-    const frozen = commits.load(.acquire);
-    std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
-    try testing.expectEqual(frozen, commits.load(.acquire)); // flat once the window has passed
+    // a tick that found the window open can still land late on a loaded machine: flat is 100 ms without a commit
+    var frozen = commits.load(.acquire);
+    var flat = false;
+    for (0..10) |_| {
+        std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake) catch {};
+        const later = commits.load(.acquire);
+        flat = later == frozen;
+        if (flat) break;
+        frozen = later;
+    }
+    try testing.expect(flat); // flat once the window has passed
     k.begin(); // a request ran and ended: the window restarts from its end
     k.end();
     try until(&commits, frozen + 1);
-    Keepalive.stop(k);
 }
 
 test "the window decides due without a thread" {
