@@ -358,13 +358,16 @@ pub const Engine = struct {
         // Size after the fixed Zig arenas and drafter: free memory at startup, less the recipe reserve.
         // Cache surplus has the same cap as Python. No fictitious kept-state charge: this engine has no prompt cache.
         var pool_rows = extent;
-        const available_room = try capacity.room(gpa, io, ctx);
+        const available = try capacity.room(gpa, io, ctx);
+        const available_room = available.bytes;
         if (streams > 1) {
             if (display.env("TF_GLM_POOL_ROWS")) |t| {
                 const n = std.fmt.parseInt(usize, t, 10) catch return error.BadPoolRows;
                 if (n < extent) return error.BadPoolRows;
                 pool_rows = std.mem.alignForward(usize, n, G.extent);
             } else {
+            // logged where the room sizes the pool (a lone stream or TF_GLM_POOL_ROWS does not use it)
+            if (available.parked >= 1 << 28) std.log.info("rank {d}: the KV pool's budget counts the {d:.2} GiB free on the per-CPU page lists beyond their resting level (neither MemFree nor MemAvailable does)", .{ o.rank, @as(f64, @floatFromInt(available.parked)) / (1 << 30) });
             const spare = @min(available_room, try capacity.gibBytes(display.env("TF_GLM_CACHE_GIB") orelse display.env("KV_POOL_GIB"), 3));
             const delta = 65536;
             const bytes0 = state.Caches.bytes(extent, streams, 2048) + fwd.Scratch.bytes(e.g, window, decodeScratchRows(extent));

@@ -5,6 +5,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const display = @import("cuda_display_kv.zig");
 const pool = @import("cuda_pool.zig");
+const cache_plan = @import("cuda_cache_plan.zig");
 pub fn gibBytes(raw: ?[]const u8, default: f64) !usize {
     const g = if (raw) |r| std.fmt.parseFloat(f64, std.mem.trim(u8, r, " \t\r\n")) catch return error.InvalidPoolGiB else default;
     const bytes = g * (1 << 30);
@@ -42,8 +43,11 @@ pub fn meminfo(text: []const u8) !Counts {
     if (t == 0 or a > t) return error.BadMeminfo;
     return .{ .total = t, .available = a };
 }
-pub fn room(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !usize {
+/// What the pool may take, and the pages parked on the per-CPU lists its reading counted (cache_plan.parkedBytes).
+pub const Room = struct { bytes: usize, parked: u64 = 0 };
+pub fn room(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !Room {
     const unified = (try ctx.attribute(.integrated)) != 0;
+    var parked: u64 = 0;
     const counts: Counts = if (unified) blk: {
         var f = try std.Io.Dir.cwd().openFile(io, "/proc/meminfo", .{});
         defer f.close(io);
@@ -51,7 +55,12 @@ pub fn room(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !usize
         var r = f.readerStreaming(io, &buf);
         const text = try r.interface.allocRemaining(gpa, .limited(1 << 20));
         defer gpa.free(text);
-        break :blk try meminfo(text);
+        const read = try meminfo(text);
+        // MemAvailable first, the per-CPU page lists right after, one reading for both figures: pages that drain from the
+        // lists in between are counted by neither (an undercount), never by both
+        const m = cache_plan.counting(.{ .total = read.total, .available = read.available }, cache_plan.parkedNow(gpa));
+        parked = m.available - read.available;
+        break :blk .{ .total = m.total, .available = m.available };
     } else blk: {
         const m = try ctx.memInfo();
         break :blk .{ .total = m.total, .available = m.free };
@@ -60,7 +69,7 @@ pub fn room(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !usize
     if (counts.available < res) return error.PoolMemoryBudget;
     var left = counts.available - res;
     if (display.env("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) |limit| left = @min(left, (try gibBytes(limit, 0)) -| cuda.usage(false).device);
-    return left;
+    return .{ .bytes = left, .parked = parked };
 }
 /// Whole extents, with display credited above the ordinary-memory cap. No kept-state charge until caching exists.
 pub fn rows(capacity: usize, spare: usize, display_bytes: usize, per_token: usize) !usize {

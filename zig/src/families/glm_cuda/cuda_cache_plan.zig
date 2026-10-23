@@ -179,6 +179,71 @@ pub fn memNow() ?MemInfo {
     return meminfo(buf[0..@intCast(n)]);
 }
 
+/// What the per-CPU page lists hold at rest when /proc/zoneinfo prints no high_min (kernels before 6.7).
+pub const parked_rest: u64 = 1 << 29;
+
+/// Bytes free on the kernel's per-CPU page lists beyond what they hold at rest: the `count:` lines under each zone's
+/// `pagesets` less their `high_min:` lines (parked_rest when there are none). A bulk free (an image copy, a compiler's
+/// exit) leaves GiBs there on kernel 6.7+; they are free and the kernel drains them when an allocation needs them, but
+/// neither MemFree nor MemAvailable counts them and they drain back at ~0.05-0.1 GiB/s. A warm start parks ~0.3 GiB,
+/// which the budget never counted: that stays ~0. 0 when the text has no page lists or a field does not parse.
+/// (Port of wojo's GLM 0119, PR #149.)
+pub fn parkedBytes(text: []const u8, page: u64) u64 {
+    var count: u64 = 0;
+    var rest: u64 = 0;
+    var listed = false;
+    var rows = std.mem.splitScalar(u8, text, '\n');
+    while (rows.next()) |row| {
+        var words = std.mem.tokenizeAny(u8, row, " \t\r");
+        const first = words.next();
+        if (std.mem.eql(u8, std.mem.trim(u8, row, " \t\r"), "pagesets")) {
+            listed = true;
+        } else if (listed and !std.mem.startsWith(u8, row, "    ") and !std.mem.startsWith(u8, row, "  vm stats")) {
+            listed = false; // the next zone's or the next field of this one
+        } else if (listed and first != null and (std.mem.eql(u8, first.?, "count:") or std.mem.eql(u8, first.?, "high_min:"))) {
+            const n = std.fmt.parseInt(u64, words.next() orelse return 0, 10) catch return 0;
+            const sum = if (first.?[0] == 'c') &count else &rest;
+            sum.* = std.math.add(u64, sum.*, n) catch return 0;
+        }
+    }
+    if (count == 0) return 0;
+    const held = std.math.mul(u64, count, page) catch return 0;
+    const resting = if (rest > 0) std.math.mul(u64, rest, page) catch return 0 else parked_rest;
+    return held -| resting;
+}
+
+/// A /proc/meminfo reading with `parked` (parkedBytes) added to MemAvailable, at most MemTotal.
+pub fn counting(m: MemInfo, parked: u64) MemInfo {
+    return .{ .total = m.total, .available = @min(m.total, m.available +| parked) };
+}
+
+/// /proc/zoneinfo's whole text (null where it cannot be read); the caller frees it.
+fn zoneinfoNow(gpa: std.mem.Allocator) ?[]u8 {
+    const fd = std.c.open("/proc/zoneinfo", .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var text: std.ArrayList(u8) = .empty;
+    while (text.items.len < 16 << 20) {
+        text.ensureUnusedCapacity(gpa, 64 << 10) catch break;
+        const free = text.unusedCapacitySlice();
+        const n = std.c.read(fd, free.ptr, free.len);
+        if (n < 0) break;
+        if (n == 0) return text.toOwnedSlice(gpa) catch break;
+        text.items.len += @intCast(n);
+    }
+    text.deinit(gpa);
+    return null;
+}
+
+/// The per-CPU page lists' excess now (parkedBytes of /proc/zoneinfo; 0 where it cannot be read). The startup budgets
+/// (the KV pool's rows, the kept states') add it to the /proc/meminfo they read just before; the keep floor's live
+/// reads (memNow alone) do not.
+pub fn parkedNow(gpa: std.mem.Allocator) u64 {
+    const text = zoneinfoNow(gpa) orelse return 0;
+    defer gpa.free(text);
+    return parkedBytes(text, std.heap.pageSize());
+}
+
 /// The whole plan.
 pub const Plan = struct {
     budget: u64,
@@ -313,4 +378,137 @@ test "the keep headroom: the budget stops that far above the reserve" {
     // the launch defaults keep their budget: 100 GiB free leaves room for both
     const big = meminfo("MemTotal:  126000000 kB\nMemFree: 1 kB\nMemAvailable: 100000000 kB\n").?;
     try std.testing.expectEqual(@as(u64, 12 * g + g / 2), (try plan(.{ .cache_gib = "12.5", .reserve_gib = "14.5" }, null, big, 100 << 20)).budget);
+}
+
+/// tools/parked_pages_check.py's /proc/zoneinfo blocks: one zone's stats, its page lists when `counts` is given.
+fn zoneText(a: std.mem.Allocator, out: *std.ArrayList(u8), node: u32, name: []const u8, counts_: ?[]const u64, high_min: ?u64) !void {
+    try out.print(a, "Node {d}, zone {s:>8}\n  pages free     10\n        managed  1000\n      nr_free_cma  0\n", .{ node, name });
+    if (counts_) |cs| {
+        try out.appendSlice(a, "  pagesets\n");
+        for (cs, 0..) |c, n| {
+            try out.print(a, "    cpu: {d}\n              count:    {d}\n              high:     5000\n              batch:    63\n", .{ n, c });
+            if (high_min) |h| try out.print(a, "              high_min: {d}\n", .{h});
+            try out.appendSlice(a, "              high_max: 198283\n  vm stats threshold: 110\n");
+        }
+    }
+    try out.appendSlice(a, "  start_pfn:           4096\n");
+}
+
+test "parked pages: every CPU, zone and node, less each list's resting level" {
+    const a = std.testing.allocator;
+    const page: u64 = 4096;
+    const hm: u64 = 2146; // a CPU list's high_min as the kernel prints it on a Spark
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(a);
+    const ca = [_]u64{ 200000, 3143, 2332, 17 };
+    const cb = [_]u64{ 100000, 100000, 100000 };
+    const cc = [_]u64{400000};
+    try zoneText(a, &t, 0, "DMA", &ca, hm);
+    try zoneText(a, &t, 0, "DMA32", null, hm);
+    try zoneText(a, &t, 0, "Normal", &cb, hm);
+    try zoneText(a, &t, 1, "Normal", &cc, hm);
+    try zoneText(a, &t, 1, "Movable", null, hm);
+    var sum: u64 = 0;
+    for (ca ++ cb ++ cc) |c| sum += c;
+    const excess = (sum - 8 * hm) * page;
+    try std.testing.expectEqual(excess, parkedBytes(t.items, page));
+    const m = counting(.{ .total = 128 << 30, .available = 100 << 30 }, excess);
+    try std.testing.expectEqual(@as(u64, (100 << 30) + excess), m.available);
+    try std.testing.expectEqual(@as(u64, 128 << 30), m.total);
+    try std.testing.expectEqual(@as(u64, 128 << 30), counting(.{ .total = 128 << 30, .available = 120 << 30 }, 200 << 30).available); // capped at MemTotal
+}
+
+test "parked pages: an image copy's 6 GiB raise the budget by 6 GiB; a warm start counts ~nothing" {
+    const a = std.testing.allocator;
+    const page: u64 = 4096;
+    const hm: u64 = 2146;
+    const six = (6 << 30) / page;
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(a);
+    try zoneText(a, &t, 0, "Normal", &.{ six / 4 + hm, six / 4 + hm, six / 4 + hm, six / 4 + hm }, hm);
+    try std.testing.expectEqual(@as(u64, 6 << 30), parkedBytes(t.items, page));
+    const warm = [_][20]u64{ @splat(hm), @splat(hm + 1440), @splat(0) };
+    for (warm) |cs| {
+        t.clearRetainingCapacity();
+        try zoneText(a, &t, 0, "Normal", &cs, hm);
+        try std.testing.expect(parkedBytes(t.items, page) < 1 << 28); // under the log line's 0.25 GiB
+    }
+    t.clearRetainingCapacity();
+    try zoneText(a, &t, 0, "Normal", &@as([20]u64, @splat(100)), hm);
+    try std.testing.expectEqual(@as(u64, 0), parkedBytes(t.items, page)); // below the resting level: nothing
+}
+
+test "parked pages: no high_min (before 6.7) rests the first 512 MiB" {
+    const a = std.testing.allocator;
+    const page: u64 = 4096;
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(a);
+    const half = ((1 << 30) + (1 << 29)) / page / 2;
+    try zoneText(a, &t, 0, "Normal", &.{ half, half }, null);
+    try std.testing.expectEqual(@as(u64, 1 << 30), parkedBytes(t.items, page));
+    t.clearRetainingCapacity();
+    try zoneText(a, &t, 0, "Normal", &.{ 1000, 1000, 1000, 1000 }, null);
+    try std.testing.expectEqual(@as(u64, 0), parkedBytes(t.items, page));
+}
+
+test "parked pages: only the count: and high_min: lines under pagesets" {
+    const a = std.testing.allocator;
+    const page: u64 = 4096;
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(a);
+    try t.appendSlice(a, "  count: 5\n      count: 6\n");
+    try zoneText(a, &t, 0, "Normal", &.{2146 + 10}, 2146);
+    try t.appendSlice(a, "      count:    99999\n      high_min: 7\n"); // after start_pfn: not a list
+    try t.appendSlice(a, "Node 0, zone Other\n      count:    77777\n  pagesets\n    cpu: 0\n              high:     1\n");
+    try std.testing.expectEqual(10 * page, parkedBytes(t.items, page));
+    // a list that ends at the next field of its zone
+    const other = "Node 0, zone Normal\n  pagesets\n    cpu: 0\n              count: 2200\n              high: 9\n" ++
+        "              high_min: 2000\n  vm stats threshold: 8\n    cpu: 1\n              count: 2100\n" ++
+        "              high_min: 2000\n  all_unreclaimable: 0\n";
+    try std.testing.expectEqual(300 * page, parkedBytes(other, page));
+}
+
+test "parked pages: no lists, empty, garbled or binary text counts nothing" {
+    const a = std.testing.allocator;
+    const page: u64 = 4096;
+    var t: std.ArrayList(u8) = .empty;
+    defer t.deinit(a);
+    try zoneText(a, &t, 0, "DMA", null, 2146);
+    try zoneText(a, &t, 0, "Normal", null, 2146);
+    try std.testing.expectEqual(@as(u64, 0), parkedBytes(t.items, page));
+    try std.testing.expectEqual(@as(u64, 0), parkedBytes("", page));
+    var bad: std.ArrayList(u8) = .empty;
+    defer bad.deinit(a);
+    try zoneText(a, &bad, 0, "Normal", &.{1000000}, 2146);
+    for ([_][2][]const u8{ .{ "count:    1000000", "count:    x" }, .{ "count:    1000000", "count:" }, .{ "high_min: 2146", "high_min: x" }, .{ "count:    1000000", "count:    \xff\xfe" } }) |swap| {
+        const garbled = try std.mem.replaceOwned(u8, a, bad.items, swap[0], swap[1]);
+        defer a.free(garbled);
+        try std.testing.expectEqual(@as(u64, 0), parkedBytes(garbled, page));
+    }
+    try std.testing.expectEqual(@as(u64, 0), parkedBytes("\x00\xff\xfe" ++ "\x00\xff\xfe" ++ "\x00\xff\xfe\n  pagesets\x00", page));
+    try std.testing.expectEqual(@as(u64, 0), parkedBytes("Node 0, zone Normal\n  pagesets\n    cpu: 0\n      count: 18446744073709551615\n      count: 1\n", page)); // overflow: nothing, not a wrap
+}
+
+test "parked pages: the kept states' budget counts them, the keep floor does not" {
+    const g: u64 = 1 << 30;
+    // 20 GiB available, 14.5 reserved and 2 of headroom leave 3.5 GiB of an asked 8; 4 GiB parked make it 7.5
+    const read = meminfo("MemTotal:  126000000 kB\nMemFree: 1 kB\nMemAvailable: 20971520 kB\n").?;
+    const env: Env = .{ .reserve_gib = "14.5" };
+    try std.testing.expectEqual(3 * g + g / 2, (try plan(env, 8, read, 100 << 20)).budget);
+    const p = try plan(env, 8, counting(read, 4 * g), 100 << 20);
+    try std.testing.expectEqual(7 * g + g / 2, p.budget);
+    try std.testing.expectEqual(14 * g + g / 2, p.reserve); // from MemTotal: unchanged
+    // the floor reads MemAvailable alone: a save it refused stays refused whatever is parked
+    try std.testing.expect(!fits(read.available, p.reserve, 6 * g));
+}
+
+test "this host's /proc/zoneinfo reads whole; its page lists count less than the host's memory (Linux)" {
+    if (@import("builtin").os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const zones = zoneinfoNow(a) orelse return error.Unreadable;
+    defer a.free(zones);
+    const mem = memNow() orelse return error.Unreadable;
+    try std.testing.expect(std.mem.indexOf(u8, zones, "pagesets") != null);
+    try std.testing.expect(parkedBytes(zones, std.heap.pageSize()) < mem.total);
+    try std.testing.expect(parkedNow(a) < mem.total);
 }

@@ -241,15 +241,20 @@ fn cacheFor(own: *Own, o: Options, build_key: u64) ?lane_backend.CacheHooks {
         .reserve_gib = envText("TENSORFOLD_MEMORY_RESERVE_GIB"),
         .headroom_gib = envText("TF_GLM_KEEP_HEADROOM_GIB"),
     };
-    const mem = cache_plan.memNow() orelse {
+    const read = cache_plan.memNow() orelse {
         std.log.warn("prompt cache: /proc/meminfo is unreadable; no prompt cache", .{});
         return null;
     };
+    // MemAvailable first, the per-CPU page lists right after (as the KV pool's reading), on a unified GPU only (as the
+    // pool's): the budget counts them, the keep floor's live reads (keepFits, the saves) do not
     const e = own.engine.?;
+    const unified = if (e.ctx) |c| (c.attribute(.integrated) catch 0) != 0 else false;
+    const mem = if (unified) cache_plan.counting(read, cache_plan.parkedNow(own.gpa)) else read;
     const p = cache_plan.plan(env, o.prompt_cache_gib, mem, e.snapBytes(0)) catch |err| {
         std.log.err("prompt cache: bad setting ({s}); no prompt cache", .{@errorName(err)});
         return null;
     };
+    if (p.budget > 0 and mem.available - read.available >= 1 << 28) std.log.info("rank {d}: the kept prompt states' budget counts the {d:.2} GiB free on the per-CPU page lists beyond their resting level (neither MemFree nor MemAvailable does)", .{ o.rank, @as(f64, @floatFromInt(mem.available - read.available)) / cache_plan.gib });
     // the keep floor is the reserve: a save (or a load from the spill tier) that would leave the machine under it is
     // refused (cuda_lanes pass agrees on the room first); the headroom only shapes the budget, so the kept states stay
     // that far above the floor and the prompts' own buffers have it
