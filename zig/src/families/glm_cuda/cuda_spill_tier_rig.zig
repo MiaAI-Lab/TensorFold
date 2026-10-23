@@ -2,8 +2,12 @@
 //! cache): an engine whose kept states are real GLM kept-state buffers (cuda_snapshot.sections at TP=2) in host memory,
 //! their bytes a function of their tokens, so a pass resumed from a restored state draws what a fresh pass draws
 //! exactly when every byte of the state came back (`first`); and a pair of ranks in one thread, each with its lane
-//! backend, its own store under TF_SPILL_TEST_DIR and the tier, rank 1 following rank 0's notes and asks. Test code only:
-//! glm_cuda exports it in test builds alone (cuda.zig's `spill_tier_rig`).
+//! backend, its own store under TF_SPILL_TEST_DIR and the tier, rank 1 following rank 0's notes and asks. Sharded
+//! (`Pair.initWith(.., .{ .sharded = true })`, TF_GLM_KV_SHARD): each rank's layout owner-sharded and its own, its
+//! sequences extents of a two-part pool (cuda_pool) placed as the engine places them, a kept state holding its latent
+//! rows on its home part's owner only, a resume placed in its home part, moved there, carried, or from 0
+//! (cuda_shard_keep).
+//! Test code only: glm_cuda exports it in test builds alone (cuda.zig's `spill_tier_rig`).
 const std = @import("std");
 const core = @import("core");
 const lanes = @import("lanes");
@@ -13,6 +17,8 @@ const snapshot = @import("cuda_snapshot.zig");
 const state = @import("cuda_state.zig");
 const tier = @import("cuda_spill_tier.zig");
 const wire = @import("cuda_spill_wire.zig");
+const shard_keep = @import("cuda_shard_keep.zig");
+const Pool = @import("cuda_pool.zig").Pool;
 
 const spill = core.spill;
 const format = spill.format;
@@ -22,12 +28,13 @@ const testing = std.testing;
 extern "c" fn memcmp(a: [*]const u8, b: [*]const u8, n: usize) c_int;
 
 /// An engine whose sequence is its tokens and whose kept state is a GLM kept-state buffer filled from them (`fill`).
-/// Its device is host memory: copies are synchronous, an event stays pending `delay` polls after its record.
+/// Its device is host memory: copies are synchronous, an event stays pending `delay` polls after its record. With a
+/// `pool` (TF_GLM_KV_SHARD's two parts) a sequence holds an extent and a kept state its home (cuda_engine's rules).
 pub const HostEngine = struct {
     pub const snap_holds_rows = true;
-    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty };
+    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null };
     pub const Buf = struct { ptr: u64, bytes: []u8 };
-    pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?Buf = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1) };
+    pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?Buf = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
     pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
     pub const Window = struct { seq: *Seq, tokens: []const u32 };
@@ -49,6 +56,11 @@ pub const HostEngine = struct {
     /// tierDest refuses (a rank at its keep floor)
     refuse_dest: bool = false,
     scratch: []u8 = &.{},
+    /// TF_GLM_KV_SHARD's parts (null: off), TF_GLM_KV_SHARD_CARRY, and the resumes placeResume carried or sent to 0
+    pool: ?Pool = null,
+    carry: bool = true,
+    carries: usize = 0,
+    refused_small: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, layout: st.Layout) HostEngine {
         return .{ .gpa = gpa, .layout = layout };
@@ -57,6 +69,7 @@ pub const HostEngine = struct {
     pub fn deinit(e: *HostEngine) void {
         e.gpa.free(e.events);
         e.gpa.free(e.scratch);
+        if (e.pool) |*p| p.deinit();
     }
 
     pub fn first(tokens: []const u32) u32 {
@@ -75,25 +88,27 @@ pub const HostEngine = struct {
         std.mem.writeInt(u64, dst[dst.len - 8 ..][0..8], ~v, .little);
     }
 
-    /// The state ranges a kept state holds (every layer's latent rows and complete pools, each section): `f` on each.
+    /// The state ranges a kept state holds (every layer's latent rows when it holds them, its complete pools, each
+    /// section): `f` on each.
     fn ranges(l: *const st.Layout, sec: snapshot.Sections, ctx: anytype, comptime f: fn (@TypeOf(ctx), usize, usize) void) void {
         for (0..G.dsa_layers) |i| {
-            f(ctx, sec.latent + i * sec.latentBytes(), sec.at * G.latent_row);
+            if (sec.rows) f(ctx, sec.latent + i * sec.latentBytes(), sec.at * G.latent_row);
             f(ctx, sec.pooled + i * sec.pooledBytes(), sec.at / 4 * G.pool_row);
         }
         const at = [_]usize{ sec.rings, sec.rec, sec.conv, sec.draft };
         for (l.specs(), l.order[0..l.n]) |s, o| f(ctx, at[@backingInt(o)], s.len);
     }
 
-    /// The state a fresh pass of `tokens` keeps at their end: each latent row from the tokens through it, each complete
-    /// pool from its four, the sections from all of them; pooled row at/4 and the padding stale bytes (0xee).
+    /// The state a fresh pass of `tokens` keeps at their end: each latent row from the tokens through it (when the
+    /// buffer holds them), each complete pool from its four, the sections from all of them; pooled row at/4 and the
+    /// padding stale bytes (0xee).
     pub fn fill(l: *const st.Layout, out: []u8, sec: snapshot.Sections, tokens: []const u32) void {
         @memset(out[0..sec.total], 0xee);
         var h: u64 = 0x51ed;
         for (tokens[0..sec.at], 0..) |t, r| {
             h = mix(h, t);
             for (0..G.dsa_layers) |i| {
-                row(out[sec.latent + i * sec.latentBytes() + r * G.latent_row ..][0..G.latent_row], h +% i);
+                if (sec.rows) row(out[sec.latent + i * sec.latentBytes() + r * G.latent_row ..][0..G.latent_row], h +% i);
                 if (r % 4 == 3) row(out[sec.pooled + i * sec.pooledBytes() + r / 4 * G.pool_row ..][0..G.pool_row], h ^ (@as(u64, i) << 40));
             }
         }
@@ -120,15 +135,23 @@ pub const HostEngine = struct {
         return snap.buf.?.bytes;
     }
 
-    fn newSnap(e: *HostEngine, at: usize) !*Snap {
-        const sec = e.layout.sections(at);
+    /// A kept-state buffer of `at` tokens kept in part `home` (null: unsharded): its latent rows only where this rank
+    /// owns that part (cuda_engine takeSnap / tierDest).
+    fn newSnap(e: *HostEngine, at: usize, home: ?u8) !*Snap {
+        const sec = e.layout.sectionsOf(at, try e.layout.owns(home));
         const bytes = try e.gpa.alloc(u8, sec.total);
         errdefer e.gpa.free(bytes);
         const s = try e.gpa.create(Snap);
         e.next_id += 1;
-        s.* = .{ .id = e.next_id, .pos = at, .buf = .{ .ptr = @intFromPtr(bytes.ptr), .bytes = bytes }, .sec = sec };
+        s.* = .{ .id = e.next_id, .pos = at, .buf = .{ .ptr = @intFromPtr(bytes.ptr), .bytes = bytes }, .sec = sec, .home = home };
         e.snaps += 1;
         return s;
+    }
+
+    /// The part sequence `s`'s extent lies in (null: unsharded).
+    pub fn partOf(e: *HostEngine, s: *const Seq) ?u8 {
+        const p = if (e.pool) |*q| q else return null;
+        return @intCast(p.partOf((p.extent(s.eid.?) catch unreachable).base));
     }
 
     /// Whether `snap` holds the state a fresh pass of `tokens` keeps.
@@ -147,14 +170,40 @@ pub const HostEngine = struct {
     pub fn snapBytes(e: *const HostEngine, at: usize) usize {
         return e.layout.sections(at).total;
     }
-    pub fn newSeq(e: *HostEngine, _: usize) !*Seq {
+    pub fn newSeq(e: *HostEngine, rows: usize) !*Seq {
         const s = try e.gpa.create(Seq);
+        errdefer e.gpa.destroy(s);
         s.* = .{};
+        if (e.pool) |*p| {
+            s.eid = (try p.alloc(rows)) orelse return error.NoPoolExtent;
+            (try p.get(s.eid.?)).owner = s.eid.?; // (a live stream: the placement evens the parts' streams out)
+        }
         return s;
     }
     pub fn freeSeq(e: *HostEngine, s: *Seq) void {
+        if (e.pool) |*p| p.remove(s.eid.?) catch unreachable;
         s.tokens.deinit(e.gpa);
         e.gpa.destroy(s);
+    }
+    /// cuda_engine placeResume: the fresh extent stays in the state's home part, moves there, keeps its part for a
+    /// carry, or the prompt runs from 0.
+    pub fn placeResume(e: *HostEngine, s: *Seq, snap: *const Snap) !bool {
+        const p = if (e.pool) |*q| q else return true;
+        switch (try shard_keep.resumeIn(p, s.eid.?, snap.home orelse return error.KvShardNoHome, snap.pos, e.carry)) {
+            .here => return true,
+            .move => |base| {
+                _ = try p.move(s.eid.?, base, null, true);
+                return true;
+            },
+            .carry => {
+                e.carries += 1;
+                return true;
+            },
+            .recompute => |why| {
+                e.refused_small += @intFromBool(why == .small);
+                return false;
+            },
+        }
     }
     pub fn bind(e: *HostEngine, s: *Seq) void {
         e.bound = s;
@@ -184,7 +233,7 @@ pub const HostEngine = struct {
         try q.tokens.appendSlice(e.gpa, prompt[q.tokens.items.len..]);
         var kept: ?*Snap = null;
         if (o.keep_at) |k| {
-            kept = try e.newSnap(k);
+            kept = try e.newSnap(k, e.partOf(q));
             fill(&e.layout, bytesOf(kept.?), kept.?.sec, prompt[0..k]);
         }
         return .{ .first = if (ok) first(q.tokens.items) else first(q.tokens.items) ^ 1, .kept = kept };
@@ -200,7 +249,7 @@ pub const HostEngine = struct {
     // -- the tier's device (cuda_spill_tier) --------------------------------------------------------------------
 
     pub fn tierKept(_: *const HostEngine, snap: *const Snap) st.Kept {
-        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec };
+        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec, .home = snap.home };
     }
     fn d2h(_: *anyopaque, dst: []u8, src: u64) anyerror!void {
         const s: [*]const u8 = @ptrFromInt(src);
@@ -236,11 +285,16 @@ pub const HostEngine = struct {
         if (e.events[ev] > 0) e.waits += 1;
         e.events[ev] = 0;
     }
-    pub fn tierDest(e: *HostEngine, at: usize) !*Snap {
+    pub fn tierDest(e: *HostEngine, at: usize, home: ?u8) !*Snap {
         if (e.refuse_dest) return error.BelowMemoryReserve;
-        const s = try e.newSnap(at);
+        const s = try e.newSnap(at, home);
         @memset(bytesOf(s), 0x33);
         return s;
+    }
+    /// cuda_engine tierResumable: a restore only where its resume could be placed or carried.
+    pub fn tierResumable(e: *const HostEngine, at: usize, home: u8) !bool {
+        const p = if (e.pool) |*q| q else return true;
+        return shard_keep.restorable(p, home, at, e.carry);
     }
 };
 
@@ -337,10 +391,20 @@ pub fn testLayout() !st.Layout {
     return st.Layout.init(try G.init(2, 0), 64, null);
 }
 
+/// Rank `rank`'s owner-sharded layout of the same shape (TF_GLM_KV_SHARD).
+pub fn shardedLayout(rank: usize) !st.Layout {
+    return (try st.Layout.init(try G.init(2, rank), 64, null)).sharded();
+}
+
+/// Rows of the sharded rig's pool: two parts of 8,192 (two 2,200-token streams' extents each).
+pub const pool_rows = 8 * 2048;
+
 /// Two ranks with the tier on each (`lead`, `fol`), their stores in fresh folders.
 pub const Pair = struct {
     gpa: std.mem.Allocator,
+    /// rank 0's layout (the replicated tests' on both ranks); `layouts` each rank's own
     layout: st.Layout,
+    layouts: [2]st.Layout,
     e: [2]HostEngine,
     r: [2]Lanes,
     sink: Sink,
@@ -360,9 +424,22 @@ pub const Pair = struct {
         return .{ .dir = "", .gib = 4, .min_free_gib = 0, .min_tokens = 64, .stage_mib = 26, .read_blocks = 2, .smalls = 1, .restores = restores, .readers = 2, .direct = false, .hold_bytes = 1 << 30 };
     }
 
+    pub const Opts = struct {
+        /// TF_GLM_KV_SHARD: owner-sharded layouts (each rank's own), a two-part pool on each engine
+        sharded: bool = false,
+    };
+
     pub fn init(p: *Pair, gpa: std.mem.Allocator, tag: []const u8, s: tier.Settings) !void {
+        return p.initWith(gpa, tag, s, .{});
+    }
+
+    pub fn initWith(p: *Pair, gpa: std.mem.Allocator, tag: []const u8, s: tier.Settings, o: Opts) !void {
         const layout = try testLayout();
-        p.* = .{ .gpa = gpa, .layout = layout, .e = .{ HostEngine.init(gpa, layout), HostEngine.init(gpa, layout) }, .r = undefined, .sink = .{ .gpa = gpa }, .pg = undefined, .settings = s, .compat = format.compatDigest(layout.digest(), .replicated, @intCast(st.block_tokens), layout.block_bytes) };
+        const ls: [2]st.Layout = if (o.sharded) .{ try shardedLayout(0), try shardedLayout(1) } else .{ layout, layout };
+        p.* = .{ .gpa = gpa, .layout = ls[0], .layouts = ls, .e = .{ HostEngine.init(gpa, ls[0]), HostEngine.init(gpa, ls[1]) }, .r = undefined, .sink = .{ .gpa = gpa }, .pg = undefined, .settings = s, .compat = ls[0].compat(ls[0].digest()) };
+        if (o.sharded) for (&p.e) |*e| {
+            e.pool = try Pool.initParts(gpa, pool_rows, 2);
+        };
         p.r = .{ Lanes.init(gpa, &p.e[0], true, 1 << 20, 8), Lanes.init(gpa, &p.e[1], true, 1 << 20, 8) };
         p.r[1].follower = true;
         p.r[0].notes = p.sink.notesOf();
@@ -386,7 +463,7 @@ pub const Pair = struct {
         for (0..2) |i| {
             var s = p.settings;
             s.dir = p.roots[i];
-            sides[i] = try Leader.S.open(p.gpa, testing.io, &p.e[i], p.layout, s, @intCast(i), p.compat, 1 << 20, p.staging[i], .{});
+            sides[i] = try Leader.S.open(p.gpa, testing.io, &p.e[i], p.layouts[i], s, @intCast(i), p.compat, 1 << 20, p.staging[i], .{});
         }
         p.lead = try Leader.create(p.gpa, sides[0], &p.r[0], p.settings, @splat(7));
         p.fol = try Follower.create(p.gpa, sides[1], &p.r[1]);
@@ -468,6 +545,30 @@ pub const Pair = struct {
             w.point = w.p.lead0().keep(.{ .saved = saved, .key = s.prompt()[0..mark], .at = mark, .group = w.group });
         }
     };
+
+    /// Sharded: a live extent of `rows` in part `part` of both ranks' pools (another stream's), so placements go
+    /// elsewhere while it stays. Its id on each rank.
+    pub fn occupy(p: *Pair, part: usize, rows: usize) ![2]u64 {
+        var ids: [2]u64 = undefined;
+        for (&p.e, &ids) |*e, *id| {
+            const pool = &e.pool.?;
+            id.* = try pool.add((try pool.placeIn(rows, null, part)) orelse return error.TestNoRoom, rows);
+            (try pool.get(id.*)).owner = id.*;
+        }
+        return ids;
+    }
+
+    pub fn vacate(p: *Pair, ids: [2]u64) !void {
+        for (&p.e, ids) |*e, id| try e.pool.?.remove(id);
+    }
+
+    /// Rank `rank`'s kept state of rank 0's `saved` (rank 0's own, or rank 1's copy under its key).
+    pub fn snapOn(p: *Pair, rank: usize, saved: *anyopaque) !*HostEngine.Snap {
+        const k0: *Lanes.Kept = @ptrCast(@alignCast(saved));
+        if (rank == 0) return k0.snap;
+        const k1: *Lanes.Kept = @ptrCast(@alignCast(p.r[1].savedFor(k0.key) orelse return error.TestNotOnRank1));
+        return k1.snap;
+    }
 
     /// Pumps both ranks (rank 1 by rank 0's pump notes) until neither has a write to stage or publish.
     pub fn settle(p: *Pair) !void {

@@ -17,7 +17,8 @@
 //!   cancel    txn u64, why u8 (Failure), forget u8
 //!   touch, share, forget   point [32]
 //!   pump, flush            budget_ns u64
-//!   has       point [32], at u32, blocks u32           (answer: 1 word, an Absence)
+//!   has       point [32], at u32, blocks u32, part u32 when blocks' bit 31 is set   (answer: 1 word, an Absence;
+//!             the part only on an owner-sharded tier, TF_GLM_KV_SHARD: a replicated has is version 1's bytes)
 //!   validate  txn u64, shared u8                       (answer: 1 word, a Failure; none is ok)
 //!   stats     nothing                                  (answer: stats_words words, `words` of the tier's counters)
 //! where `opt X` is a u8 (0 absent, 1 present) and then X.
@@ -28,7 +29,13 @@ const format = core.spill.format;
 pub const Digest = [32]u8;
 
 /// Bumped with any change to the messages or their meaning (the fingerprint's `wire` field carries it, so ranks built
-/// with another protocol refuse to start together).
+/// with another protocol refuse to start together). TF_GLM_KV_SHARD's changes are not a bump: a replicated `has` is
+/// version 1's bytes (an owner-sharded one's part rides behind bit 31, and the fingerprint's `owner_layout` keeps a
+/// sharded rank from ever pairing with a replicated one); the replicated `stats` answer did grow (36 counters, 34
+/// before: points_part0/1), which only ranks of two builds could disagree on, and two builds pair only under forced
+/// identity exports (TF_GLM_ENGINE_ID and TF_GLM_RECIPE_PATCHES are in the fingerprint; the recipe's differ per build).
+/// The version is in every store's namespace too: at 1, spill v2 alone's stays ef6eb5b0's under the same identity
+/// exports (gpu-validation SA1).
 pub const version: u16 = 1;
 
 pub const Op = enum(u8) {
@@ -53,7 +60,7 @@ pub const Op = enum(u8) {
 pub const Absence = enum(u8) {
     present = 0,
     missing = 1, // not held (pruned by this rank's cap, floor or turns; a write it cancelled or never made)
-    incompatible = 2, // held under another layout or compat
+    incompatible = 2, // held under another layout or compat, or (owner_sharded) kept from another part
     incomplete = 3, // this rank's own write of it is still queued (it will be there shortly)
     damaged = 4, // its copy failed a check
     disabled = 5, // this rank runs without the tier
@@ -100,7 +107,9 @@ pub const Keep = struct {
 pub const Begin = struct { txn: u64, kept: u64, point: Digest, at: u32, blocks: u32 };
 pub const Progress = struct { txn: u64, upto: u32 };
 pub const Cancel = struct { txn: u64, why: Failure, forget: bool };
-pub const Has = struct { point: Digest, at: u32, blocks: u32 };
+/// `part`: an owner-sharded tier's (TF_GLM_KV_SHARD) home part of rank 0's point (core/spill Store.partOf); null on a
+/// replicated one.
+pub const Has = struct { point: Digest, at: u32, blocks: u32, part: ?u32 = null };
 pub const Validate = struct { txn: u64, shared: bool };
 
 pub const Msg = union(enum) {
@@ -140,6 +149,8 @@ pub const max_world = 4;
 
 /// A forks count past this is refused (core/spill format.Limits' default).
 pub const max_forks = 4096;
+/// `has`: its blocks word's bit 31, set when a part follows (no point has 2^31 blocks).
+const has_part: u32 = 1 << 31;
 
 // -- encoding -----------------------------------------------------------------------------------------------------
 
@@ -205,9 +216,11 @@ pub fn encode(list: *std.ArrayList(u8), gpa: std.mem.Allocator, m: Msg) !void {
         .touch, .share, .forget => |p| try o.bytes(&p),
         .pump, .flush => |ns| try o.int(u64, ns),
         .has => |h| {
+            if (h.blocks & has_part != 0) return error.BadMessage;
             try o.bytes(&h.point);
             try o.int(u32, h.at);
-            try o.int(u32, h.blocks);
+            try o.int(u32, h.blocks | if (h.part != null) has_part else 0);
+            if (h.part) |p| try o.int(u32, p);
         },
         .validate => |v| {
             try o.int(u64, v.txn);
@@ -275,7 +288,14 @@ pub fn decode(arena: std.mem.Allocator, bytes: []const u8) !Msg {
         .forget => .{ .forget = try i.fixed(32) },
         .pump => .{ .pump = try i.int(u64) },
         .flush => .{ .flush = try i.int(u64) },
-        .has => .{ .has = .{ .point = try i.fixed(32), .at = try i.end(), .blocks = try i.end() } },
+        .has => blk: {
+            var h: Has = .{ .point = try i.fixed(32), .at = try i.end(), .blocks = try i.int(u32) };
+            const parted = h.blocks & has_part != 0;
+            h.blocks &= ~has_part;
+            if (h.blocks == 0) return error.BadMessage;
+            if (parted) h.part = try i.int(u32);
+            break :blk .{ .has = h };
+        },
         .validate => .{ .validate = .{ .txn = try i.int(u64), .shared = try i.flag() } },
         .stats => .stats,
         _ => return error.UnknownOp,
@@ -410,6 +430,10 @@ test "every message survives its bytes, a cut or longer one is refused, and only
     try std.testing.expectEqual(@as(u64, 60_000_000_000), (try roundTrip(a, .{ .flush = 60_000_000_000 })).flush);
     const has: Msg = .{ .has = .{ .point = @splat(8), .at = 4288, .blocks = 3 } };
     try std.testing.expectEqual(has.has, (try roundTrip(a, has)).has);
+    // an owner-sharded tier's has names rank 0's part (a cut before it refused like any other)
+    const parted: Msg = .{ .has = .{ .point = @splat(8), .at = 4288, .blocks = 3, .part = 1 } };
+    try std.testing.expectEqual(parted.has, (try roundTrip(a, parted)).has);
+    try std.testing.expectEqual(@as(?u32, 0), (try roundTrip(a, .{ .has = .{ .point = @splat(8), .at = 64, .blocks = 1, .part = 0 } })).has.part);
     try std.testing.expectEqual(Validate{ .txn = 9, .shared = true }, (try roundTrip(a, .{ .validate = .{ .txn = 9, .shared = true } })).validate);
     try std.testing.expect((try roundTrip(a, .stats)) == .stats);
     try std.testing.expectEqual(@as(?usize, 1), has.width());
@@ -438,6 +462,23 @@ test "the message layout is the documented one, and bad values are refused" {
     has[0] = @backingInt(Op.has);
     has[37] = 1; // at 0: no point ends at 0
     try std.testing.expectError(error.BadMessage, decode(a, &has));
+    // has: a replicated tier's bytes are version 1's; an owner-sharded one sets the blocks word's bit 31, then the part
+    var want: [45]u8 = @splat(0xaa);
+    want[0] = @backingInt(Op.has);
+    want[33..45].* = .{ 64, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0 };
+    list.clearRetainingCapacity();
+    try encode(&list, gpa, .{ .has = .{ .point = @splat(0xaa), .at = 64, .blocks = 1 } });
+    try std.testing.expectEqualSlices(u8, want[0..41], list.items);
+    want[40] = 0x80;
+    list.clearRetainingCapacity();
+    try encode(&list, gpa, .{ .has = .{ .point = @splat(0xaa), .at = 64, .blocks = 1, .part = 1 } });
+    try std.testing.expectEqualSlices(u8, &want, list.items);
+    list.items[40] = 0; // the part's bytes without the bit: one message's worth of trailing bytes
+    try std.testing.expectError(error.TrailingBytes, decode(a, list.items));
+    list.items[40] = 0x80;
+    list.items[37] = 0; // the bit alone: no blocks
+    try std.testing.expectError(error.BadMessage, decode(a, list.items));
+    try std.testing.expectError(error.BadMessage, encode(&list, gpa, .{ .has = .{ .point = @splat(0), .at = 64, .blocks = 1 << 31 } }));
     // a keep whose forks count is past what its bytes could hold
     list.clearRetainingCapacity();
     try encode(&list, gpa, .{ .keep = .{ .kept = 1, .at = 64, .point = @splat(0), .group = 0, .shared = false, .lineage = .{ .root = @splat(2) } } });

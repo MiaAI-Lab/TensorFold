@@ -16,11 +16,19 @@
 //!     rank, or abort, and every rank forgets the point when any rank's copy was damaged;
 //!   - a kept state about to be freed while its write still reads it is held (cuda_spill_state.Guard), or its rest is
 //!     staged at once past the guard's limit.
+//! TF_GLM_KV_SHARD (GLM 0118's spill blocks; an owner-sharded layout, cuda_spill_state `Layout.sharded`): each rank
+//! writes its own view of a kept state (the home part's owner its latent and pooled rows, the other rank the pooled
+//! rows alone) under a lineage salted with the home part, so every manifest records it; `has` names rank 0's part and
+//! a rank whose point of those ids was kept from another part answers `incompatible` (every rank forgets it); a restore
+//! makes each rank's destination its view of that home (Snap.home), and the resume then places it as any kept state
+//! (its home part, moved there, carried, or from 0: cuda_engine placeResume); rank 0 starts no restore whose resume
+//! could only start from 0 (its home part full, no carry).
 //! Nothing here waits on a disk while the engine runs: the stores' threads do the file I/O, the engine thread only
 //! enqueues copies on its stream and polls their events. The engine `E` (cuda_engine.Engine; a host-memory one in the
-//! tests) gives: `tierKept(snap)` (the buffer and its sections), `tierCopier()`, `tierEvents(n)`, `tierRecord(ev)`,
-//! `tierDone(ev)`, `tierWait(ev)`, `tierDest(at)` (a new kept-state buffer, under the keep floor), `freeSnapshot`,
-//! `current`.
+//! tests) gives: `tierKept(snap)` (the buffer, its sections and its home), `tierCopier()`, `tierEvents(n)`,
+//! `tierRecord(ev)`, `tierDone(ev)`, `tierWait(ev)`, `tierDest(at, home)` (a new kept-state buffer, under the keep
+//! floor: this rank's view of a state kept in part `home`), `tierResumable(at, home)` (a restore of such a state could
+//! resume), `freeSnapshot`, `current`.
 const std = @import("std");
 const builtin = @import("builtin");
 const core = @import("core");
@@ -168,6 +176,8 @@ pub const Counts = struct {
     quota_trims: u64 = 0,
     recovered_points: u64 = 0,
     dropped_temporaries: u64 = 0,
+    points_part0: u64 = 0,
+    points_part1: u64 = 0,
 };
 
 fn monotonicNs() u64 {
@@ -319,7 +329,8 @@ pub fn Side(comptime E: type) type {
 
         /// Opens this rank's store under `s.dir` (namespace `prefix` + `compat`) over `staging` (pinned, at least
         /// plan's bytes, 4 KiB aligned; the caller's), its events made by the engine (eventCount). `layout`: the
-        /// engine's (Engine.spillLayout); `max_tokens`: the longest point (the context).
+        /// engine's (Engine.spillLayout: owner_sharded under TF_GLM_KV_SHARD, its block sizes this rank's);
+        /// `max_tokens`: the longest point (the context).
         pub fn open(gpa: Allocator, io: std.Io, e: *E, layout: st.Layout, s: Settings, rank: u32, compat: Digest, max_tokens: u32, staging: []align(spill.slots.alignment) u8, hooks: spill.store.Hooks) !*Self {
             const p = try plan(s, &layout);
             if (staging.len < p.bytes()) return error.StagingTooSmall;
@@ -344,6 +355,7 @@ pub fn Side(comptime E: type) type {
                 .prefix = prefix,
                 .rank = rank,
                 .compat = compat,
+                .owner_layout = layout.owner,
                 .limits = layout.limits(max_tokens),
                 .cap_bytes = s.capBytes(),
                 .floor_bytes = s.floorBytes(),
@@ -409,16 +421,19 @@ pub fn Side(comptime E: type) type {
         // -- writes ---------------------------------------------------------------------------------------------
 
         /// The write of a kept state: its sections and its tail copied off its buffer now, its whole blocks staged
-        /// later by `service`. Never waits on the disk.
+        /// later by `service`. Never waits on the disk. Owner-sharded: this rank's view of it (its latent rows only
+        /// where it owns the state's home), under the lineage salted with that home (cuda_spill_state lineageOf).
         pub fn keepPoint(self: *Self, k: KeepArgs) Kept {
             const kept = self.e.tierKept(k.snap);
             const at = kept.sec.at;
             if (k.keyed.len != at) return .refused;
-            self.layout.check(kept.sec) catch return .refused;
+            self.layout.check(kept) catch return .refused;
+            const own = self.layout.owns(kept.home) catch return .refused;
+            const lin = self.layout.lineageOf(k.lineage, kept.home) catch return .refused;
             if (self.writes.contains(k.snap.id)) return .stored;
             self.writes.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
             self.copies.ensureUnusedCapacity(self.gpa, 1) catch return .refused;
-            const r = self.store.keep(.{ .keyed = k.keyed, .lineage = k.lineage, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytes(at), .source = st.sourceOf(k.snap.id) });
+            const r = self.store.keep(.{ .keyed = k.keyed, .lineage = lin, .origin = k.origin, .shared = k.shared, .group = k.group, .sections = self.layout.specs(), .tail_bytes = self.layout.tailBytesOf(at, own), .source = st.sourceOf(k.snap.id) });
             const q = switch (r) {
                 .queued => |q| q,
                 .stored => return .stored,
@@ -655,10 +670,14 @@ pub fn Side(comptime E: type) type {
             rx.retry = false;
         }
 
-        /// `rx`'s destination: a new kept state of the point's size (the engine's, under its keep floor).
+        /// `rx`'s destination: a new kept state of the point's size (the engine's, under its keep floor). Owner-sharded:
+        /// this rank's view of a state of the point's home part, as this rank's store recorded it (`has` agreed it with
+        /// rank 0's).
         pub fn rxDest(self: *Self, rx: *Rx) void {
             if (rx.why != .none or rx.dest != null) return;
-            const snap = self.e.tierDest(rx.at) catch return rx.fail(.reserve);
+            const p = self.store.partOf(rx.key) orelse return rx.fail(.missing);
+            const home = self.layout.homeOf(p.part) catch return rx.fail(.unpack);
+            const snap = self.e.tierDest(rx.at, home) catch return rx.fail(.reserve);
             rx.dest = snap;
             rx.un = st.Unpacker.init(&self.layout, self.e.tierCopier(), self.e.tierKept(snap)) catch return rx.fail(.reserve);
         }
@@ -867,6 +886,12 @@ pub fn Side(comptime E: type) type {
                 .recovered_points = c.recovered_points,
                 .dropped_temporaries = c.temps_removed + c.recovered_dropped,
             };
+            if (self.layout.owner == .owner_sharded) { // (two parts: this rank's own and the other's)
+                const own = self.layout.g.rank;
+                const parts = [2]*u64{ &self.cached.points_part0, &self.cached.points_part1 };
+                parts[own].* = c.own_part_points;
+                parts[1 - own].* = c.points - c.own_part_points;
+            }
         }
     };
 }
@@ -1036,7 +1061,8 @@ pub fn Leader(comptime E: type) type {
             if (kp.at != at) return null;
             var forks: std.ArrayList(format.Fork) = .empty;
             defer forks.deinit(self.gpa);
-            const lin = self.toLineage(w.lineage, &forks) catch return null;
+            // (owner-sharded: salted with the state's home, which every rank's keep note then carries)
+            const lin = self.side.layout.lineageOf(self.toLineage(w.lineage, &forks) catch return null, self.side.e.tierKept(kp.snap).home) catch return null;
             if (lin.forks.len > wire.max_forks) return null; // (a keep note carries no more: no rank holds a point another lacks)
             const origin: ?format.Origin = if (w.parent) |p| (if (self.points.get(p)) |r| .{ .key = r.key, .at = w.fork } else null) else null;
             const keyed = w.key[0..at];
@@ -1090,13 +1116,16 @@ pub fn Leader(comptime E: type) type {
 
         /// begin's refusals of point `id` itself that no room cures, from this rank's own records with nothing read,
         /// sent or reserved: UnknownPoint and BadPoint (not a point lookup gave), SpillMissing (gone from this rank's
-        /// store: forgotten here). The prompt cache asks it before it makes room for the restore
-        /// (prompt_cache.Tier.VTable.check), so such a refusal evicts no kept state; begin asks it again.
+        /// store: forgotten here), and owner-sharded KvShardHomeFull (begin, below). The prompt cache asks it before it
+        /// makes room for the restore (prompt_cache.Tier.VTable.check), so such a refusal evicts no kept state; begin
+        /// asks it again.
         pub fn check(self: *Self, id: u64, at: u32) !void {
             _ = try self.checked(id, at);
         }
 
-        fn checked(self: *Self, id: u64, at: u32) !PointRef {
+        const Checked = struct { ref: PointRef, part: ?u32 };
+
+        fn checked(self: *Self, id: u64, at: u32) !Checked {
             const side = self.side;
             const ref = self.points.get(id) orelse return error.UnknownPoint;
             if (at != ref.at) return error.BadPoint;
@@ -1104,18 +1133,27 @@ pub fn Leader(comptime E: type) type {
                 _ = self.points.remove(id);
                 return error.SpillMissing;
             }
-            return ref;
+            // owner-sharded: the part it was kept from (its home), which every rank must hold it under
+            const part = (side.store.partOf(ref.key) orelse return error.SpillMissing).part;
+            if (side.layout.homeOf(part) catch null) |home| if (!try side.e.tierResumable(at, home)) return error.KvShardHomeFull;
+            return .{ .ref = ref, .part = part };
         }
 
         /// A restore of point `id` (found by lookup): `check`'s refusals first, then this rank's reads (TooMany,
         /// NoSlot: refused for capacity, nothing sent), then `has` on every rank (a rank that lacks the point or holds
         /// it damaged makes every rank forget it), then the destination, and a `begin` note that has every other rank
-        /// reserve its own under the same key and start its reads. Its transaction.
+        /// reserve its own under the same key and start its reads. Its transaction. Owner-sharded, before any of it:
+        /// KvShardHomeFull when the resume could only start from 0 (its home part full, no carry: the engine's
+        /// tierResumable), nothing read, sent or forgotten (not a capacity refusal, and one of
+        /// prompt_cache.point_errors: the prompt prefills at once, other restores in flight or not, since their ends
+        /// free no pool rows; a stream's may).
         pub fn begin(self: *Self, id: u64, at: u32, shared: bool) !u64 {
             self.side.e.current();
             const side = self.side;
             if (self.jobs.count() >= self.max_restores) return error.TooManyRestores;
-            const ref = try self.checked(id, at);
+            const c = try self.checked(id, at);
+            const ref = c.ref;
+            const part = c.part;
             try self.jobs.ensureUnusedCapacity(self.gpa, 1);
             const txn = self.next_txn;
             const rx = try side.newRx(txn, ref.key, at);
@@ -1125,7 +1163,7 @@ pub fn Leader(comptime E: type) type {
             };
             const mine = [1]u64{@backingInt(wire.Absence.present)};
             var all: [wire.max_world]u64 = undefined;
-            const ranks = self.ask(.{ .has = .{ .point = ref.key, .at = at, .blocks = rx.blocks } }, &mine, &all) catch |e| {
+            const ranks = self.ask(.{ .has = .{ .point = ref.key, .at = at, .blocks = rx.blocks, .part = part } }, &mine, &all) catch |e| {
                 side.rxEnd(rx, .cancel, false);
                 return e;
             };
@@ -1358,8 +1396,10 @@ pub fn Follower(comptime E: type) type {
             switch (m.*) {
                 .keep => |k| {
                     const kp: *L.Kept = @ptrCast(@alignCast(kept orelse return error.KeepWithoutState));
-                    // this rank's own ids must name rank 0's point, or a restore could never agree on it
-                    if (kp.at != k.at or kp.tokens.len < k.at or !std.mem.eql(u8, &format.pointKey(kp.tokens[0..k.at], @intCast(st.block_tokens), &.{}), &k.point)) {
+                    // this rank's own ids must name rank 0's point, and (owner-sharded) its state the home rank 0's lineage
+                    // is salted with, or a restore could never agree on it
+                    const home = side.e.tierKept(kp.snap).home;
+                    if (kp.at != k.at or kp.tokens.len < k.at or !std.mem.eql(u8, &format.pointKey(kp.tokens[0..k.at], @intCast(st.block_tokens), &.{}), &k.point) or k.lineage.part != if (home) |h| @as(?u32, h) else null) {
                         self.skipped += 1;
                         return;
                     }
@@ -1407,7 +1447,7 @@ pub fn Follower(comptime E: type) type {
             const side = self.side;
             _ = side.retire();
             switch (m.*) {
-                .has => |h| out[0] = @backingInt(self.absence(h.point)),
+                .has => |h| out[0] = @backingInt(self.absence(h)),
                 .validate => |v| out[0] = @backingInt(self.validate(v.txn)),
                 .stats => {
                     side.refresh();
@@ -1417,11 +1457,16 @@ pub fn Follower(comptime E: type) type {
             }
         }
 
-        /// This rank's store compat is the pair's (the agreement at start): presence is the check. A point whose write
-        /// this rank still has queued is `incomplete` (published here soon; rank 0 keeps it).
-        fn absence(self: *Self, point: Digest) wire.Absence {
-            if (self.side.store.presence(point)) return .present;
-            if (self.side.writing(point)) return .incomplete;
+        /// This rank's store compat is the pair's (the agreement at start): presence is the check, and (owner-sharded)
+        /// the part: the same ids kept here from the other part are the other view's bytes (rank 0 dedups a keep this
+        /// rank wrote again after losing its copy), `incompatible`. A point whose write this rank still has queued is
+        /// `incomplete` (published here soon; rank 0 keeps it).
+        fn absence(self: *Self, h: wire.Has) wire.Absence {
+            if (self.side.store.presence(h.point)) {
+                const p = self.side.store.partOf(h.point) orelse return .missing;
+                return if (p.part == h.part) .present else .incompatible;
+            }
+            if (self.side.writing(h.point)) return .incomplete;
             return .missing;
         }
 

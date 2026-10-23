@@ -974,6 +974,50 @@ test "a restore refused for its destination's memory (GLM's SpillReserve) waits 
     try std.testing.expectEqual(@as(u64, 2), r.tier.refused); // once more, when the first ended
 }
 
+test "a restore refused because its home part has no room (GLM's KvShardHomeFull) beside one in flight is admitted on memory at once, not deferred" {
+    var a: Box = .{};
+    defer a.deinit();
+    var b: Box = .{};
+    defer b.deinit();
+    const r = try Rig.create(.{ .load_ms = 5, .defer_ms = 10_000 });
+    defer r.destroy();
+    r.tier.gate.store(false, .release); // the first restore stays in flight until the end
+    _ = try r.point(&t2, 8);
+    const e = r.host.engine();
+    const areq: Request = .{ .prompt = &t2, .max_tokens = 6, .history_len = 14 };
+    try e.submit(1, &areq, a.sink());
+    try r.until(struct {
+        fn ok(s: api.CacheStats) bool {
+            return s.restore_waits == 1;
+        }
+    }.ok);
+    // the second point is on disk but its resume could only start from 0 (its home part full, no carry): its own
+    // placement, which no restore in flight holds, so its prompt prefills now rather than waiting for the first restore
+    r.tier.refuse = 1 << 20;
+    r.tier.refuse_err = error.KvShardHomeFull;
+    const other = [_]u32{ 9, 9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6 };
+    _ = try r.point(&other, 8);
+    const breq: Request = .{ .prompt = &other, .max_tokens = 6, .history_len = 14 };
+    try e.submit(2, &breq, b.sink());
+    for (0..5000) |_| {
+        if (b.finished() != null) break;
+        std.Io.sleep(io, .fromMilliseconds(1), .awake) catch {};
+    }
+    try std.testing.expectEqual(@as(?Reason, Reason.length), b.finished()); // with the first restore still in flight
+    try std.testing.expectEqual(@as(?u32, 0), b.cached);
+    try b.exact(&other);
+    try std.testing.expect(a.finished() == null);
+    const s = r.stats();
+    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred);
+    try std.testing.expectEqual(@as(u64, 0), s.restores_deferred_expired);
+    try std.testing.expectEqual(@as(u64, 1), r.tier.refused); // asked once, never again
+    r.tier.gate.store(true, .release);
+    try std.testing.expectEqual(Reason.length, a.wait());
+    try std.testing.expectEqual(@as(?u32, 8), a.cached);
+    try a.exact(&t2);
+    try std.testing.expectEqual(@as(u64, 1), r.stats().restores_begun);
+}
+
 // -- prompt passes while requests are parked (whole passes service nothing) -----------------------------------------
 
 /// Records, at each watched pass's first chunk (on the engine thread), how many restores the store had adopted.

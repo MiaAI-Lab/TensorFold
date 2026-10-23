@@ -395,6 +395,8 @@ pub const Engine = struct {
         // spill v2 (Options.spill_v2): its pinned staging (the write ring, the read-ahead slots, the small states') taken
         // before the pool is sized, so the pool and the kept-state budget are what it leaves and it never takes pool rows
         // mid-run. Sized for the largest index ring the caches can end with (the final ring is set below).
+        // TF_GLM_KV_SHARD plans the same slots: a slot holds a rank's largest block, its own part's (the other part's
+        // are smaller).
         e.tier_staging = null;
         e.tier_events = &.{};
         if (o.spill_v2) |sv| {
@@ -862,9 +864,11 @@ pub const Engine = struct {
         return e.sectionsFor(at).total;
     }
 
-    /// Spill v2's layout of this engine's kept states (cuda_spill_state): its geometry, index ring and drafter.
+    /// Spill v2's layout of this engine's kept states (cuda_spill_state): its geometry, index ring and drafter;
+    /// owner_sharded under TF_GLM_KV_SHARD (a state's latent rows on its home part's owner only).
     pub fn spillLayout(e: *const Engine) !spill_state.Layout {
-        return spill_state.Layout.init(e.g, e.caches.ring, if (e.drafter) |p| .{ .kv = p.forward.rank.kv, .ring = dflash_config.Config.ring } else null);
+        const l = try spill_state.Layout.init(e.g, e.caches.ring, if (e.drafter) |p| .{ .kv = p.forward.rank.kv, .ring = dflash_config.Config.ring } else null);
+        return if (e.shard != null) l.sharded() else l;
     }
 
     // -- spill v2's device side (cuda_spill_tier): copies on the engine's stream, one event a staging slot ----------
@@ -877,7 +881,7 @@ pub const Engine = struct {
     }
 
     pub fn tierKept(_: *const Engine, snap: *const Snap) spill_state.Kept {
-        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec };
+        return .{ .buf = snap.buf.?.ptr, .sec = snap.sec, .home = snap.home };
     }
 
     fn tierD2h(ptr: *anyopaque, dst: []u8, src: u64) anyerror!void {
@@ -937,15 +941,25 @@ pub const Engine = struct {
     }
 
     /// A restore's destination: a new kept-state buffer for `at` tokens, refused under the keep floor (as a save is).
-    pub fn tierDest(e: *Engine, at: usize) !*Snap {
-        const sec = e.sectionsFor(at);
+    /// TF_GLM_KV_SHARD: the state of part `home` as takeSnap leaves it on this rank (its latent rows on the part's owner
+    /// only), its home recorded for the resume's placement (placeResume).
+    pub fn tierDest(e: *Engine, at: usize, home: ?u8) !*Snap {
+        const rows = if (e.shard) |sh| (home orelse return error.KvShardNoHome) == sh.rank else if (home != null) return error.KvShardOff else true;
+        const sec = e.sectionsHeld(at, rows);
         if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
         const snap = try e.gpa.create(Snap);
         errdefer e.gpa.destroy(snap);
         const buf = try cuda.DeviceBuffer.alloc(e.stream.d, sec.total);
         e.snap_next += 1;
-        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec };
+        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec, .home = home };
         return snap;
+    }
+
+    /// TF_GLM_KV_SHARD: whether a restore of a state of `at` tokens kept in part `home` is worth its reads now (its
+    /// resume could be placed or carried: cuda_shard_keep.restorable); rank 0 asks before any read. Off: true.
+    pub fn tierResumable(e: *const Engine, at: usize, home: u8) !bool {
+        if (e.shard == null) return true;
+        return shard_keep.restorable(&e.pool, home, at, e.kv_switches.carry);
     }
 
     fn copyBytes(ptr: *anyopaque, dst: u64, src: u64, n: usize) anyerror!void {
@@ -1709,7 +1723,12 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
         try std.testing.expectEqual(@as(usize, 4 * G.extent), s.st.base);
         e.kv_switches.carry = false;
         try std.testing.expect(!try e.placeResume(s, &home0));
+        // (so a restore of such a state from disk does not start; part 1's two free extents take 2,048 tokens and the
+        // next one, not 4,096)
+        try std.testing.expect(!try e.tierResumable(4096, 0));
+        try std.testing.expect(!try e.tierResumable(4096, 1) and try e.tierResumable(G.extent, 1));
         e.kv_switches.carry = true;
+        try std.testing.expect(try e.tierResumable(4096, 0) and !try e.tierResumable(shard_keep.carry_min - 64, 0));
         try std.testing.expect(!try e.placeResume(s, &.{ .pos = shard_keep.carry_min - 64, .home = 0 }));
         try std.testing.expectEqual(@as(u64, 1), e.kv_counts.refused_small);
         try std.testing.expectError(error.KvShardNoHome, e.placeResume(s, &.{ .pos = 4096 }));
@@ -1724,6 +1743,7 @@ test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both rank
     plain.shard = null;
     var q: Seq = .{ .slot = 0, .st = undefined, .eid = 0 };
     try std.testing.expect(try plain.placeResume(&q, &home0));
+    try std.testing.expect(try plain.tierResumable(4096, 0));
     try std.testing.expect(!try plain.borrowRows(&q));
     plain.giveRows(&q);
 }

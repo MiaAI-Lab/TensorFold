@@ -47,7 +47,7 @@ pub const Field = enum(u16) {
     grid = 12, // the kept-state grid (64 tokens) and a block's tokens (2,048)
     layout = 13, // spill_state.Layout.digest(): the buffer, block and sections a point holds
     tp_split = 14, // the TP world, every rank's share (heads, widths, vocab) and the index ring's rows
-    owner_layout = 15, // replicated (KV sharding's owner-sharded layout, its version and parts: round 3)
+    owner_layout = 15, // spill_state.Layout.ownerText: replicated, or owner_sharded with its home rule's version and parts
     features = 16, // the switches that change state or protocol (spill v2, its minimum, KV sharding, drafts, streams)
     template = 17, // rank 0 renders prompts with its chat template; a follower holds its own (or none)
     rank_split = 18, // this rank and its share
@@ -482,6 +482,7 @@ pub const Rank = struct {
     rank: u32,
     ring: usize, // the index ring's rows (Caches.ring)
     layout: Digest, // spill_state.Layout.digest()
+    owner_layout: []const u8 = "replicated", // spill_state.Layout.ownerText (TF_GLM_KV_SHARD: owner_sharded;...)
     capability: u32,
     driver: i32,
     state_format: u32, // spill_state.format_version
@@ -622,7 +623,7 @@ pub fn build(gpa: std.mem.Allocator, io: std.Io, r: Rank) !Fingerprint {
     b.int(.tp_split, u16, @intCast(r.world));
     b.part(.tp_split, try splitText(&sbuf, r.world));
     b.int(.tp_split, u64, r.ring);
-    b.part(.owner_layout, "replicated");
+    b.part(.owner_layout, r.owner_layout);
     b.part(.features, r.features);
     // the template rank 0 renders with (server/hf_text.zig's order)
     if (exists(io, model, "chat_template.jinja")) try fileOr(&b, .template, io, model, "chat_template.jinja") else if (exists(io, model, "chat_template.json")) try fileOr(&b, .template, io, model, "chat_template.json") else try fileOr(&b, .template, io, model, "tokenizer_config.json");
@@ -898,6 +899,9 @@ test "two ranks of one install agree on the common digest; the kernel archive's 
     r = try testRank(root, a, 0);
     r.layout = @splat(8);
     try testing.expectEqual(@as(?Field, .layout), named(f0, try build(gpa, io, r)));
+    r = try testRank(root, a, 0);
+    r.owner_layout = "owner_sharded;version=1;parts=2;"; // (TF_GLM_KV_SHARD: a sharded store never meets a replicated one)
+    try testing.expectEqual(@as(?Field, .owner_layout), named(f0, try build(gpa, io, r)));
     r = try testRank(root, a, 0);
     r.driver = 13010;
     try testing.expectEqual(@as(?Field, .gpu), named(f0, try build(gpa, io, r)));

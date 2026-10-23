@@ -1651,6 +1651,7 @@ fn checkOwnerParts(gpa: Allocator) !void {
     try h.reopen();
     try ensure(h.s.presence(own) and h.s.presence(other), @src());
     try ensure(h.s.partOf(own).?.part == 0 and h.s.partOf(other).?.part == 1 and h.s.partOf(@splat(9)) == null, @src());
+    try ensure(h.s.counts().points == 2 and h.s.counts().own_part_points == 1, @src()); // (one of this rank's part)
     const hit = h.s.lookup(.{ .keyed = other_ids, .max_at = max_tokens }) orelse return CheckFailed;
     try ensure(hit.part == 1 and std.mem.eql(u8, &hit.key, &other), @src());
     // a rank owning part 1 with these files: the sizes are not its own, both points damaged

@@ -8,6 +8,7 @@ const rig = @import("cuda_spill_tier_rig.zig");
 const st = @import("cuda_spill_state.zig");
 const wire = @import("cuda_spill_wire.zig");
 const lane_backend = @import("cuda_lanes.zig");
+const shard_keep = @import("cuda_shard_keep.zig");
 
 const spill = core.spill;
 const format = spill.format;
@@ -79,6 +80,7 @@ test "a kept state written at keep on both ranks, evicted, restored byte for byt
         try testing.expectEqual(@as(u64, 1), c.writes_committed);
         try testing.expectEqual(@as(u64, 1), c.reads);
         try testing.expectEqual(@as(u64, 2), c.blocks);
+        try testing.expectEqual(@as(u64, 0), c.points_part0 + c.points_part1); // (a replicated store has no parts)
     }
     try testing.expectEqual(@as(usize, 0), p.pg.fatals);
 }
@@ -447,6 +449,12 @@ test "the staging plan: the ring, read-ahead and small states as asked; under tw
     // with DFlash2's rings the small slot grows by the drafter's 22,282,240 bytes
     const d = try st.Layout.init(l.g, 64, .{ .kv = 4, .ring = 2176 });
     try testing.expectEqual(std.mem.alignForward(usize, l.small_bytes + 22_282_240, 4096), (try tier.plan(.{ .dir = "/s", .gib = 1 }, &d)).small_slot);
+    // TF_GLM_KV_SHARD: the same slots on either rank (a slot holds the rank's largest block, its own part's; the other
+    // part's blocks and tails are smaller), so the staging the engine takes before its pool does not change
+    for (0..2) |r| {
+        const sh = try rig.shardedLayout(r);
+        try testing.expectEqual(p, try tier.plan(.{ .dir = "/s", .gib = 1 }, &sh));
+    }
 }
 
 test "spill v2 off: a two-rank pass with no tier sends only the pass's note, writes nothing and allocates no staging" {
@@ -489,4 +497,314 @@ test "spill v2 off: a two-rank pass with no tier sends only the pass's note, wri
     try testing.expectEqual(@as(usize, 0), e0.events.len + e1.events.len);
     rig.Lanes.releaseFn(&r0, &s0);
     rig.Lanes.releaseFn(&r1, &s1);
+}
+
+// -- TF_GLM_KV_SHARD: owner-sharded points (each rank its own view, the home part recorded) ---------------------------
+
+/// A token's and a whole block's bytes on the home part's owner and on the other rank (cuda_spill_state).
+const own_block = 12_705_792;
+const own_token = 6204;
+const other_block = 811_008;
+const other_token = 396;
+
+/// A sharded pair holding `a` kept in part 0 (an empty pool places it there) and `b` kept in part 1 (part 0 taken by
+/// another stream meanwhile), both written on both ranks.
+fn keepBothParts(p: *rig.Pair, a: []const u32, b: []const u32) ![2]*anyopaque {
+    const ka = try p.keepPass(a, at, 1);
+    try p.settle();
+    const other = try p.occupy(0, rig.pool_rows / 2);
+    const kb = try p.keepPass(b, at, 2);
+    try p.settle();
+    try p.vacate(other);
+    return .{ ka.saved, kb.saved };
+}
+
+test "TF_GLM_KV_SHARD: each rank writes its own view of a kept state under its home part, and a restore gives each rank that view back with its home; the resume lands in the home part" {
+    const gpa = testing.allocator;
+    var p: rig.Pair = undefined;
+    try p.initWith(gpa, "shard-restore", rig.Pair.settingsFor(1), .{ .sharded = true });
+    defer p.deinit();
+    var b1: [2200]u32 = undefined;
+    var b2: [2200]u32 = undefined;
+    const a = rig.idsOf(&b1, 70);
+    const b = rig.idsOf(&b2, 71);
+    const ka = try p.keepPass(a, at, 1);
+    try p.settle();
+    // a's home is part 0: rank 0 wrote its latent and pooled rows (a whole block and a 64-token tail), rank 1 the
+    // pooled rows alone
+    try testing.expectEqual(@as(u64, own_block + 64 * own_token), p.lead0().side.store.counts().written_bytes);
+    try testing.expectEqual(@as(u64, other_block + 64 * other_token), p.fol.?.side.store.counts().written_bytes);
+    try testing.expectEqual(@as(u64, 0), p.fol.?.skipped);
+    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| { // (rank 0's own part, rank 1's other part)
+        try testing.expectEqual(@as(u64, 1), side.cached.points_part0);
+        try testing.expectEqual(@as(u64, 0), side.cached.points_part1);
+    }
+    const other = try p.occupy(0, rig.pool_rows / 2);
+    const kb = try p.keepPass(b, at, 2);
+    try p.settle();
+    try p.vacate(other);
+    // b's home is part 1: the reverse
+    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| try testing.expectEqual(@as(u64, own_block + 64 * own_token + other_block + 64 * other_token), side.store.counts().written_bytes);
+    const keys = [2]format.Digest{ pointKey(a[0..at]), pointKey(b[0..at]) };
+    const saved = [2]*anyopaque{ ka.saved, kb.saved };
+    var originals: [2][2][]u8 = undefined; // [point][rank]
+    for (saved, 0..) |sv, i| for (0..2) |r| {
+        const snap = try p.snapOn(r, sv);
+        try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
+        try testing.expectEqual(r == i, snap.sec.rows); // (the latent rows on the home part's owner only)
+        originals[i][r] = try gpa.dupe(u8, HostEngine.bytesOf(snap));
+    };
+    defer for (originals) |o| for (o) |x| gpa.free(x);
+    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| {
+        try testing.expectEqual(@as(?u32, 0), side.store.partOf(keys[0]).?.part);
+        try testing.expectEqual(@as(?u32, 1), side.store.partOf(keys[1]).?.part);
+    }
+    // every rank's points by part (the stats ask)
+    p.lead0().stats_at = 0;
+    p.lead0().pump(1);
+    var counts: [4]tier.Counts = undefined;
+    try testing.expectEqual(@as(usize, 2), p.lead0().counts(&counts));
+    for (counts[0..2]) |c| {
+        try testing.expectEqual(@as(u64, 2), c.points);
+        try testing.expectEqual(@as(u64, 1), c.points_part0);
+        try testing.expectEqual(@as(u64, 1), c.points_part1);
+    }
+    try p.evict(ka.saved);
+    try p.evict(kb.saved);
+    try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
+    const exact = [2]usize{ p.e[0].exact, p.e[1].exact }; // (a pass resumes its own mark's state too)
+    // each restored: every rank holds its own view of the point's home again, byte for byte the state it kept
+    for ([_][]const u32{ a, b }, 0..) |ids, i| {
+        const r = try p.restore(ids);
+        try testing.expect(r == .ready);
+        for (0..2) |rank| {
+            const snap = try p.snapOn(rank, r.ready.saved);
+            try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
+            try testing.expectEqual(rank == i, snap.sec.rows);
+            try testing.expect(HostEngine.same(&p.layouts[rank], snap.sec, originals[i][rank], HostEngine.bytesOf(snap)));
+        }
+        // the resume: placed in part 0 (an empty pool), where a's home is (here) and from where b moves to its own;
+        // nothing carried, and both ranks draw a fresh pass's token from their own view
+        const firsts = try p.resumeBoth(ids, r.ready.saved, at);
+        try testing.expectEqual(HostEngine.first(ids), firsts[0]);
+        try testing.expectEqual(HostEngine.first(ids), firsts[1]);
+    }
+    for (&p.e, exact) |*e, x| {
+        try testing.expectEqual(x + 2, e.exact);
+        try testing.expectEqual(e.resumed, e.exact);
+        try testing.expectEqual(@as(usize, 0), e.carries);
+    }
+    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
+}
+
+test "TF_GLM_KV_SHARD: a restored state whose home part has no room resumes in the other part (carried), from 0 with the carry off" {
+    const gpa = testing.allocator;
+    var p: rig.Pair = undefined;
+    try p.initWith(gpa, "shard-carry", rig.Pair.settingsFor(1), .{ .sharded = true });
+    defer p.deinit();
+    var b1: [2200]u32 = undefined;
+    const a = rig.idsOf(&b1, 72);
+    const k = try p.keepPass(a, at, 1);
+    try p.settle();
+    try p.evict(k.saved);
+    // part 0 full: the restore still starts (a carry takes 2,112 tokens: past the minimum), and the resume's extent
+    // stays in part 1 with the home owner's rows carried; both ranks resume exactly from their own views
+    const full = try p.occupy(0, rig.pool_rows / 2);
+    const r = try p.restore(a);
+    try testing.expect(r == .ready);
+    try testing.expectEqual(@as(?u8, 0), (try p.snapOn(0, r.ready.saved)).home);
+    const exact = [2]usize{ p.e[0].exact, p.e[1].exact };
+    const firsts = try p.resumeBoth(a, r.ready.saved, at);
+    try testing.expectEqual(HostEngine.first(a), firsts[0]);
+    try testing.expectEqual(HostEngine.first(a), firsts[1]);
+    for (&p.e, exact) |*e, x| {
+        try testing.expectEqual(@as(usize, 1), e.carries);
+        try testing.expectEqual(x + 1, e.exact);
+        try testing.expectEqual(e.resumed, e.exact);
+    }
+    // the carry off (TF_GLM_KV_SHARD_CARRY=0 on both ranks) with the state in memory: the prompt from 0, nothing resumed
+    for (&p.e) |*e| e.carry = false;
+    const resumed = [2]usize{ p.e[0].resumed, p.e[1].resumed };
+    try testing.expectEqual(HostEngine.first(a), (try p.resumeBoth(a, r.ready.saved, at))[0]);
+    for (&p.e, resumed) |*e, x| {
+        try testing.expectEqual(@as(usize, 1), e.carries);
+        try testing.expectEqual(x, e.resumed);
+    }
+    try p.vacate(full);
+    try testing.expectEqual(p.e[0].pool.?.digest(), p.e[1].pool.?.digest());
+}
+
+test "TF_GLM_KV_SHARD: a point whose home part has no room is not read when its resume could only start from 0 (the carry off, or a state under the minimum), and restores once the part has room" {
+    const gpa = testing.allocator;
+    var p: rig.Pair = undefined;
+    try p.initWith(gpa, "shard-homefull", rig.Pair.settingsFor(1), .{ .sharded = true });
+    defer p.deinit();
+    var b1: [2200]u32 = undefined;
+    var b2: [2200]u32 = undefined;
+    const a = rig.idsOf(&b1, 73);
+    const s = rig.idsOf(&b2, 74);
+    const small = 1984; // (under cuda_shard_keep.carry_min)
+    comptime std.debug.assert(small < shard_keep.carry_min);
+    const keys = [2]format.Digest{ pointKey(a[0..at]), pointKey(s[0..small]) };
+    const ka = try p.keepPass(a, at, 1);
+    try p.settle(); // (one small slot a rank)
+    const ks = try p.keepPass(s, small, 2);
+    try p.settle();
+    for ([_]*anyopaque{ ka.saved, ks.saved }) |sv| {
+        try testing.expectEqual(@as(?u8, 0), (try p.snapOn(0, sv)).home); // (an empty pool places both in part 0)
+        try p.evict(sv);
+    }
+    const full = try p.occupy(0, rig.pool_rows / 2);
+    // the carry off: a's restore is refused before any read, `has` or reservation on either rank (its point stays on
+    // both); the carry on: s's too, a carry never taking a state under the minimum
+    for (&p.e) |*e| e.carry = false;
+    // (`check`, which the prompt cache asks before it makes room for the restore, refuses it the same way)
+    const pa = p.lead0().lookup(a, 0, @intCast(a.len - 1), &.{}, 0).?;
+    try testing.expectError(error.KvShardHomeFull, p.lead0().check(pa.id, pa.at));
+    try testing.expectError(error.KvShardHomeFull, p.restore(a));
+    for (&p.e) |*e| e.carry = true;
+    try testing.expectError(error.KvShardHomeFull, p.restore(s));
+    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| {
+        try testing.expectEqual(@as(u64, 0), side.store.counts().loaded + side.store.counts().load_failed);
+        try testing.expectEqual(@as(usize, 0), side.rxs.count());
+        for (keys) |key| try testing.expect(side.store.presence(key));
+    }
+    try testing.expectEqual(@as(u64, 0), p.lead0().presence_refused);
+    try testing.expectEqual(@as(usize, 0), p.lead0().jobs.count());
+    try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
+    // part 0 has room again: both restore with the carry off, each resumed in its home part exactly, nothing carried
+    try p.vacate(full);
+    try p.lead0().check(pa.id, pa.at);
+    for (&p.e) |*e| e.carry = false;
+    const resumed = [2]usize{ p.e[0].resumed, p.e[1].resumed }; // (a pass resumes its own mark's state too)
+    for ([_][]const u32{ a, s }, [_]u32{ at, small }) |ids, n| {
+        const r = try p.restore(ids);
+        try testing.expect(r == .ready);
+        const firsts = try p.resumeBoth(ids, r.ready.saved, n);
+        try testing.expectEqual(HostEngine.first(ids), firsts[0]);
+        try testing.expectEqual(HostEngine.first(ids), firsts[1]);
+    }
+    for (&p.e, resumed) |*e, x| {
+        try testing.expectEqual(x + 2, e.resumed);
+        try testing.expectEqual(e.resumed, e.exact);
+        try testing.expectEqual(@as(usize, 0), e.carries);
+    }
+    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
+}
+
+test "TF_GLM_KV_SHARD: a damaged block on the rank that does not own the point's home makes both ranks forget it" {
+    const gpa = testing.allocator;
+    for ([_]rig.Pair.Damage{ .flip, .truncate }, 0..) |how, n| for (0..2) |home| {
+        var p: rig.Pair = undefined;
+        var tb: [32]u8 = undefined;
+        try p.initWith(gpa, try std.fmt.bufPrint(&tb, "shard-damage{d}{d}", .{ n, home }), rig.Pair.settingsFor(1), .{ .sharded = true });
+        defer p.deinit();
+        var buf: [2200]u32 = undefined;
+        const ids = rig.idsOf(&buf, @intCast(80 + 2 * n + home));
+        const other = if (home == 1) try p.occupy(0, rig.pool_rows / 2) else null;
+        const k = try p.keepPass(ids, at, 1);
+        try p.settle();
+        if (other) |o| try p.vacate(o);
+        try testing.expectEqual(@as(?u8, @intCast(home)), (try p.snapOn(0, k.saved)).home);
+        try p.evict(k.saved);
+        try p.damage(1 - home, how); // (its blocks: the pooled rows alone)
+        const r = try p.restore(ids);
+        try testing.expect(r == .failed);
+        try testing.expectEqual(error.SpillDamaged, r.failed);
+        const key = pointKey(ids[0..at]);
+        try testing.expect(!p.lead0().side.store.presence(key));
+        try testing.expect(!p.fol.?.side.store.presence(key));
+        try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
+        try testing.expectEqual(@as(usize, 0), p.lead0().side.rxs.count() + p.fol.?.side.rxs.count());
+        try testing.expect(p.lead0().lookup(ids, 0, @intCast(ids.len - 1), &.{}, 0) == null);
+    };
+}
+
+test "TF_GLM_KV_SHARD: after a restart both ranks recover their points of both parts, and each restores into its home" {
+    const gpa = testing.allocator;
+    var p: rig.Pair = undefined;
+    try p.initWith(gpa, "shard-restart", rig.Pair.settingsFor(1), .{ .sharded = true });
+    defer p.deinit();
+    var b1: [2200]u32 = undefined;
+    var b2: [2200]u32 = undefined;
+    const a = rig.idsOf(&b1, 90);
+    const b = rig.idsOf(&b2, 91);
+    _ = try keepBothParts(&p, a, b);
+    try p.restart();
+    for ([_]*rig.Leader.S{ p.lead0().side, p.fol.?.side }) |side| {
+        const c = side.store.counts();
+        try testing.expectEqual(@as(u64, 2), c.recovered_points);
+        try testing.expectEqual(@as(u64, 1), side.cached.points_part0);
+        try testing.expectEqual(@as(u64, 1), side.cached.points_part1);
+    }
+    for ([_][]const u32{ a, b }, 0..) |ids, i| {
+        const r = try p.restore(ids);
+        try testing.expect(r == .ready);
+        for (0..2) |rank| {
+            const snap = try p.snapOn(rank, r.ready.saved);
+            try testing.expectEqual(@as(?u8, @intCast(i)), snap.home);
+            try testing.expect(p.e[rank].exactFor(snap, ids[0..at]));
+        }
+        const firsts = try p.resumeBoth(ids, r.ready.saved, at);
+        try testing.expectEqual(HostEngine.first(ids), firsts[0]);
+        try testing.expectEqual(HostEngine.first(ids), firsts[1]);
+    }
+}
+
+test "TF_GLM_KV_SHARD: the same ids kept again from the other part by a rank that lost its copy are refused at has, and every rank forgets them" {
+    const gpa = testing.allocator;
+    var p: rig.Pair = undefined;
+    try p.initWith(gpa, "shard-reparted", rig.Pair.settingsFor(1), .{ .sharded = true });
+    defer p.deinit();
+    var b1: [2200]u32 = undefined;
+    const a = rig.idsOf(&b1, 92);
+    const key = pointKey(a[0..at]);
+    _ = try p.keepPass(a, at, 1); // (part 0)
+    try p.settle();
+    // rank 1 loses its copy; the conversation comes back with part 0 full and the carry off: rank 0 finds its point but
+    // refuses the restore before `has` (the resume could only start from 0), so no rank forgets it; the turn prefills
+    // in part 1 and is kept again there: rank 0 dedups it (its point keeps part 0), rank 1 writes it under part 1
+    try p.dropAll();
+    p.close();
+    try p.dropManifests(1);
+    try p.open();
+    const full = try p.occupy(0, rig.pool_rows / 2);
+    for (&p.e) |*e| e.carry = false;
+    try testing.expectError(error.KvShardHomeFull, p.restore(a));
+    try testing.expectEqual(@as(u64, 0), p.lead0().presence_refused);
+    _ = try p.keepPass(a, at, 1);
+    try p.settle();
+    try p.vacate(full);
+    for (&p.e) |*e| e.carry = true;
+    try testing.expectEqual(@as(?u32, 0), p.lead0().side.store.partOf(key).?.part);
+    try testing.expectEqual(@as(?u32, 1), p.fol.?.side.store.partOf(key).?.part);
+    try p.dropAll();
+    // `has` names part 0: rank 1's point of these ids is the other view (incompatible), so no rank restores it and
+    // every rank forgets it
+    try testing.expectError(error.SpillNotOnEveryRank, p.restore(a));
+    try testing.expectEqual(@as(u64, 1), p.lead0().presence_refused);
+    try testing.expect(!p.lead0().side.store.presence(key));
+    try testing.expect(!p.fol.?.side.store.presence(key));
+    try testing.expectEqual(@as(usize, 0), p.e[0].snaps + p.e[1].snaps);
+    try testing.expectEqual(@as(usize, 0), p.pg.fatals);
+}
+
+test "TF_GLM_KV_SHARD: a keep note whose part is not the home of rank 1's own state writes nothing there" {
+    const gpa = testing.allocator;
+    var p: rig.Pair = undefined;
+    try p.initWith(gpa, "shard-skip", rig.Pair.settingsFor(1), .{ .sharded = true });
+    defer p.deinit();
+    var b1: [2200]u32 = undefined;
+    const a = rig.idsOf(&b1, 93);
+    // rank 1's pool alone has part 0 taken: its pass keeps the state in part 1 while rank 0's keeps it in part 0
+    const pool = &p.e[1].pool.?;
+    const x = try pool.add(0, rig.pool_rows / 2);
+    (try pool.get(x)).owner = x;
+    _ = try p.keepPass(a, at, 1);
+    try p.settle();
+    try pool.remove(x);
+    try testing.expectEqual(@as(u64, 1), p.fol.?.skipped);
+    try testing.expect(p.lead0().side.store.presence(pointKey(a[0..at])));
+    try testing.expect(!p.fol.?.side.store.presence(pointKey(a[0..at])));
+    try testing.expectEqual(@as(u64, 0), p.fol.?.side.store.counts().keeps);
 }

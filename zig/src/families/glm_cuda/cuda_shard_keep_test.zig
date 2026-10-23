@@ -102,6 +102,25 @@ test "a resume: in its state's part as it is, moved there when it has room, else
     try std.testing.expectEqual(@as(usize, 0), p.partOf((try p.extent(b)).base));
 }
 
+test "a restore from disk: started when its resume could be placed in the home part or carried, refused when it could only start from 0" {
+    comptime std.debug.assert(keep.carry_min == E);
+    var p = try Pool.initParts(gpa, 8 * E, 2);
+    defer p.deinit();
+    _ = try p.add(0, 3 * E); // part 0: one extent of E rows left
+    // room for the state's rows and the next token's: whatever the carry
+    try std.testing.expect(try keep.restorable(&p, 0, E - 64, false));
+    // E tokens leave the next one no row there: only a carry takes it (from carry_min, E)
+    try std.testing.expect(!try keep.restorable(&p, 0, E, false));
+    try std.testing.expect(try keep.restorable(&p, 0, E, true));
+    // part 0 full (part 1's room does not count): carried from the minimum up, else refused
+    _ = try p.add(3 * E, E);
+    try std.testing.expect(try keep.restorable(&p, 0, 5000, true));
+    try std.testing.expect(!try keep.restorable(&p, 0, 5000, false));
+    try std.testing.expect(!try keep.restorable(&p, 0, keep.carry_min - 64, true));
+    try std.testing.expect(try keep.restorable(&p, 1, keep.carry_min - 64, false));
+    try std.testing.expectError(error.BadPart, keep.restorable(&p, 2, 5000, true));
+}
+
 /// Each rank's part for every (home, part): one copier when they agree, else one sender (the home's owner) and one
 /// receiver (the extent's), the rank between them none.
 fn roles() anyerror!bool {

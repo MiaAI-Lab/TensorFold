@@ -133,14 +133,14 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             return e;
         };
         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
-        spill_env = spillAdmit(v2, o, choice, kv_switches) catch |e| return kvRefused(e);
+        spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
         own.comm = try comm.Comm.init(gpa, own.link.?, o.rank, o.tp);
         std.log.info("rank {d}: settings agreed, NCCL joined", .{o.rank});
         own.watch = .{ .io = io, .fd = own.link.?.fd, .more = own.link.?.more, .rank = o.rank, .comm = mirror.Coll.of(comm.Comm, &own.comm.?) };
         try own.watch.?.start();
     } else {
         kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
-        spill_env = spillAdmit(v2, o, choice, kv_switches) catch |e| return kvRefused(e);
+        spill_env = spillAdmit(v2, o, choice) catch |e| return kvRefused(e);
     }
     const streams: usize = @max(@as(usize, 1), @min(@as(usize, o.parallel), lane_backend.max_streams));
     own.engine = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{
@@ -218,7 +218,6 @@ pub fn refusal(err: anyerror) ?[]const u8 {
         error.BadSpillV2 => "TF_GLM_SPILL_V2: 1 (spill v2) or 0 (v1, the rollback), nothing else",
         error.SpillV2NeedsTwoRanks => "TF_GLM_SPILL_V2=1: spill v2 runs on the recipe's two ranks only for now (--tp 2)",
         error.SpillV2WithMtp => "TF_GLM_SPILL_V2=1: the prompt cache is off with MTP drafts, so spill v2 would keep nothing (DFlash2 drafts or none)",
-        error.SpillV2WithKvShard => "TF_GLM_SPILL_V2=1 with TF_GLM_KV_SHARD=1: spill v2 of sharded kept states is not in this build yet",
         error.SpillV2NoPromptCache => "TF_GLM_SPILL_V2=1 needs the prompt cache, and a rank's kept-state budget is 0 (--prompt-cache-gib; with PROMPT_CACHE_GIB a lower KV_POOL_GIB)",
         error.SpillV2StoreFailed => "TF_GLM_SPILL_V2=1: a rank's spill v2 store did not open (that rank's log says why)",
         error.StagingTooSmall => "TF_GLM_SPILL_STAGE_MIB: spill v2's write ring holds two blocks at least (25 MiB), TF_GLM_SPILL_READ_BLOCKS one",
@@ -239,13 +238,12 @@ fn spillV2(o: Options, choice: choice_mod.Choice) anyerror!?identity.Env {
 
 /// Spill v2 once the ranks agreed on it (its switch and knobs are in the settings text, so every rank answers alike):
 /// this rank's own read error, a world it does not run on yet (the recipe's two ranks; the identity agreement and the
-/// rank protocol are the pair's), MTP drafts (the prompt cache is off with them), KV sharding (round 3), or a staging
-/// too small for its blocks.
-fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choice, kv: shard.Switches) !?identity.Env {
+/// rank protocol are the pair's), MTP drafts (the prompt cache is off with them), or a staging too small for its
+/// blocks. With TF_GLM_KV_SHARD=1 the tier is owner-sharded (Engine.spillLayout).
+fn spillAdmit(read: anyerror!?identity.Env, o: Options, choice: choice_mod.Choice) !?identity.Env {
     const env = (try read) orelse return null;
     if (o.tp != 2) return error.SpillV2NeedsTwoRanks;
     if (o.drafts and choice == .mtp) return error.SpillV2WithMtp;
-    if (kv.on) return error.SpillV2WithKvShard;
     try spill_tier.check(tierSettings(o, 0));
     return env;
 }
@@ -257,16 +255,16 @@ fn tierSettings(o: Options, budget: u64) spill_tier.Settings {
 }
 
 /// Spill v2's tier on this rank, once the ranks agreed on their identities and on one kept-state budget: this rank's
-/// store under its own compat (Agreement.storeCommon) over the staging the engine took before its pool, every rank's
-/// open agreed (one that failed fails the start on all), rank 0's tier for the prompt cache, the other ranks' on
-/// their lane backends.
+/// store under its own compat (Agreement.storeCommon, and the layout's owner: TF_GLM_KV_SHARD's owner-sharded store is
+/// another namespace) over the staging the engine took before its pool, every rank's open agreed (one that failed
+/// fails the start on all), rank 0's tier for the prompt cache, the other ranks' on their lane backends.
 fn openTier(own: *Own, gpa: std.mem.Allocator, io: std.Io, o: Options, a: identity.Agreement, budget: u64) !void {
     if (budget == 0) return error.SpillV2NoPromptCache;
     const e = own.engine.?;
     e.current();
     const layout = try e.spillLayout();
     const s = tierSettings(o, budget);
-    const compat = format.compatDigest(a.storeCommon(@intCast(o.rank)), .replicated, @intCast(spill_state.block_tokens), layout.block_bytes);
+    const compat = layout.compat(a.storeCommon(@intCast(o.rank)));
     const opened = SpillLeader.S.open(gpa, io, e, layout, s, o.rank, compat, @intCast(e.context), e.tierStaging(), .{});
     const ok = if (opened) |_| true else |err| blk: {
         std.log.err("rank {d}: spill v2's store under {s} did not open ({s})", .{ o.rank, s.dir, @errorName(err) });
@@ -280,7 +278,7 @@ fn openTier(own: *Own, gpa: std.mem.Allocator, io: std.Io, o: Options, a: identi
     }
     const handed = spill_tier.giveFolders(side.store);
     const c = side.store.counts();
-    std.log.info("rank {d}: spill v2 tier: {s}, up to {d:.0} GiB, {d} points ({d} MiB) found; each kept state written at keep from {d} tokens, keeping {d:.0} GiB of disk free{s}", .{ o.rank, s.dir, s.gib, c.points, c.stored_bytes >> 20, s.min_tokens, s.min_free_gib, if (handed) "; its folders given to the spill directory's owner" else "" });
+    std.log.info("rank {d}: spill v2 tier: {s}, up to {d:.0} GiB, {d} points ({d} MiB) found; each kept state written at keep from {d} tokens, keeping {d:.0} GiB of disk free{s}{s}", .{ o.rank, s.dir, s.gib, c.points, c.stored_bytes >> 20, s.min_tokens, s.min_free_gib, if (layout.owner == .owner_sharded) "; owner-sharded (TF_GLM_KV_SHARD: a point's latent rows on its home part's rank only)" else "", if (handed) "; its folders given to the spill directory's owner" else "" });
     // a following rank outlives a stop signal this long: rank 0's flush has it drain its own writes first
     e.spill_wait_ns = @as(u64, o.spill_flush_ms) * std.time.ns_per_ms;
     if (o.rank == 0) {
@@ -306,6 +304,7 @@ fn spillAgree(gpa: std.mem.Allocator, io: std.Io, own: *Own, ctx: *const cuda.Co
     const e = own.engine.?;
     const layout = try e.spillLayout();
     var fbuf: [256]u8 = undefined;
+    var obuf: [48]u8 = undefined;
     const r: identity.Rank = .{
         .dir = dir,
         .kernels = kernels,
@@ -316,6 +315,7 @@ fn spillAgree(gpa: std.mem.Allocator, io: std.Io, own: *Own, ctx: *const cuda.Co
         .rank = o.rank,
         .ring = e.caches.ring,
         .layout = layout.digest(),
+        .owner_layout = layout.ownerText(&obuf),
         .capability = try ctx.capability(),
         .driver = try ctx.d.version(),
         .state_format = spill_state.format_version,
@@ -383,9 +383,9 @@ fn openSpill(own: *Own, o: Options, build_key: u64) ?SpillSettings {
     }
     if (!(gib > 0)) return null;
     if (own.engine.?.shard != null) {
-        // TF_GLM_KV_SHARD: a kept state's latent rows are on its home part's owner only, and a stored one does not say
-        // which part that was (spill and sharding together: round 3); every rank leaves the tier off alike
-        if (o.rank == 0) std.log.warn("spill: off with TF_GLM_KV_SHARD=1 (a stored state does not record the part its latent rows lie in yet)", .{});
+        // TF_GLM_KV_SHARD: a kept state's latent rows are on its home part's owner only, and v1's stored state does not
+        // say which part that was (spill v2's owner-sharded tier does); every rank leaves the tier off alike
+        if (o.rank == 0) std.log.warn("spill: off with TF_GLM_KV_SHARD=1 (v1 does not record the part a stored state's latent rows lie in; TF_GLM_SPILL_V2=1 does)", .{});
         return null;
     }
     if (root.len == 0) {
@@ -798,27 +798,25 @@ test "TF_GLM_SPILL_V2: the settings text carries it only when on and after KV sh
     defer gpa.free(bad);
     try std.testing.expect(std.mem.endsWith(u8, bad, " spill_v2=unreadable"));
     try std.testing.expect(!std.mem.eql(u8, bad, on) and !std.mem.eql(u8, bad, off));
-    // after the agreement: off passes; this rank's own error; a world other than two ranks; MTP drafts; KV sharding; a
-    // staging too small for two blocks; on
-    const kv: shard.Switches = .{};
-    try std.testing.expectEqual(@as(?identity.Env, null), try spillAdmit(null, o, .dflash2, kv));
-    try std.testing.expectError(error.NoModelRevision, spillAdmit(error.NoModelRevision, o, .dflash2, kv));
+    // after the agreement: off passes; this rank's own error; a world other than two ranks; MTP drafts; a staging too
+    // small for two blocks; on (KV sharding or not: Engine.spillLayout makes the tier owner-sharded)
+    try std.testing.expectEqual(@as(?identity.Env, null), try spillAdmit(null, o, .dflash2));
+    try std.testing.expectError(error.NoModelRevision, spillAdmit(error.NoModelRevision, o, .dflash2));
     for ([_]u32{ 1, 3, 4 }) |tp| {
         var x = o;
         x.tp = tp;
-        try std.testing.expectError(error.SpillV2NeedsTwoRanks, spillAdmit(env, x, .dflash2, kv));
+        try std.testing.expectError(error.SpillV2NeedsTwoRanks, spillAdmit(env, x, .dflash2));
     }
     var mtp = o;
     mtp.drafts = true;
-    try std.testing.expectError(error.SpillV2WithMtp, spillAdmit(env, mtp, .mtp, kv));
-    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, mtp, .dflash2, kv)).?.engine);
-    try std.testing.expectError(error.SpillV2WithKvShard, spillAdmit(env, o, .dflash2, .{ .on = true }));
+    try std.testing.expectError(error.SpillV2WithMtp, spillAdmit(env, mtp, .mtp));
+    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, mtp, .dflash2)).?.engine);
     var small = o;
     small.spill_stage_mib = 24;
-    try std.testing.expectError(error.StagingTooSmall, spillAdmit(env, small, .dflash2, kv));
+    try std.testing.expectError(error.StagingTooSmall, spillAdmit(env, small, .dflash2));
     small.spill_stage_mib = 25;
-    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, small, .dflash2, kv)).?.engine);
-    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, o, .dflash2, kv)).?.engine);
+    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, small, .dflash2)).?.engine);
+    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, o, .dflash2)).?.engine);
     // the tier's settings from the server's (the guard's limit a quarter of the agreed budget)
     const ts = tierSettings(.{ .context = 8, .drafts = false, .spill_gib = 64, .spill_dir = "/spill", .spill_quota = 0.25, .spill_turns = 2, .spill_read_blocks = 8, .spill_stage_mib = 128, .spill_min_tokens = 4096, .spill_min_free_gib = 10 }, 8 << 30);
     try std.testing.expectEqualStrings("/spill", ts.dir);
@@ -833,12 +831,12 @@ test "TF_GLM_SPILL_V2: the settings text carries it only when on and after KV sh
     // with the spill off (no --spill-gib, or no --snapshot-dir) nothing is read: off whatever the environment holds
     try std.testing.expectEqual(@as(?identity.Env, null), try spillV2(.{ .context = 8, .drafts = false }, .dflash2));
     try std.testing.expectEqual(@as(?identity.Env, null), try spillV2(.{ .context = 8, .drafts = false, .spill_gib = 64 }, .dflash2));
-    for ([_]anyerror{ error.BadSpillV2, error.SpillV2NeedsTwoRanks, error.SpillV2WithMtp, error.SpillV2WithKvShard, error.SpillV2NoPromptCache, error.SpillV2StoreFailed, error.StagingTooSmall, error.NoEngineId, error.NoRecipePatches, error.NoModelRevision, error.NoDrafterRevision, error.SpillIdentityMismatch }) |e|
+    for ([_]anyerror{ error.BadSpillV2, error.SpillV2NeedsTwoRanks, error.SpillV2WithMtp, error.SpillV2NoPromptCache, error.SpillV2StoreFailed, error.StagingTooSmall, error.NoEngineId, error.NoRecipePatches, error.NoModelRevision, error.NoDrafterRevision, error.SpillIdentityMismatch }) |e|
         try std.testing.expect(std.mem.startsWith(u8, refusal(e).?, "TF_GLM_SPILL_"));
     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
 }
 
-test "TF_GLM_KV_SHARD=1 is admitted whatever TF_GLM_SPILL_V2 holds: spill v2's own admission refuses the pair, and only with its tier on" {
+test "TF_GLM_KV_SHARD=1 is admitted whatever TF_GLM_SPILL_V2 holds, and spill v2 with it (an owner-sharded tier)" {
     const C = struct {
         extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
         extern "c" fn unsetenv(name: [*:0]const u8) c_int;
@@ -860,6 +858,13 @@ test "TF_GLM_KV_SHARD=1 is admitted whatever TF_GLM_SPILL_V2 holds: spill v2's o
         _ = C.setenv("TF_GLM_SPILL_V2", v.ptr, 1);
         try std.testing.expect((try kvAdmit(shard.Switches.read(), o, .dflash2)).on);
     }
+    // with the spill tier on as well, spill v2 is admitted beside it (round 3: no refusal of the pair)
+    const env: identity.Env = .{ .engine = "a1b2c3d", .patches = "sha256:0014", .model_revision = "4f2e9a1" };
+    var spilled = o;
+    spilled.spill_gib = 64;
+    spilled.spill_dir = "/spill";
+    try std.testing.expect((try kvAdmit(shard.Switches.read(), spilled, .dflash2)).on);
+    try std.testing.expectEqualStrings("a1b2c3d", (try spillAdmit(env, spilled, .dflash2)).?.engine);
 }
 
 test "serving refuses more than eight lanes before any CUDA call" {

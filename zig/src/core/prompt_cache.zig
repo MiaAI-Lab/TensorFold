@@ -320,8 +320,10 @@ pub const TierCounts = struct {
     quota_trims: u64 = 0,
     recovered_points: u64 = 0, // published points found at start
     dropped_temporaries: u64 = 0, // incomplete records removed at start
+    points_part0: u64 = 0, // gauge: KV sharding (an owner-sharded store): published points whose home is part 0
+    points_part1: u64 = 0, // gauge: ... part 1
 
-    pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending" };
+    pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending", "points_part0", "points_part1" };
 
     /// Each field's /metrics help (a missing one fails the build).
     pub const help = .{
@@ -359,6 +361,8 @@ pub const TierCounts = struct {
         .quota_trims = "Writes that trimmed their conversation to its quota.",
         .recovered_points = "Published points found at start.",
         .dropped_temporaries = "Incomplete records removed at start.",
+        .points_part0 = "Published points whose home is KV part 0 (an owner-sharded disk tier; 0 when replicated).",
+        .points_part1 = "Published points whose home is KV part 1 (an owner-sharded disk tier; 0 when replicated).",
     };
 };
 
@@ -369,12 +373,15 @@ pub const TierCounts = struct {
 pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy };
 
 /// Refusals that name the point itself, never deferred (Store.deferrable): the store's NoTier and BadPoint; a family
-/// tier's UnknownPoint, BadPoint, SpillMissing (absent here), SpillNotOnEveryRank; core/spill's Missing; the fake
-/// tier's PointMissing. No wait cures them (the tier forgets a point it learned is gone), with one exception:
-/// SpillNotOnEveryRank is also GLM's answer while a rank's own write of the point is still queued (`incomplete`, kept
-/// on every rank), which a later ask would find published. It stays here: rank 0 cannot see that write publish without
-/// asking every rank `has` again, a gather each time, and the case needs a lookup to choose the point (its memory state
-/// already evicted) while another rank is still writing it.
+/// tier's UnknownPoint, BadPoint, SpillMissing (absent here), SpillNotOnEveryRank, KvShardHomeFull; core/spill's
+/// Missing; the fake tier's PointMissing. No wait for the restores in flight cures them (the tier forgets a point it
+/// learned is gone), with one exception: SpillNotOnEveryRank is also GLM's answer while a rank's own write of the
+/// point is still queued (`incomplete`, kept on every rank), which a later ask would find published. It stays here:
+/// rank 0 cannot see that write publish without asking every rank `has` again, a gather each time, and the case needs
+/// a lookup to choose the point (its memory state already evicted) while another rank is still writing it.
+/// KvShardHomeFull (GLM, owner-sharded KV: the point's home part has no room for its resume and no carry can take it)
+/// names the point's placement, which no restore holds (a restore's end frees no pool rows; a stream's may), so the
+/// prompt prefills at once, in a part with room, instead of waiting beside the restores in flight.
 pub const point_errors = [_]anyerror{
     error.NoTier,
     error.BadPoint,
@@ -383,6 +390,7 @@ pub const point_errors = [_]anyerror{
     error.SpillNotOnEveryRank,
     error.Missing,
     error.PointMissing,
+    error.KvShardHomeFull,
 };
 
 /// The ranks a tier reports counters for (TP ranks; more are not reported).

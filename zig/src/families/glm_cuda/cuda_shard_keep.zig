@@ -65,6 +65,18 @@ pub fn resumeIn(pool: *const Pool, eid: u64, home: usize, at: usize, carry_on: b
     return .carry;
 }
 
+/// Whether a kept state of `at` tokens whose home is part `home`, read from disk now, could be resumed (resumeIn short
+/// of `recompute`): a carry takes it wherever its prompt lands, else the home part must have room for the resume's
+/// extent (at least its rows and the next token's: newSeq places it there, or the resume moves it there). False: a
+/// restore would read it only for a prefill from 0, so none starts (Python's disk restore `_room(.., half=)` and
+/// DeepSeek's `reserve(.., part)` refuse before reading too). Rank 0 alone asks; room that comes back serves a later
+/// request.
+pub fn restorable(pool: *const Pool, home: usize, at: usize, carry_on: bool) !bool {
+    if (home >= pool.parts()) return error.BadPart;
+    if (carry_on and (at >= carry_min or mut(.carry_small))) return true;
+    return (try pool.placeIn(at + 1, null, home)) != null;
+}
+
 /// This rank's part of a resume's latent rows: the home owner's state holds them, the new extent's owner needs them.
 /// `copy`: both here (a restore puts them back); `send` / `recv`: a carry; `none`: no latent row here either way.
 pub const Latent = enum { copy, none, send, recv };

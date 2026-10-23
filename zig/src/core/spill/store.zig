@@ -250,6 +250,9 @@ pub const Counters = struct {
     staging_bytes: u64 = 0,
     staging_peak_bytes: u64 = 0,
     disk_free_bytes: u64 = 0,
+    /// owner_sharded: the points of this rank's own part (Limits.own_part); the others are the other parts' (0 on a
+    /// replicated store)
+    own_part_points: u64 = 0,
 };
 
 const BlockInfo = struct { crc: u32, sha: Digest, ino: u64, bytes: u64 };
@@ -2836,6 +2839,10 @@ pub const Store = struct {
         x.staging_bytes = s.slots.heldBytes();
         x.staging_peak_bytes = s.slots.peakBytes();
         x.disk_free_bytes = s.disk_free;
+        if (s.cfg.limits.foreign_block_bytes != 0) {
+            var it = s.points.valueIterator();
+            while (it.next()) |p| x.own_part_points += @intFromBool(p.*.lineage.part == s.cfg.limits.own_part);
+        }
         return x;
     }
 
