@@ -69,13 +69,14 @@ pub const LaneHost = struct {
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
         marks: []const u32 = &.{}, // where the pass keeps states (gpa-owned)
         kept0: u64 = 0, // the store's kept count when the job looked it up
+        join: pc.Join = .{}, // the conversation its kept states join (0111), decided at its lookup
 
         /// The backend's prompt pass stands at a mark: the cache keeps the stream's state there.
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
             if (job.host.cache) |store| {
-                _ = store.keep(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request));
+                _ = store.keepIn(job.request.prompt, at, s, job.request.chunks, job.host.spans(job.request), job.join.chat);
                 status.noteKept(job.host);
             }
         }
@@ -317,6 +318,7 @@ pub const LaneHost = struct {
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
+            job.join = store.join(r.prompt, l.entry, r.drafts);
         } else |_| {};
         job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.droppedJob(job, "the drafter could not start");
         job.stream = lanes.Stream.init(h.gpa, .{
@@ -536,7 +538,10 @@ pub const LaneHost = struct {
         job.prefilled = done;
         h.unlock();
         job.reported();
-        if (h.cache) |store| store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+        if (h.cache) |store| {
+            store.continued(job.join, job.stream.cached, job.request.prompt.len);
+            store.report(job.request.prompt.len, job.stream.cached, store.counts.kept - job.kept0);
+        }
         status.noteKept(h);
         emit(job, .{ .prefilled = job.stream.cached });
     }
@@ -555,7 +560,7 @@ pub const LaneHost = struct {
             return h.cancel(job);
         };
         h.prefilled(job, began);
-        if (h.cache) |store| _ = store.keep(job.request.prompt, @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request));
+        if (h.cache) |store| _ = store.keepIn(job.request.prompt, @intCast(job.request.prompt.len), &job.stream, job.request.chunks, h.spans(job.request), job.join.chat);
         status.noteKept(h);
         be.release(&job.stream);
         h.remove(job);
@@ -634,6 +639,7 @@ pub const LaneHost = struct {
         job.started = false;
         job.fill_began = false;
         job.entry = null; // looked up again at its next admission
+        job.join = .{};
         h.gpa.free(job.marks);
         job.marks = &.{};
         h.lock();

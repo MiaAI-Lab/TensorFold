@@ -497,3 +497,68 @@ test "a lane host fills prompts between rounds: requests arriving together fill 
     }
     try std.testing.expect(target.fill_steps > 0);
 }
+
+test "a lane host counts a request that goes back into its conversation from the system-prompt cut, and keeps its id (0111)" {
+    const gpa = std.testing.allocator;
+    var r: RecipeHost = undefined;
+    try r.start();
+    defer r.deinit();
+    const e = r.host.engine();
+    var turns: [4]Turn = @splat(.{});
+    defer for (&turns) |*t| t.tokens.deinit(gpa);
+    var prompts: [4]std.ArrayList(u32) = @splat(.empty);
+    defer for (&prompts) |*p| p.deinit(gpa);
+    try prompts[0].appendSlice(gpa, &system ++ [_]u32{ 11, 12, 13, 14, 7, 7 }); // the first prompt: 14 tokens
+    try turns[0].run(e, 1, prompts[0].items);
+    try prompts[1].appendSlice(gpa, prompts[0].items); // a long reply and a tool result: keeps 56
+    for (0..40) |i| try prompts[1].append(gpa, 300 + @as(u32, @intCast(i)));
+    try prompts[1].appendSlice(gpa, &.{ 15, 16, 7, 7 });
+    try turns[1].run(e, 2, prompts[1].items);
+    try prompts[2].appendSlice(gpa, prompts[1].items); // keeps 64; the conversation's 12 goes (two a conversation)
+    try prompts[2].appendSlice(gpa, &.{ 17, 18, 19, 20, 21, 22, 7, 7 });
+    try turns[2].run(e, 3, prompts[2].items);
+    const chat = r.chatOf(11);
+    try std.testing.expectEqual(@as(u64, 0), r.store.counts.chats_continued);
+    try prompts[3].appendSlice(gpa, prompts[1].items[0..50]); // back into the reply: only the cut serves it
+    try prompts[3].appendSlice(gpa, &.{ 99, 98, 97, 96, 7, 7 });
+    try turns[3].run(e, 4, prompts[3].items);
+    try std.testing.expectEqual(@as(?u32, 8), turns[3].cached);
+    try std.testing.expectEqual(@as(u64, 1), r.store.counts.chats_continued);
+    try std.testing.expectEqual(@as(u64, prompts[3].items.len - 8), r.store.counts.chats_continued_prefill_tokens);
+    for (r.store.entries.items) |x| if (!x.shared) try std.testing.expectEqual(chat, x.chat); // one conversation
+    var status: api.Status = .{};
+    e.status(&status, &.{});
+    try std.testing.expectEqual(@as(u64, 1), status.kept.?.chats_continued);
+    try std.testing.expectEqual(@as(u64, prompts[3].items.len - 8), status.kept.?.chats_continued_prefill_tokens);
+}
+
+test "a lane host counts no turn of two conversations behind one kept system-prompt cut as continued (0111)" {
+    const gpa = std.testing.allocator;
+    var r: RecipeHost = undefined;
+    try r.start();
+    defer r.deinit();
+    const e = r.host.engine();
+    var turns: [5]Turn = @splat(.{});
+    defer for (&turns) |*t| t.tokens.deinit(gpa);
+    var prompts: [5]std.ArrayList(u32) = @splat(.empty);
+    defer for (&prompts) |*p| p.deinit(gpa);
+    try prompts[0].appendSlice(gpa, &system ++ [_]u32{ 11, 12, 13, 14, 7, 7 }); // A1: keeps the cut at 8 and its own 12
+    try turns[0].run(e, 1, prompts[0].items);
+    try prompts[1].appendSlice(gpa, &system ++ [_]u32{ 21, 22, 23, 24, 7, 7 }); // B1: resumes the cut, a conversation of its own
+    try turns[1].run(e, 2, prompts[1].items);
+    try std.testing.expectEqual(@as(?u32, 8), turns[1].cached);
+    try std.testing.expect(r.chatOf(11) != r.chatOf(21));
+    try std.testing.expectEqual(@as(u64, 0), r.store.counts.chats_continued);
+    // A2 and A3 from A's last state, then B2 from B1's after them: each resumes its own turn, which is no continuation
+    for ([_]usize{ 2, 3, 4 }, [_]usize{ 0, 2, 1 }, [_][2]u32{ .{ 15, 2 }, .{ 15, 3 }, .{ 25, 26 } }) |k, prev, said| {
+        try prompts[k].appendSlice(gpa, prompts[prev].items);
+        try prompts[k].appendSlice(gpa, turns[prev].tokens.items[0..4]);
+        try prompts[k].appendSlice(gpa, &.{ said[0], said[1], 7, 7 });
+        try turns[k].run(e, @intCast(k + 1), prompts[k].items);
+        try std.testing.expectEqual(@as(?u32, @intCast(prompts[prev].items.len - 2)), turns[k].cached);
+        try std.testing.expectEqual(@as(u64, 0), r.store.counts.chats_continued);
+    }
+    var status: api.Status = .{};
+    e.status(&status, &.{});
+    try std.testing.expectEqual(@as(u64, 0), status.kept.?.chats_continued);
+}

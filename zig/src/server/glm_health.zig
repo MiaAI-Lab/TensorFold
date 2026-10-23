@@ -1,7 +1,8 @@
 //! The fields the recipe's /health answers (Python `cuda/health.py` and the GLM decoder's `health()`), beside the
 //! native server's own: `ok`, `backend`, `busy`, `requests_running`, the totals of finished requests (a bench reads the
 //! `*_total` ones before and after a run), `streams`, `context_length`, and the pool's `pool_tokens` and
-//! `pool_free_tokens` when the engine reports them. The kept-state figures (`kept_*`, `spill`) belong to the prompt cache.
+//! `pool_free_tokens` when the engine reports them. The kept-state figures (`kept_*`, `spill`) belong to the prompt cache;
+//! with one, its conversation counters (patch 0111) are the recipe's: `chats_continued`, `chats_continued_prefill_tokens`.
 const std = @import("std");
 const api = @import("engine_api");
 const json = @import("json");
@@ -46,6 +47,12 @@ pub fn add(srv: *Server, a: Allocator, o: *json.Object, status: api.Status) !voi
     if (status.pool_tokens) |n| try putNum(a, o, "pool_tokens", n);
     if (status.pool_free_tokens) |n| try putNum(a, o, "pool_free_tokens", n);
     if (srv.info.context_window > 0) try putNum(a, o, "context_length", srv.info.context_window);
+    // requests that continued their conversation without resuming its own turn state (a rewind before its kept states,
+    // or they were dropped or read back from disk), and the tokens those prefilled
+    if (status.kept) |k| {
+        try putNum(a, o, "chats_continued", k.chats_continued);
+        try putNum(a, o, "chats_continued_prefill_tokens", k.chats_continued_prefill_tokens);
+    }
 }
 
 fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
@@ -94,6 +101,12 @@ pub fn metrics(srv: *Server, w: *std.Io.Writer) !void {
     if (status.pool_free_tokens) |n| {
         try family(w, "pool_free_tokens", "gauge", "Pool rows no stream or kept prompt holds.");
         try w.print("tensorfold_health:pool_free_tokens {d}\n", .{n});
+    }
+    if (status.kept) |k| {
+        try family(w, "chats_continued", "counter", "Streams that continued a conversation without resuming from its own turn state (a rewind, or it was dropped).");
+        try w.print("tensorfold_health:chats_continued {d}\n", .{k.chats_continued});
+        try family(w, "chats_continued_prefill_tokens", "counter", "Prompt tokens those streams prefilled.");
+        try w.print("tensorfold_health:chats_continued_prefill_tokens {d}\n", .{k.chats_continued_prefill_tokens});
     }
 }
 

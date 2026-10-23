@@ -462,6 +462,28 @@ test "/metrics carries /health's figures as tensorfold_health: families (0045)" 
         try std.testing.expect(std.mem.indexOf(u8, reply.body, want) != null);
 }
 
+test "/health and /metrics count the requests that continued a conversation and their prefill, with a prompt cache (0111)" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var r: rig.Rig = .{};
+    try r.start(.{}, rig.default_config);
+    defer r.finish();
+    const none = try helper.exchangeMethod(r.srv, "GET", "/health", ""); // no prompt cache: no conversations to count
+    defer std.testing.allocator.free(none.body);
+    try std.testing.expect(std.mem.indexOf(u8, none.body, "chats_continued") == null);
+    r.backend.kept = .{ .prompts = 2, .chats_continued = 3, .chats_continued_prefill_tokens = 9000 };
+    const health = try helper.exchangeMethod(r.srv, "GET", "/health", "");
+    defer std.testing.allocator.free(health.body);
+    const h = (try json.parse(a, health.body)).ok;
+    try std.testing.expectEqual(@as(i64, 3), h.get("chats_continued").?.int64().?);
+    try std.testing.expectEqual(@as(i64, 9000), h.get("chats_continued_prefill_tokens").?.int64().?);
+    var out: std.Io.Writer.Allocating = .init(a); // the families /metrics appends (its whole body outgrows a test exchange on macOS)
+    try @import("glm_health.zig").metrics(r.srv, &out.writer);
+    for ([_][]const u8{ "# TYPE tensorfold_health:chats_continued counter", "tensorfold_health:chats_continued 3", "# TYPE tensorfold_health:chats_continued_prefill_tokens counter", "tensorfold_health:chats_continued_prefill_tokens 9000" }) |want|
+        try std.testing.expect(std.mem.indexOf(u8, out.written(), want) != null);
+}
+
 test "Anthropic Messages answers a full server with 429 and an overloaded_error body (cuda/http.py -> responses._send)" {
     var r: rig.Rig = .{};
     r.backend.lanes = 1;

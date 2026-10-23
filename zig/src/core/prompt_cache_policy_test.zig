@@ -480,3 +480,52 @@ test "the state a pass just kept is never the one its own caps drop, and a state
     try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
     try std.testing.expectEqual(@as(u32, 52), s.entries.items[0].at);
 }
+
+test "a request resuming a state read back from disk continues its conversation while one of its own turns is kept (0111)" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var d: Disky = .{ .f = .{ .gpa = gpa } };
+    var s = diskStore(&d, .{ .recipe = true, .entries = 1, .spill = true });
+    defer s.deinit();
+    var bufs: [4][96]u32 = undefined;
+    const j1, _ = try d.f.hosted(&s, a, line(&bufs[0], 1, 13), 12, &.{}); // the conversation's first prompt: 13 tokens
+    const j2, _ = try d.f.hosted(&s, a, line(&bufs[1], 1, 53), 52, &.{}); // resumes 12, keeps 52
+    try std.testing.expectEqual(@as(u32, 1), s.flush(std.time.ns_per_s)); // 52 on disk too
+    const j3, _ = try d.f.hosted(&s, a, line(&bufs[2], 1, 77), 76, &.{}); // keeps 76; the cap of one drops 52 from memory
+    try std.testing.expect(j2.chat == j1.chat and j3.chat == j1.chat);
+    try std.testing.expectEqual(@as(usize, 1), s.entries.items.len);
+    const back = line(&bufs[3], 1, 61); // back into turn 2: 52 is read back, and the conversation is the same
+    @memset(back[56..], 99);
+    const jb, const sum = try d.f.hosted(&s, a, back, 60, &.{});
+    try std.testing.expectEqual(fresh(back), sum);
+    try std.testing.expectEqual(@as(u64, 1), s.counts.restored);
+    try std.testing.expect(jb.continued and jb.chat == j1.chat and jb.source == .other);
+    try std.testing.expectEqual(@as(u32, 56), jb.back);
+    try std.testing.expectEqual(@as(u64, 61 - 52), s.counts.chats_continued_prefill_tokens);
+    var buf: [512]u8 = undefined;
+    try std.testing.expect(std.mem.indexOf(u8, pc.continuedLine(&buf, jb, 52, 61), "from a state that is not a turn's own (read back from disk)") != null);
+}
+
+test "a pass in its request's conversation (as the lane host keeps them, 0111): /health counts the cut in it" {
+    const gpa = std.testing.allocator;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var f: Fake = .{ .gpa = gpa };
+    var s = Store.init(gpa, f.snapshots(), .{ .planned = true, .grid = 4, .min_prompt = 0, .min_gap = 4 }, 1 << 20);
+    defer s.deinit();
+    s.policy = .{ .recipe = true, .entries = 8, .shared_least = 8 };
+    var b1: [64]u32 = undefined;
+    const p1 = line(&b1, 1, 37);
+    const plan = try s.begin(a, p1, 36, &.{16}, &.{}, null, &.{}); // the system block ends at 16
+    try std.testing.expectEqualSlices(u32, &.{ 16, 36 }, plan.marks);
+    _ = f.passIn(&s, p1, plan, s.join(p1, null, true).chat); // the cut and the turn, both in the request's conversation
+    const k = s.keptStats();
+    try std.testing.expectEqual(@as(u32, 1), k.own);
+    try std.testing.expectEqual(@as(u32, 1), k.shared);
+    try std.testing.expectEqual(@as(u32, 1), k.chats);
+    try std.testing.expectEqual(@as(u8, 1), k.by_chat_n);
+    try std.testing.expectEqual([3]u64{ 1, 2, 36 }, k.by_chat[0]);
+}

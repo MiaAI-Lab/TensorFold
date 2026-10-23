@@ -189,6 +189,11 @@ pub const Fake = struct {
 
     /// A prompt pass from `plan.from`, keeping at each mark; returns the sum a fresh pass would give.
     pub fn pass(f: *Fake, s: *Store, prompt: []const u32, plan: Plan) u64 {
+        return f.passIn(s, prompt, plan, 0);
+    }
+
+    /// `pass`, its states kept in conversation `chat` (0: the store finds it).
+    pub fn passIn(f: *Fake, s: *Store, prompt: []const u32, plan: Plan, chat: u32) u64 {
         if (plan.from == 0) f.* = .{ .gpa = f.gpa, .fail_save = f.fail_save, .fail_restore = f.fail_restore, .fail_write = f.fail_write, .writes = f.writes, .live = f.live, .spare_bytes = f.spare_bytes, .peer = f.peer };
         if (f.peer) |p| p.in_pass = true;
         defer if (f.peer) |p| {
@@ -199,10 +204,26 @@ pub const Fake = struct {
             f.sum = f.sum *% 31 +% t;
             f.at += 1;
             if (mi < plan.marks.len and plan.marks[mi] == f.at) {
-                _ = s.keep(prompt, f.at, null, &.{}, &.{});
+                _ = s.keepIn(prompt, f.at, null, &.{}, &.{}, chat);
                 mi += 1;
             }
         }
         return f.sum;
+    }
+
+    /// A request as the lane host runs one: looked up, its conversation joined (drafted), the state restored, the pass
+    /// from it keeping in that conversation, then counted. Its conversation, and the sum a fresh pass would give.
+    pub fn hosted(f: *Fake, s: *Store, a: Allocator, prompt: []const u32, history: u32, shared: []const u32) !struct { pc.Join, u64 } {
+        const l = try s.lookupRewind(a, prompt, history, 0, shared, &.{}, &.{});
+        const j = s.join(prompt, l.entry, true);
+        var from: u32 = 0;
+        if (l.entry) |e| {
+            try restoreFn(f, null, e.saved);
+            s.resumed(e, prompt, true);
+            from = e.at;
+        }
+        const sum = f.passIn(s, prompt, .{ .from = from, .marks = l.marks }, j.chat);
+        s.continued(j, from, prompt.len);
+        return .{ j, sum };
     }
 };

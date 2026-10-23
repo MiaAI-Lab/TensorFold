@@ -27,6 +27,7 @@ pub const Script = struct {
     structures: bool = false, // the engine says it enforces grammars
     structure: ?api.Structure = null, // the last request's grammar (its text copied: the request's arena goes)
     submits: u32 = 0,
+    kept: ?api.prompt_cache.KeptStats = null, // the prompt cache's numbers its status reports (null: no cache)
     /// Called before each round with its index (a test sleeps or reads the server there).
     before_round: ?*const fn (n: usize) void = null,
 
@@ -63,8 +64,9 @@ pub const Script = struct {
 
     fn cancel(_: *anyopaque, _: api.Id) void {}
 
-    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
-        out.* = .{};
+    fn status(ctx: *anyopaque, out: *api.Status, _: []u32) void {
+        const e: *Script = @ptrCast(@alignCast(ctx));
+        out.* = .{ .kept = e.kept };
     }
 
     fn memory(_: *anyopaque, _: bool) ?api.Memory {

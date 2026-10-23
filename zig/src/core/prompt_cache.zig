@@ -147,6 +147,9 @@ pub const KeptStats = struct {
     misses: u64 = 0,
     evicted: u64 = 0,
     restored: u64 = 0,
+    /// Requests that continued a conversation without resuming its own turn state (0111), and what they prefilled.
+    chats_continued: u64 = 0,
+    chats_continued_prefill_tokens: u64 = 0,
 };
 
 pub const Entry = struct {
@@ -159,12 +162,32 @@ pub const Entry = struct {
     used: u64, // the store's clock at its last keep or resume
     last: []u32, // the last prompt that kept or resumed it
     shared: bool = false, // kept at a shared system block's cut: other conversations resume it, so its own never supersedes it
-    chat: u32 = 0, // the conversation (Policy): the state it resumed from, else a new one
+    chat: u32 = 0, // the conversation (Policy): its request's (`Store.join`), else the state it extends (`chatOf`)
     own: bool = true, // a conversation's own state, not a shared cut
     spilled: bool = false, // the family stored it on disk already (an early write)
 };
 
-pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0 };
+pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0, chats_continued: u64 = 0, chats_continued_prefill_tokens: u64 = 0 };
+
+/// A later prompt continues a conversation when it repeats that conversation's first prompt and this many tokens of the
+/// reply to it (0111): ids no other conversation wrote.
+pub const chat_match: u32 = 32;
+/// A continued request that prefills this many tokens or more is logged.
+pub const chat_log_tokens: u32 = 4096;
+
+/// The conversation a request's kept states join (`Store.join`), and whether it continues one without resuming that
+/// conversation's own turn state (0111's counted case).
+pub const Join = struct {
+    chat: u32 = 0, // 0: none named (a keep takes the conversation of the state it extends)
+    continued: bool = false,
+    /// The matched state's tokens, and where the prompt left them: `back < prior_len` is a rewind before that state.
+    prior_len: u32 = 0,
+    back: u32 = 0,
+    /// What the lookup resumed from.
+    source: Source = .nothing,
+
+    pub const Source = enum { nothing, shared, other };
+};
 
 /// Where a prompt pass starts and where it stops to keep its state (marks sorted, in `a`).
 pub const Plan = struct { from: u32 = 0, marks: []const u32 = &.{} };
@@ -189,6 +212,7 @@ pub const Store = struct {
     active_rewind_at: u32 = 0, // the last lookup's rewind state (0: none); hosts keep a pass's states before the next lookup
     policy: Policy = .{},
     next_chat: u32 = 1,
+    roots: std.AutoHashMapUnmanaged(u32, u32) = .empty, // each conversation's first prompt length (continuedChat)
 
     const SHARED_KEYS = 64;
 
@@ -200,6 +224,7 @@ pub const Store = struct {
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
         s.shared_keys.deinit(s.gpa);
+        s.roots.deinit(s.gpa);
         s.held = 0;
     }
 
@@ -473,6 +498,11 @@ pub const Store = struct {
 
     /// Keep the state at `at` with its span prefix, evicting within the budget; `starts` are a learned cut's chunks.
     pub fn keep(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span) bool {
+        return s.keepIn(prompt, at, owner, starts, spans, 0);
+    }
+
+    /// `keep` in conversation `chat` (its request's, `join`; 0: the conversation of the state it extends, `chatOf`).
+    pub fn keepIn(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span, chat_in: u32) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
@@ -504,7 +534,7 @@ pub const Store = struct {
             s.counts.evicted += 1;
         }
         if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
-        const chat = s.chatOf(prompt, at);
+        const chat = if (chat_in != 0) chat_in else s.chatOf(prompt, at);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
             s.gpa.destroy(e);
@@ -581,7 +611,7 @@ pub const Store = struct {
             s.counts.evicted += 1;
         }
         const e = s.gpa.create(Entry) catch return have;
-        e.* = .{ .tokens = &.{}, .at = hit.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .own = false, .spilled = true, .chat = s.freshChat() };
+        e.* = .{ .tokens = &.{}, .at = hit.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .own = false, .spilled = true, .chat = s.newChat(prompt.len) };
         e.tokens = s.gpa.dupe(u32, hit.tokens) catch return s.drop(e, have, false);
         e.last = s.gpa.dupe(u32, prompt) catch return s.drop(e, have, false);
         e.saved = load(s.family.ptr, hit.key, hit.at) catch |err| {
@@ -699,13 +729,18 @@ pub const Store = struct {
         return shorter orelse oldest;
     }
 
-    fn freshChat(s: *Store) u32 {
-        defer s.next_chat += 1;
-        return s.next_chat;
+    /// A new conversation whose first prompt is `root` tokens long (`continuedChat` matches past it).
+    fn newChat(s: *Store, root: usize) u32 {
+        const chat = s.next_chat;
+        s.next_chat += 1;
+        s.roots.put(s.gpa, chat, @intCast(root)) catch {};
+        if (s.roots.count() > 4 * @max(16, s.entries.items.len, s.policy.entries)) s.pruneRoots(chat); // conversations no kept state is in
+        return chat;
     }
 
-    /// The conversation a state kept for `prompt` at `at` belongs to: the longest kept state this prompt extends (the one
-    /// it resumed from, or an earlier mark of this pass), else a new one.
+    /// The conversation a state kept for `prompt` at `at` belongs to when its request named none: the longest kept
+    /// state this prompt extends (the one it resumed from, or an earlier mark of this pass) that is not a shared cut,
+    /// which is every conversation's; else a new one.
     fn chatOf(s: *Store, prompt: []const u32, at: u32) u32 {
         var best: ?*Entry = null;
         for (s.entries.items) |e| {
@@ -714,8 +749,71 @@ pub const Store = struct {
             if (std.mem.eql(u32, prompt[0..e.tokens.len], e.tokens)) best = e;
         }
         if (best) |b| return b.chat;
-        defer s.next_chat += 1;
-        return s.next_chat;
+        return s.newChat(prompt.len);
+    }
+
+    /// The conversation a request's kept states join, decided at its lookup (`hit`: the state it resumes, null: none).
+    /// A hit on a conversation's own turn state keeps that conversation; otherwise (a shared cut, a state read back
+    /// from disk, nothing) the conversation the prompt continues (`continuedChat`; `matchable`: drafted, as the recipe
+    /// requires), counted at its prefill (`continued`); else a new one. Deterministic in the states' use order.
+    pub fn join(s: *Store, prompt: []const u32, hit: ?*const Entry, matchable: bool) Join {
+        const source: Join.Source = if (hit) |e| (if (e.shared) .shared else .other) else .nothing;
+        if (hit) |e| if (ownTurn(e)) return .{ .chat = e.chat, .source = .other };
+        if (matchable) if (s.continuedChat(prompt)) |c| return .{
+            .chat = c.chat,
+            .continued = true,
+            .prior_len = @intCast(c.tokens.len),
+            .back = @intCast(commonPrefix(c.tokens, prompt)),
+            .source = source,
+        };
+        return .{ .chat = s.newChat(prompt.len), .source = source };
+    }
+
+    /// One of a conversation's own turn states: not a shared cut, nor a state read back from disk (no conversation's).
+    /// Its tokens are that conversation's, so a hit on it is the evidence.
+    fn ownTurn(e: *const Entry) bool {
+        return e.own and !e.shared and e.chat != 0;
+    }
+
+    /// The own kept state whose conversation `prompt` continues (continued_chat): its tokens repeat the prompt through
+    /// its conversation's first prompt and chat_match tokens of the reply to it. The most recently used first, a later
+    /// entry winning a tie; a conversation whose first prompt was forgotten is passed over.
+    pub fn continuedChat(s: *const Store, prompt: []const u32) ?*Entry {
+        var best: ?*Entry = null;
+        for (s.entries.items) |c| {
+            if (!ownTurn(c)) continue;
+            const root = s.roots.get(c.chat) orelse continue;
+            const n = @as(usize, root) + chat_match;
+            if (c.tokens.len < n or prompt.len < n or c.tokens[n - 1] != prompt[n - 1] or !std.mem.eql(u32, c.tokens[0..n], prompt[0..n])) continue;
+            if (best == null or c.used >= best.?.used) best = c;
+        }
+        return best;
+    }
+
+    /// The first prompt lengths of conversations no kept state is in, forgotten (never `keep_`'s).
+    fn pruneRoots(s: *Store, keep_: u32) void {
+        var gone: std.ArrayList(u32) = .empty;
+        defer gone.deinit(s.gpa);
+        var it = s.roots.keyIterator();
+        while (it.next()) |k| {
+            if (k.* == keep_) continue;
+            const held = for (s.entries.items) |e| {
+                if (e.chat == k.*) break true;
+            } else false;
+            if (!held) gone.append(s.gpa, k.*) catch return;
+        }
+        for (gone.items) |k| _ = s.roots.remove(k);
+    }
+
+    /// After a request's prompt pass resumed at `cut` of `len` tokens: one that continued its conversation is counted,
+    /// and a large prefill logged with where the prompt left the kept state and what it resumed from.
+    pub fn continued(s: *Store, j: Join, cut: u32, len: usize) void {
+        if (!j.continued) return;
+        s.counts.chats_continued += 1;
+        s.counts.chats_continued_prefill_tokens += len -| cut;
+        if (!shouldLog(j, cut, len) or @import("builtin").is_test) return;
+        var buf: [512]u8 = undefined;
+        std.log.info("{s}", .{continuedLine(&buf, j, cut, len)});
     }
 
     /// The caps after a state is kept (multi.py `_keep`): the conversation's own states, then the entry count, then the bytes.
@@ -785,6 +883,7 @@ pub const Store = struct {
             }
         }.lt);
         k.hits, k.misses, k.evicted, k.restored = .{ s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.restored };
+        k.chats_continued, k.chats_continued_prefill_tokens = .{ s.counts.chats_continued, s.counts.chats_continued_prefill_tokens };
         if (s.policy.spill) if (s.family.vtable.spill_stats) |f| {
             k.spill_on = true;
             f(s.family.ptr, &k.spill);
@@ -813,6 +912,31 @@ pub fn note(comptime fmt: []const u8, args: anytype) void {
     std.log.warn("prompt cache: " ++ fmt, args);
 }
 
+/// Whether `Store.continued` logs a continued request's pass from `cut` of `len` tokens: its prefill is large.
+pub fn shouldLog(j: Join, cut: u32, len: usize) bool {
+    return j.continued and len -| cut >= chat_log_tokens;
+}
+
+/// `Store.continued`'s log line, in `buf`.
+pub fn continuedLine(buf: []u8, j: Join, cut: u32, len: usize) []const u8 {
+    const source = switch (j.source) {
+        .nothing => "nothing",
+        .shared => "a shared prefix",
+        .other => "a state that is not a turn's own (read back from disk)",
+    };
+    var why_buf: [256]u8 = undefined;
+    const why = (if (j.back < j.prior_len)
+        std.fmt.bufPrint(&why_buf, "it went back to token {d}, before that conversation's newest kept state ({d} tokens)", .{ j.back, j.prior_len })
+    else
+        std.fmt.bufPrint(&why_buf, "its kept state of {d} tokens could not serve it (off the request's chunks or decoded rows, or a longer state served)", .{j.prior_len})) catch "";
+    return std.fmt.bufPrint(buf, "prompt cache: conversation {d}: resumed at {d} of {d} tokens from {s}, prefilling {d}; {s}", .{ j.chat, cut, len, source, len -| cut, why }) catch buf[0..0];
+}
+
+/// The tokens two id lists share from the start.
+pub fn commonPrefix(a: []const u32, b: []const u32) usize {
+    return std.mem.indexOfDiff(u32, a, b) orelse @min(a.len, b.len);
+}
+
 /// The chunk start at or before `at` (0 when none).
 fn floorStart(starts: []const u32, at: u32) u32 {
     var best: u32 = 0;
@@ -826,6 +950,7 @@ test {
     _ = @import("prompt_cache_test.zig");
     _ = @import("prompt_cache_rewind_test.zig");
     _ = @import("prompt_cache_policy_test.zig");
+    _ = @import("prompt_cache_chat_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = modes;
 }
