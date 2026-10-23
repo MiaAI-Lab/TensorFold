@@ -5,6 +5,7 @@
 const std = @import("std");
 const lanes = @import("lanes");
 const decode = @import("flashnext").decode;
+const shard = @import("cuda_shard.zig");
 
 const be = lanes.backend;
 
@@ -31,7 +32,9 @@ const ring = 1024;
 pub const Gate = @import("flashnext").lane_backend.Gate;
 pub const Notes = @import("flashnext").lane_backend.Notes;
 
-pub const Note = enum(u8) { pass = 1, drop = 2, spill = 3, load = 4, _ };
+/// `place`: TF_GLM_KV_SHARD's record of where rank 0 placed a stream's extent (cuda_shard.Placement), checked on rank 1;
+/// `layout`: TF_GLM_KV_SHARD_CHECK's digest of rank 0's whole pool every that many decode rounds, compared on rank 1.
+pub const Note = enum(u8) { pass = 1, drop = 2, spill = 3, load = 4, place = 5, layout = 6, _ };
 
 /// The prompt cache's family calls (core/prompt_cache.zig Snapshots.VTable, same signatures) and its budget:
 /// native/cuda.zig makes the Store from them (this module cannot import the engine API's types).
@@ -238,6 +241,7 @@ pub fn Lanes(comptime E: type) type {
                 self.dropLane(s, l);
                 return err;
             };
+            self.placed(l);
             const requested = s.reuse.at > 0;
             var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
             if (requested) {
@@ -419,6 +423,7 @@ pub fn Lanes(comptime E: type) type {
                 self.dropLane(s, l);
                 return err;
             };
+            self.placed(l);
             // a resume both ranks can make (each holds the state), else both prefill from the start
             const requested = s.reuse.at > 0;
             var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
@@ -458,6 +463,7 @@ pub fn Lanes(comptime E: type) type {
                 for (ss[0..made], ls[0..made]) |s, l| self.dropLane(s, l);
                 return error.BurstRefused;
             };
+            for (ls[0..made]) |l| self.placed(l);
             for (ss) |s| {
                 s.cached = 0;
                 s.reuse_failed = false;
@@ -643,6 +649,31 @@ pub fn Lanes(comptime E: type) type {
             return null;
         }
 
+        /// TF_GLM_KV_SHARD, rank 0: where the lane's new extent lies, to rank 1 with the next calls (`.place`). Rank 1
+        /// placed it from the same calls itself; both ranks hold it once they agreed, until the stream's release.
+        fn placed(self: *Self, l: *const Lane) void {
+            if (comptime !@hasDecl(E, "placement")) return;
+            const n = self.notes orelse return;
+            const p = self.e.placement(l.seq) orelse return;
+            var buf: [1 + shard.Placement.bytes]u8 = undefined;
+            buf[0] = @backingInt(Note.place);
+            p.encode(buf[1..]);
+            n.send(n.ptr, &buf);
+        }
+
+        /// TF_GLM_KV_SHARD_CHECK, rank 0, at a decode round's end: every that many rounds its pool's layout digest to
+        /// rank 1 (`.layout`), which compares its own after the same round. A drift between placements (a release, a
+        /// twin) is caught within those rounds, not only at the next placement.
+        fn layoutNote(self: *Self) void {
+            if (comptime !@hasDecl(E, "roundDigest")) return;
+            const n = self.notes orelse return;
+            const d = self.e.roundDigest(self.round) orelse return;
+            var buf: [9]u8 = undefined;
+            buf[0] = @backingInt(Note.layout);
+            std.mem.writeInt(u64, buf[1..9], d, .little);
+            n.send(n.ptr, &buf);
+        }
+
         /// Both ranks' answer to a yes/no both must share (one rank: its own).
         fn agreeOn(self: *Self, ok: bool) !bool {
             const g = self.gate orelse return ok;
@@ -806,6 +837,15 @@ pub fn Lanes(comptime E: type) type {
                     if (self.spill_wait.items.len >= 64) _ = self.spill_wait.orderedRemove(0);
                     try self.spill_wait.append(self.gpa, key);
                 },
+                .place => {
+                    if (comptime !@hasDecl(E, "checkPlacement")) return error.BadNote;
+                    try self.e.checkPlacement(try shard.Placement.decode(bytes[1..]));
+                },
+                .layout => {
+                    if (comptime !@hasDecl(E, "checkDigest")) return error.BadNote;
+                    if (bytes.len != 9) return error.BadNote;
+                    try self.e.checkDigest(std.mem.readInt(u64, bytes[1..9], .little));
+                },
                 .load => {
                     if (bytes.len != 21) return error.BadNote;
                     if (comptime !@hasDecl(E, "spillOut")) return;
@@ -948,6 +988,7 @@ pub fn Lanes(comptime E: type) type {
                 l.round = self.round;
                 self.opened.append(self.gpa, l) catch |err| return self.lost("a window's bookkeeping", err);
             }
+            self.layoutNote();
         }
 
         /// The windows' checks and rows, the last round committed.
@@ -1314,10 +1355,10 @@ test "GLM lane backend interleaves eight streams and preserves serial keyed outp
 
 /// An engine whose sequence is its tokens and whose kept state copies them (GLM's snapshot buffer): the first draw is a
 /// hash of every token, so a resumed pass equals a fresh one exactly when the state restored whole. Its spill tier is a
-/// map in memory.
+/// map in memory. With a `pool` (TF_GLM_KV_SHARD's two parts) each sequence holds an extent placed as the engine's.
 const MiniEngine = struct {
     pub const snap_holds_rows = true;
-    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty };
+    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null };
     pub const Snap = struct { id: u64, pos: usize, mtp_len: usize = 0, tokens: []u32 };
     pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
@@ -1338,6 +1379,8 @@ const MiniEngine = struct {
     refuse_keep: bool = false, // prefillWith keeps nothing (a save refused after the agreement)
     refuse_keep_at: ?usize = null, // prefillWith keeps nothing at this mark only
     trace: std.ArrayList([2]usize) = .empty, // every prefillWith's rows: [begin, end)
+    pool: ?@import("cuda_pool.zig").Pool = null, // TF_GLM_KV_SHARD's parts (null: off)
+    check: u32 = 0, // TF_GLM_KV_SHARD_CHECK
 
     fn hash(tokens: []const u32) u32 {
         return @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(tokens)));
@@ -1351,13 +1394,19 @@ const MiniEngine = struct {
     pub fn keepFits(e: *const MiniEngine, _: u64) bool {
         return e.keep_fits;
     }
-    pub fn newSeq(e: *MiniEngine, _: usize) !*Seq {
+    pub fn newSeq(e: *MiniEngine, rows: usize) !*Seq {
         const s = try e.gpa.create(Seq);
         s.* = .{};
+        if (e.pool) |*p| {
+            errdefer e.gpa.destroy(s);
+            s.eid = (try p.alloc(rows)) orelse return error.NoPoolExtent;
+            (try p.get(s.eid.?)).owner = e.seqs;
+        }
         e.seqs += 1;
         return s;
     }
     pub fn freeSeq(e: *MiniEngine, s: *Seq) void {
+        if (e.pool) |*p| p.remove(s.eid.?) catch unreachable;
         s.tokens.deinit(e.gpa);
         e.gpa.destroy(s);
         e.seqs -= 1;
@@ -1399,6 +1448,22 @@ const MiniEngine = struct {
     pub fn commitWindow(_: *MiniEngine, _: usize, _: usize) !void {
         return error.NotUsed;
     }
+    pub fn placement(e: *MiniEngine, s: *const Seq) ?shard.Placement {
+        const p = if (e.pool) |*q| q else return null;
+        return shard.Placement.of(p, s.eid.?, e.check != 0) catch null;
+    }
+    pub fn checkPlacement(e: *MiniEngine, at: shard.Placement) !void {
+        const p = if (e.pool) |*q| q else return error.KvShardPlacement;
+        try at.verify(p);
+    }
+    pub fn roundDigest(e: *MiniEngine, round: u64) ?u64 {
+        const p = if (e.pool) |*q| q else return null;
+        return if ((shard.Switches{ .on = true, .check = e.check }).digestAt(round)) p.digest() else null;
+    }
+    pub fn checkDigest(e: *MiniEngine, digest: u64) !void {
+        const p = if (e.pool) |*q| q else return error.KvShardPlacement;
+        try shard.checkLayout(p, digest);
+    }
     pub fn current(_: *const MiniEngine) void {}
     pub fn spillOn(e: *const MiniEngine) bool {
         return e.spill_on;
@@ -1430,6 +1495,7 @@ const MiniEngine = struct {
         for (e.disk.items) |d| e.gpa.free(d.tokens);
         e.disk.deinit(e.gpa);
         e.trace.deinit(e.gpa);
+        if (e.pool) |*p| p.deinit();
     }
 };
 
@@ -1553,6 +1619,171 @@ test "kept states that hold their rows: a pass keeps at its marks, a later pass 
     try std.testing.expectEqual(@as(usize, 0), e1.snaps);
     try std.testing.expectEqual(@as(usize, 0), e0.seqs);
     try std.testing.expectEqual(@as(usize, 0), e1.seqs);
+}
+
+test "TF_GLM_KV_SHARD: rank 0's placements reach rank 1 with the calls; one of its own elsewhere ends the pair, and with the check any other layout does" {
+    const gpa = std.testing.allocator;
+    const Pool = @import("cuda_pool.zig").Pool;
+    const B = Lanes(MiniEngine);
+    for ([_]bool{ false, true }) |check| {
+        var e0: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = @intFromBool(check) };
+        defer e0.deinit();
+        var e1: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = @intFromBool(check) };
+        defer e1.deinit();
+        var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+        defer r0.deinit();
+        var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
+        defer r1.deinit();
+        r1.follower = true;
+        var sink: NoteSink = .{ .gpa = gpa };
+        defer sink.deinit();
+        r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
+        const prompt = testPrompt(7);
+        // 1. the same placements on both ranks: one note a stream, each checked
+        var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4 });
+        defer s1.deinit(gpa);
+        try B.prefillFn(&r0, &s1);
+        try B.prefillFn(&r1, &s1);
+        try std.testing.expectEqual(@as(usize, 1), sink.notes.items.len);
+        try std.testing.expectEqual(@as(u8, @backingInt(Note.place)), sink.notes.items[0][0]);
+        const at = try shard.Placement.decode(sink.notes.items[0][1..]);
+        try std.testing.expectEqual(@as(u64, 0), at.base);
+        try std.testing.expectEqual(check, at.digest != 0);
+        try sink.take(&r1);
+        // 2. rank 1's layout drifts (an extent of its own moved), a placement still alike: only the check sees it
+        const first = r1.lanes.get(&s1).?.seq.eid.?;
+        _ = try e1.pool.?.move(first, 4096, null, false);
+        var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = &prompt, .max_new = 4 });
+        defer s2.deinit(gpa);
+        try B.prefillFn(&r0, &s2);
+        try B.prefillFn(&r1, &s2);
+        try std.testing.expectEqual(@as(u64, 8192), (try shard.Placement.decode(sink.notes.items[0][1..])).base); // the part with fewer streams
+        if (check) try std.testing.expectError(error.KvShardPlacement, sink.take(&r1)) else try sink.take(&r1);
+        for (sink.notes.items) |n| gpa.free(n);
+        sink.notes.clearRetainingCapacity();
+        // 3. a placement of rank 1's own elsewhere (an extent rank 0 never made) is refused, checked or not
+        _ = try e1.pool.?.add(8192 + 4096, 2048);
+        var s3 = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = &prompt, .max_new = 4 });
+        defer s3.deinit(gpa);
+        try B.prefillFn(&r0, &s3);
+        try B.prefillFn(&r1, &s3);
+        try std.testing.expectError(error.KvShardPlacement, sink.take(&r1));
+        for (sink.notes.items) |n| gpa.free(n);
+        sink.notes.clearRetainingCapacity();
+        // the extent rank 1 made itself goes before the lanes release theirs
+        for (e1.pool.?.extents.items) |x| if (x.owner == null) {
+            try e1.pool.?.remove(x.eid);
+            break;
+        };
+    }
+    // off (no pool): no note at all, as before
+    var e0: MiniEngine = .{ .gpa = gpa };
+    defer e0.deinit();
+    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+    defer r0.deinit();
+    var sink: NoteSink = .{ .gpa = gpa };
+    defer sink.deinit();
+    r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
+    const prompt = testPrompt(7);
+    var s = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4 });
+    defer s.deinit(gpa);
+    try B.prefillFn(&r0, &s);
+    r0.round = shard.check_rounds;
+    r0.layoutNote();
+    try std.testing.expectEqual(@as(usize, 0), sink.notes.items.len);
+}
+
+test "TF_GLM_KV_SHARD: a prefill rank 0 refuses before its sequence leaves rank 1's extent ids one ahead, and the placements and digests still check" {
+    const gpa = std.testing.allocator;
+    const Pool = @import("cuda_pool.zig").Pool;
+    const B = Lanes(MiniEngine);
+    for ([_]u32{ 0, 1 }) |check| {
+        var e0: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = check };
+        defer e0.deinit();
+        var e1: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = check };
+        defer e1.deinit();
+        // rank 0 refuses a 150-token prompt before it opens a sequence (a check of its own, as the engine's
+        // NoVisionTower); rank 1 opens one, then drops it when the ranks agree on the refusal
+        var r0 = B.init(gpa, &e0, true, 100, 8);
+        defer r0.deinit();
+        var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
+        defer r1.deinit();
+        r1.follower = true;
+        var sink: NoteSink = .{ .gpa = gpa };
+        defer sink.deinit();
+        r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
+        var gate: TestGate = .{ .other = &.{ true, false, true, true, true, true } };
+        r0.gate = .{ .ptr = &gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
+        r1.gate = .{ .ptr = &gate, .agree = TestGate.agree, .fatal = TestGate.fatal };
+        const prompt = testPrompt(7);
+        var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4 });
+        defer s1.deinit(gpa);
+        try std.testing.expectError(error.PromptTooLong, B.prefillFn(&r0, &s1));
+        try std.testing.expectError(error.OtherRankFailed, B.prefillFn(&r1, &s1));
+        try std.testing.expectEqual(@as(u64, 0), e0.pool.?.next_id);
+        try std.testing.expectEqual(@as(u64, 1), e1.pool.?.next_id);
+        // the next prompts: the same extents at the same bases on both ranks, under other ids; each note checks
+        var s2 = try lanes.Stream.init(gpa, .{ .id = "b", .prompt = prompt[0..50], .max_new = 4 });
+        defer s2.deinit(gpa);
+        var s3 = try lanes.Stream.init(gpa, .{ .id = "c", .prompt = prompt[0..50], .max_new = 4 });
+        defer s3.deinit(gpa);
+        for ([_]*lanes.Stream{ &s2, &s3 }) |s| {
+            try B.prefillFn(&r0, s);
+            try B.prefillFn(&r1, s);
+            // rank 1 takes the note before its next call, as the mirror delivers it
+            try std.testing.expectEqual(@as(usize, 1), sink.notes.items.len);
+            try std.testing.expectEqual(check != 0, (try shard.Placement.decode(sink.notes.items[0][1..])).digest != 0);
+            try sink.take(&r1);
+        }
+        // a decode round's digest of the same layout under other ids
+        r0.round = 1;
+        r0.layoutNote();
+        try std.testing.expectEqual(@as(usize, @intFromBool(check != 0)), sink.notes.items.len);
+        try sink.take(&r1);
+    }
+}
+
+test "TF_GLM_KV_SHARD_CHECK: every that many decode rounds rank 0's layout digest reaches rank 1, which ends the pair on a drift; 0 sends none" {
+    const gpa = std.testing.allocator;
+    const Pool = @import("cuda_pool.zig").Pool;
+    const B = Lanes(MiniEngine);
+    for ([_]u32{ 0, 2 }) |check| {
+        var e0: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = check };
+        defer e0.deinit();
+        var e1: MiniEngine = .{ .gpa = gpa, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = check };
+        defer e1.deinit();
+        var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+        defer r0.deinit();
+        var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
+        defer r1.deinit();
+        r1.follower = true;
+        var sink: NoteSink = .{ .gpa = gpa };
+        defer sink.deinit();
+        r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
+        const prompt = testPrompt(7);
+        var s = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &prompt, .max_new = 4 });
+        defer s.deinit(gpa);
+        try B.prefillFn(&r0, &s);
+        try B.prefillFn(&r1, &s);
+        try sink.take(&r1);
+        // round 1: none; round 2: the digest, alike
+        r0.round = 1;
+        r0.layoutNote();
+        try std.testing.expectEqual(@as(usize, 0), sink.notes.items.len);
+        r0.round = 2;
+        r0.layoutNote();
+        try std.testing.expectEqual(@as(usize, @intFromBool(check != 0)), sink.notes.items.len);
+        if (check != 0) try std.testing.expectEqual(@as(u8, @backingInt(Note.layout)), sink.notes.items[0][0]);
+        try sink.take(&r1);
+        // rank 1 drifts between placements (its stream's extent elsewhere): the next digest ends the pair
+        _ = try e1.pool.?.move(r1.lanes.get(&s).?.seq.eid.?, 4096, null, false);
+        r0.round = 4;
+        r0.layoutNote();
+        if (check != 0) try std.testing.expectError(error.KvShardPlacement, sink.take(&r1)) else try std.testing.expectEqual(@as(usize, 0), sink.notes.items.len);
+        for (sink.notes.items) |n| gpa.free(n);
+        sink.notes.clearRetainingCapacity();
+        try std.testing.expectError(error.BadNote, r1.applyNote(&.{ @backingInt(Note.layout), 1, 2 }));
+    }
 }
 
 fn firstToken(comptime B: type, r: *B, s: *lanes.Stream) !u32 {

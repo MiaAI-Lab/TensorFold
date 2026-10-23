@@ -166,6 +166,7 @@ pub const Metrics = struct {
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
         if (status.cache) |c| try cacheFamilies(w, c);
+        if (status.kv_parts) |k| try kvPartFamilies(w, k);
     }
 };
 
@@ -185,6 +186,30 @@ pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
             try family(w, "spill_" ++ name, comptime kindOf(&T.gauges, name), @field(T.help, name));
             for (rc.slice(), 0..) |t, r| try w.print("{s}spill_{s}{{rank=\"{d}\"}} {d}\n", .{ prefix, name, r, @field(t, name) });
         }
+    }
+}
+
+/// KV ownership's counters (a backend that shards its pool: tensorfold:kv_shard_*), then every part's rows
+/// (tensorfold:kv_shard_part_*{part="N"}, gauges), then every reporting rank's own counters
+/// (tensorfold:kv_shard_rank_*{rank="N"}, counters; none when no rank reported).
+pub fn kvPartFamilies(w: *std.Io.Writer, k: api.KvParts) !void {
+    const H = api.KvParts.help;
+    const info = @typeInfo(api.KvParts).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| if (T == u64) {
+        try gauge(w, "kv_shard_" ++ name, comptime kindOf(&api.KvParts.gauges, name), @field(H, name), @field(k, name));
+    };
+    const P = @TypeOf(k.part[0]);
+    const n: usize = @intCast(@min(k.parts, k.part.len));
+    inline for (@typeInfo(P).@"struct".field_names) |name| {
+        try family(w, "kv_shard_part_" ++ name, "gauge", @field(P.help, name));
+        for (k.part[0..n], 0..) |p, i| try w.print("{s}kv_shard_part_{s}{{part=\"{d}\"}} {d}\n", .{ prefix, name, i, @field(p, name) });
+    }
+    const nr: usize = @intCast(@min(k.ranks, k.rank.len));
+    if (nr == 0) return;
+    const R = @TypeOf(k.rank[0]);
+    inline for (@typeInfo(R).@"struct".field_names) |name| {
+        try family(w, "kv_shard_rank_" ++ name, "counter", @field(R.help, name));
+        for (k.rank[0..nr], 0..) |r, i| try w.print("{s}kv_shard_rank_{s}{{rank=\"{d}\"}} {d}\n", .{ prefix, name, i, @field(r, name) });
     }
 }
 
@@ -422,4 +447,50 @@ test "cache families: present only with the v2 tier's counters, every field with
         "tensorfold:spill_crc_errors{rank=\"1\"} 1\n",
         "# TYPE tensorfold:spill_staging_peak gauge\n",
     }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+}
+
+test "kv shard families: present only with a sharded backend's stats, its counters and every part's rows" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var plain: std.Io.Writer.Allocating = .init(gpa);
+    defer plain.deinit();
+    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "kv_shard") == null);
+    var k: api.KvParts = .{ .parts = 2, .part_rows = 1048576, .carries = 3, .moved_bytes = 720 };
+    k.part[0] = .{ .free = 10, .live = 1 };
+    k.part[1] = .{ .free = 20, .twin_rows = 4096 };
+    stub.status_value.kv_parts = k;
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "# TYPE tensorfold:kv_shard_parts gauge\n",
+        "tensorfold:kv_shard_parts 2\n",
+        "# TYPE tensorfold:kv_shard_carries counter\n",
+        "tensorfold:kv_shard_carries 3\n",
+        "tensorfold:kv_shard_moved_bytes 720\n",
+        "# TYPE tensorfold:kv_shard_part_free gauge\n",
+        "tensorfold:kv_shard_part_free{part=\"0\"} 10\n",
+        "tensorfold:kv_shard_part_free{part=\"1\"} 20\n",
+        "tensorfold:kv_shard_part_twin_rows{part=\"1\"} 4096\n",
+        "tensorfold:kv_shard_part_live{part=\"0\"} 1\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "part=\"2\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "tensorfold:kv_shard_rank_") == null); // (no rank reported; the ranks gauge's help names the family)
+    // every rank's own counters, labelled by rank
+    k.ranks = 2;
+    k.rank[1] = .{ .owner_rounds = 7, .copy_bytes = 4096 };
+    stub.status_value.kv_parts = k;
+    var out2: std.Io.Writer.Allocating = .init(gpa);
+    defer out2.deinit();
+    try m.render(std.testing.io, &out2.writer, stub.engine(), 4096);
+    for ([_][]const u8{
+        "tensorfold:kv_shard_ranks 2\n",
+        "# TYPE tensorfold:kv_shard_rank_owner_rounds counter\n",
+        "tensorfold:kv_shard_rank_owner_rounds{rank=\"0\"} 0\n",
+        "tensorfold:kv_shard_rank_owner_rounds{rank=\"1\"} 7\n",
+        "tensorfold:kv_shard_rank_copy_bytes{rank=\"1\"} 4096\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, out2.written(), line) != null);
 }

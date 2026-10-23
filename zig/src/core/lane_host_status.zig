@@ -30,6 +30,7 @@ pub fn read(ctx: *anyopaque, out: *api.Status, stream_tokens: []u32) void {
         .generation_tokens = h.live_generated,
         .kept = h.kept_view,
         .cache = h.tele,
+        .kv_parts = h.kv_tele,
     };
     if (h.extra_status) |source| source.read(source.ctx, out);
 }
@@ -58,10 +59,15 @@ pub fn noteDecoded(h: *LaneHost, n: usize) void {
     h.decoded.append(h.gpa, .{ .at = now, .tokens = n }) catch {};
 }
 
-/// Each started stream's context and generated tokens, and with a tier the cache's counters (read here, on the engine
-/// thread, before the lock), for the next status read.
+/// Each started stream's context and generated tokens, with a tier the cache's counters, and the backend's
+/// KV-ownership stats (both read here, on the engine thread, before the lock), for the next status read.
 pub fn noteLive(h: *LaneHost) void {
     const tele = if (h.tele != null) cacheStats(h) else null;
+    var parts: ?api.KvParts = null;
+    if (h.kv_parts) |src| {
+        parts = .{};
+        src.read(src.ctx, &parts.?);
+    }
     h.mutex.lockUncancelable(h.io);
     defer h.mutex.unlock(h.io);
     h.live_tokens.clearRetainingCapacity();
@@ -71,6 +77,7 @@ pub fn noteLive(h: *LaneHost) void {
         h.live_generated += @intCast(job.stream.emitted().len);
     };
     if (tele) |t| h.tele = t;
+    if (parts) |p| h.kv_tele = p;
 }
 
 /// The prompt cache's counters with its tier, the store's and the host's (engine thread).

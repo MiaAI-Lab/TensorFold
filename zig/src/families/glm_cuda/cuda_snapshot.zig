@@ -95,6 +95,8 @@ pub fn sections(g: G, at: usize, ring: usize, draft_bytes: usize) Sections {
 
 /// Copy a sequence's state out of its live caches into `buf` (a device buffer of `s.total` bytes).
 pub fn save(c: Copier, g: G, s: Sections, buf: u64, st: *const state.State, draft: ?Draft) !void {
+    // TF_GLM_KV_SHARD: the other rank's extent has no latent rows here (a sharded state: owner rows only, round 3)
+    if (!st.cache.hasLatent()) return error.NoLatentRows;
     for (0..G.dsa_layers) |i| {
         try c.go(buf + s.latent + i * s.latentBytes(), st.cache.latent[i], s.latentBytes());
         try c.go(buf + s.pooled + i * s.pooledBytes(), st.cache.pooled[i], s.pooledBytes());
@@ -110,6 +112,8 @@ pub fn save(c: Copier, g: G, s: Sections, buf: u64, st: *const state.State, draf
 
 /// Put a saved state into a sequence's caches. The recurrent states go to the parity each layer holds now.
 pub fn restore(c: Copier, g: G, s: Sections, buf: u64, st: *const state.State, draft: ?Draft) !void {
+    // TF_GLM_KV_SHARD: the other rank's extent has no latent rows here (a sharded state: owner rows only, round 3)
+    if (!st.cache.hasLatent()) return error.NoLatentRows;
     for (0..G.dsa_layers) |i| {
         try c.go(st.cache.latent[i], buf + s.latent + i * s.latentBytes(), s.latentBytes());
         try c.go(st.cache.pooled[i], buf + s.pooled + i * s.pooledBytes(), s.pooledBytes());
@@ -282,6 +286,27 @@ test "a saved state restores the rows, rings, recurrent parity and drafter ring 
         try std.testing.expectEqualSlices(u8, a.kc[i][(h * a.cap + 16) * 256 ..][0 .. 16 * 256], b.kc[i][(h * b.cap) * 256 ..][0 .. 16 * 256]);
         try std.testing.expectEqualSlices(u8, a.vc[i][(h * a.cap + 16) * 256 ..][0 .. 16 * 256], b.vc[i][(h * b.cap) * 256 ..][0 .. 16 * 256]);
     };
+}
+
+test "TF_GLM_KV_SHARD: a state whose view has no latent rows on this rank (the other rank's extent) is neither saved nor restored, before any copy" {
+    const gpa = std.testing.allocator;
+    var a = try Fake.init(gpa, 256, 64, 0);
+    defer a.deinit();
+    a.st.cache.owner = false;
+    a.st.cache.latent = @splat(state.no_latent);
+    const Count = struct {
+        n: usize = 0,
+        fn copy(ptr: *anyopaque, _: u64, _: u64, _: usize) anyerror!void {
+            const c: *@This() = @ptrCast(@alignCast(ptr));
+            c.n += 1;
+        }
+    };
+    var count: Count = .{};
+    const c: Copier = .{ .ptr = &count, .copy = Count.copy };
+    const s = sections(a.g, 192, 64, 0);
+    try std.testing.expectError(error.NoLatentRows, save(c, a.g, s, 0x1000, &a.st, null));
+    try std.testing.expectError(error.NoLatentRows, restore(c, a.g, s, 0x1000, &a.st, null));
+    try std.testing.expectEqual(@as(usize, 0), count.n);
 }
 
 test "section sizes follow the geometry and stay 256-aligned" {

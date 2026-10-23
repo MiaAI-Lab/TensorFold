@@ -2,6 +2,7 @@
 //! TensorFold by Ash Hart and contributors; MiaAI-Lab recipe MEMORY_RESERVE_GIB / KV_POOL_GIB.
 //! Uses live allocation room after Zig's fixed arenas and drafter are installed, rather than Python estimates.
 const std = @import("std");
+const shard = @import("cuda_shard.zig");
 const cuda = @import("cuda");
 const display = @import("cuda_display_kv.zig");
 const pool = @import("cuda_pool.zig");
@@ -80,6 +81,16 @@ pub fn rows(capacity: usize, spare: usize, display_bytes: usize, per_token: usiz
     if (result < pool.alignment) return error.BadPool;
     return result;
 }
+/// TF_GLM_KV_SHARD's pool in the memory the agreed unsharded pool takes: shard.budget's rows (it counts the DSA planes
+/// alone), whole parts off while the sharded layout (`cost.sharded(rows)`: the caches and the decode scratch) takes
+/// more than the unsharded one (`cost.plain(unsharded)`), then the longest request a part holds (shard.fit). Every
+/// rank gets the same numbers from the same agreed pool.
+pub fn sharded(unsharded: usize, context: usize, window: usize, cost: anytype) !shard.Plan {
+    var n = shard.budget(unsharded, 2, shard.trash);
+    const have = cost.plain(unsharded);
+    while (n > 0 and cost.sharded(n) > have) n -= 2 * pool.alignment;
+    return shard.fit(n, context, window, 2);
+}
 test "pool reserve, host counts, cap and display credit use integer extent arithmetic" {
     const g = 1 << 30;
     try std.testing.expectEqual(@as(usize, 145 * g / 10), try reserve("14.5", 120 * g, true));
@@ -91,4 +102,33 @@ test "pool reserve, host counts, cap and display credit use integer extent arith
     try std.testing.expectEqual(@as(usize, 4096), try rows(4096, 0, 0, 6204));
     try std.testing.expectEqual(@as(usize, 6144), try rows(4096, 6204 * 2048, 0, 6204));
     try std.testing.expectEqual(@as(usize, 6144), try rows(4096, 0, 6204 * 2048, 6204));
+}
+test "the sharded pool fits the unsharded pool's memory, its scratch counted, in whole parts" {
+    // the DSA planes as cuda_state lays them, and a decode scratch growing past a bucket (decodeScratchRows' shape)
+    const Cost = struct {
+        fn scratch(n: usize) usize {
+            return 64 * @max(n, 1 << 20);
+        }
+        fn plain(_: @This(), n: usize) usize {
+            return 11 * (n * 528 + (n / 4 + 2) * 144) + scratch(n);
+        }
+        fn sharded(_: @This(), n: usize) usize {
+            return 11 * ((n / 2 + shard.trash) * 528 + (n / 4 + 2) * 144) + scratch(n);
+        }
+    };
+    const c: Cost = .{};
+    for ([_]usize{ 1 << 20, 3 << 20, 5 << 20 }) |unsharded| {
+        const p = try sharded(unsharded, 1 << 20, 64, c);
+        try std.testing.expect(p.rows <= shard.budget(unsharded, 2, shard.trash));
+        try std.testing.expectEqual(@as(usize, 0), p.rows % (2 * pool.alignment));
+        try std.testing.expectEqual(p.rows / 2, p.part);
+        try std.testing.expect(c.sharded(p.rows) <= c.plain(unsharded)); // never more memory than the agreed pool's
+        try std.testing.expect(c.sharded(p.rows + 2 * pool.alignment) > c.plain(unsharded)); // and the most that fits
+        try std.testing.expect(p.rows > unsharded * 17 / 10); // ~1.9x the tokens
+    }
+    // a part short of the context shortens it; one under the floor is refused
+    const short = try sharded(1 << 20, 1 << 20, 64, c);
+    try std.testing.expectEqual(short.part - 64, short.context);
+    try std.testing.expectError(error.PartTooSmall, sharded(64 << 10, 1 << 20, 64, c));
+    try std.testing.expectError(error.PartTooSmall, sharded(4096, 8192, 64, c));
 }

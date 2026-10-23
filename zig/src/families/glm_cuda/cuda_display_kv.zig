@@ -34,6 +34,15 @@ pub fn planes(count: usize, plane: usize, display: usize) !usize {
     if (k > count) return error.DisplayTooLarge;
     return k;
 }
+/// How a span of latent planes holds the reservation: the first `planes` planes of `plane` bytes, `ordinary` of their
+/// bytes on host pages below the `display` ones. The span holds the arena's first latent planes, so with
+/// TF_GLM_KV_SHARD (planes of a part and its trash rows: patch 0118's latent_planes) they are this rank's owner planes,
+/// first, and more of them for the same bytes.
+pub const Reserve = struct { planes: usize, ordinary: usize };
+pub fn reserve(count: usize, plane: usize, display: usize) !Reserve {
+    const k = try planes(count, plane, display);
+    return .{ .planes = k, .ordinary = k * plane - display };
+}
 pub const Config = struct {
     bytes: usize = 0,
     kind: Backend = .drm,
@@ -250,6 +259,15 @@ test "display configuration and fewest latent planes match reference boundaries"
     try std.testing.expectEqual(@as(usize, 2), try planes(11, 1024, 1025));
     try std.testing.expectEqual(@as(usize, 1), try planes(11, 1024, 1024));
     try std.testing.expectError(error.DisplayTooLarge, planes(2, 1024, 2049));
+    // sharded planes (a part and its trash rows) are shorter: more of them hold the same reservation, below it as few
+    // host bytes as the last plane leaves
+    const full = try reserve(11, 1048576 * 528, 1792 << 20); // a 1M-row pool's latent plane
+    const half = try reserve(11, (524288 + 64) * 528, 1792 << 20); // a part of it and the trash rows
+    try std.testing.expectEqual(@as(usize, 4), full.planes);
+    try std.testing.expectEqual(@as(usize, 7), half.planes);
+    try std.testing.expectEqual(half.planes * (524288 + 64) * 528, half.ordinary + (1792 << 20));
+    try std.testing.expect(half.ordinary < (524288 + 64) * 528);
+    try std.testing.expectError(error.DisplayTooLarge, reserve(11, 128 << 20, 1792 << 20));
 }
 
 const Fake = struct {

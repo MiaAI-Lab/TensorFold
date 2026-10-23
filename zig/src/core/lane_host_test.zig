@@ -36,6 +36,45 @@ test "a lane host reports its backend's memory counts, and none without them" {
     try std.testing.expectEqual(@as(u32, 1), counts.resets);
 }
 
+test "a lane host publishes its backend's KV-ownership stats at each live note, and none without them" {
+    const gpa = std.testing.allocator;
+    var cfg = try lanes.Config.init(gpa, .{}, 1, 0);
+    defer cfg.deinit(gpa);
+    var target: lanes.fake.Fake = .{ .gpa = gpa };
+    defer target.deinit();
+    var clock: lanes.fake.FixedClock = .{};
+    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+    defer core.deinit();
+    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 1 });
+    defer host.live_tokens.deinit(gpa);
+    const status = @import("lane_host_status.zig");
+    var out: api.Status = .{};
+    status.noteLive(&host);
+    host.engine().status(&out, &.{});
+    try std.testing.expect(out.kv_parts == null);
+    const Parts = struct {
+        reads: u32 = 0,
+        fn read(ctx: *anyopaque, k: *api.KvParts) void {
+            const p: *@This() = @ptrCast(@alignCast(ctx));
+            p.reads += 1;
+            k.parts = 2;
+            k.part_rows = 1 << 20;
+            k.part[1] = .{ .free = 7, .live = p.reads };
+        }
+    };
+    var parts: Parts = .{};
+    host.kv_parts = .{ .ctx = &parts, .read = Parts.read };
+    host.engine().status(&out, &.{});
+    try std.testing.expect(out.kv_parts == null); // read at the next live note, not by a status reader
+    status.noteLive(&host);
+    status.noteLive(&host);
+    host.engine().status(&out, &.{});
+    try std.testing.expectEqual(@as(u32, 2), parts.reads);
+    try std.testing.expectEqual(@as(u64, 2), out.kv_parts.?.parts);
+    try std.testing.expectEqual(@as(u64, 7), out.kv_parts.?.part[1].free);
+    try std.testing.expectEqual(@as(u64, 2), out.kv_parts.?.part[1].live);
+}
+
 test "a request the backend refuses fails alone, in the backend's words" {
     const gpa = std.testing.allocator;
     var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);

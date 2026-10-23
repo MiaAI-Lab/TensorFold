@@ -161,3 +161,27 @@ test "invalid verify windows cannot reach staging or mutate tables" {
     try std.testing.expectEqual(@as(usize, 0), tables.used);
     for (tables.host) |word| try std.testing.expectEqual(@as(i32, 0), word);
 }
+
+test "a sharded window whose stream lies outside the pool is refused before its tables or glue change" {
+    var slots: @import("cuda_state.zig").Slots = undefined;
+    slots.count = 2;
+    var caches: @import("cuda_state.zig").Caches = undefined;
+    caches.ring = 64;
+    var f: Forward = undefined;
+    f.slots = &slots;
+    f.caches = &caches;
+    f.b.rows = 4;
+    const sh = try @import("cuda_shard.zig").Shard.init(0, 2, 4 * 2048, @import("cuda_shard.zig").trash);
+    var tables = try segments.SegRows.initShard(std.testing.allocator, 4, 4, 64, sh);
+    defer tables.deinit();
+    var v: Verify = .{ .f = &f, .tables = &tables, .kseg = undefined };
+    var st: State = undefined;
+    st.slot = 0;
+    st.base = 4 * 2048;
+    st.pos = 0;
+    st.capacity = 2048;
+    st.cur = @splat(0);
+    try std.testing.expectError(error.BadSegment, v.stage(&.{.{ .st = &st, .tokens = &.{ 1, 2 } }}));
+    try std.testing.expectEqual(@as(usize, 0), tables.used);
+    for (tables.host) |word| try std.testing.expectEqual(@as(i32, 0), word);
+}

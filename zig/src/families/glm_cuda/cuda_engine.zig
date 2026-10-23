@@ -40,6 +40,7 @@ const G = state.Geometry;
 const pool_mod = @import("cuda_pool.zig");
 const capacity = @import("cuda_pool_capacity.zig");
 const display = @import("cuda_display_kv.zig");
+const shard_mod = @import("cuda_shard.zig");
 
 pub const Options = struct {
     context: usize,
@@ -55,7 +56,13 @@ pub const Options = struct {
     /// picture and clip input; rank 0 also loads the tower (the Zig backend; the Python backend brings features)
     vision: bool = false,
     tower: bool = false,
+    /// TF_GLM_KV_SHARD's switches, read and agreed by cuda_native (null: off, every rank's caches the whole pool's)
+    kv_shard: ?shard_mod.Switches = null,
 };
+
+/// TF_GLM_KV_SHARD's counters (/health's kv_shard): layout digests sent or compared (TF_GLM_KV_SHARD_CHECK; a
+/// mismatch ends the pair), carries, twins.
+pub const KvCounts = struct { checks: u64 = 0, carries: u64 = 0, twins_made: u64 = 0, twins_revoked: u64 = 0 };
 
 /// `tag`: the id of the kept state this sequence's caches stand at (set when it is saved from or restored into the
 /// sequence; the position tells whether anything was written since), so a resume of the same state skips the copy.
@@ -171,6 +178,10 @@ pub const Engine = struct {
     vision: bool = false,
     /// rank 0 with --vision-backend zig: the vision tower (null: the server brings the features)
     tower: ?vision_tower.Tower = null,
+    /// TF_GLM_KV_SHARD: this rank's view of the pool's two parts (null: off), the switches and the counters
+    shard: ?shard_mod.Shard = null,
+    kv_switches: shard_mod.Switches = .{},
+    kv_counts: KvCounts = .{},
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         if (o.world < 1 or o.world > 4) return error.UnsupportedTp;
@@ -222,10 +233,15 @@ pub const Engine = struct {
         e.vision = o.vision;
         e.tower = null;
         e.committed = @splat(false);
+        e.shard = null;
+        e.kv_switches = o.kv_shard orelse .{};
+        e.kv_counts = .{};
+        if (o.kv_shard) |sw| try shard_mod.refuse(sw, o.world, @intCast(streams), false);
         var why: cfgs.Why = .{};
         e.cfg = try cfgs.Config.read(gpa, io, dir, .{}, &why);
         errdefer e.cfg.deinit();
         const mtp_on = try choice_mod.load(choice_mod.setting(), e.draft_choice, o.drafts, e.cfg.mtp_layers, streams);
+        if (o.kv_shard != null and mtp_on) return error.KvShardWithMtp;
         e.cat = try weights.loadCatalog(gpa, io, dir, draft_dir);
         errdefer e.cat.deinit();
         e.plan = try weights.plan(gpa, &e.cfg, &e.cat, .{ .rank = o.rank, .world = @intCast(o.world), .mtp = mtp_on });
@@ -383,28 +399,45 @@ pub const Engine = struct {
             if (o.comm) |c| {
                 // one word out (this rank's proposal) and one in per rank: every rank takes the smallest
                 const w: usize = c.world;
-                var words = try cuda.DeviceBuffer.alloc(ctx.d, (1 + w) * 8);
-                defer words.free();
-                var mine: u64 = @intCast(pool_rows);
-                try words.upload(0, std.mem.asBytes(&mine));
-                try c.allGather(words.ptr, words.ptr + 8, 1, .u64, e.stream.handle);
-                try e.stream.synchronize();
-                var all: [comm.max_world]u64 = undefined;
-                try words.download(8, std.mem.sliceAsBytes(all[0..w]));
+                const all = try gatherWord(ctx, c, e.stream, @intCast(pool_rows));
                 pool_rows = @intCast(agreedPool(all[0..w]));
+            }
+            if (o.kv_shard != null) {
+                // TF_GLM_KV_SHARD: the latent planes once over the two ranks, in the memory of the agreed pool; a part's
+                // owner is base / part, so the ranks check they cut the same parts (each sized them itself)
+                const c = o.comm orelse return error.KvShardNeedsTwoRanks;
+                const unsharded = pool_rows;
+                const p = try capacity.sharded(unsharded, e.context, window, ShardCost{ .g = e.g, .streams = streams, .window = window });
+                const all = try gatherWord(ctx, c, e.stream, p.rows);
+                if (!shard_mod.same(all[0..c.world])) return error.KvShardPoolMismatch;
+                e.shard = try shard_mod.Shard.init(o.rank, o.world, p.rows, shard_mod.trash);
+                pool_rows = p.rows;
+                if (o.rank == 0) {
+                    std.log.info("TF_GLM_KV_SHARD: the latent cache once over the {d} ranks: a pool of {d} tokens in {d} parts of {d} (unsharded {d}), the same memory", .{ o.world, p.rows, o.world, p.part, unsharded });
+                    if (p.context < e.context) std.log.info("TF_GLM_KV_SHARD: a request holds at most {d} tokens (a part of {d} less a {d}-row window), not {d}", .{ p.context, p.part, window, e.context });
+                }
+                e.context = p.context;
             }
             // Free the provisional single-window planes before their final allocation; graphs have not captured yet.
             e.caches.deinit();
             caches_live = false;
-            e.caches = try state.Caches.initDisplay(gpa, io, ctx.d, ctx.device, pool_rows, streams, 2048, display_cfg);
+            e.caches = if (e.shard) |sh| try state.Caches.initShard(gpa, io, ctx.d, ctx.device, streams, 2048, display_cfg, sh) else try state.Caches.initDisplay(gpa, io, ctx.d, ctx.device, pool_rows, streams, 2048, display_cfg);
             caches_live = true;
+            if (e.shard) |sh| {
+                // the decode tables with the glue planes (cuda_segments), in place before any graph captures them
+                var t = try seg.SegRows.initShard(gpa, window, 8, e.caches.ring, sh);
+                errdefer t.deinit();
+                try t.initDevice(ctx.d);
+                e.tables.deinit();
+                e.tables = t;
+            }
             scratch.deinit();
             scratch_live = false;
             scratch = try fwd.Scratch.init(ctx.d, e.g, window, decodeScratchRows(pool_rows));
             scratch_live = true;
             e.fwd.s = scratch;
         }
-        e.pool = try pool_mod.Pool.init(gpa, pool_rows);
+        e.pool = if (e.shard != null) try pool_mod.Pool.initParts(gpa, pool_rows, 2) else try pool_mod.Pool.init(gpa, pool_rows);
         errdefer e.pool.deinit();
         e.pool_free = .init(pool_rows);
         std.log.info("GLM KV pool: {d} tokens, display {d} MiB ({s})", .{ pool_rows, if (streams > 1) display_cfg.bytes >> 20 else 0, @tagName(display_cfg.kind) });
@@ -460,12 +493,14 @@ pub const Engine = struct {
     }
 
     /// One more sequence's slot estimate (forward.slot_bytes) plus one stream's DSA cache share.
-    /// The cache term is an admission estimate, not a measured allocator total.
+    /// The cache term is an admission estimate, not a measured allocator total. TF_GLM_KV_SHARD: its latent rows on
+    /// one rank of the two, a rank's share half of them.
     pub fn seqBytes(e: *const Engine, rows: usize) usize {
         const extent = std.mem.alignForward(usize, @max(rows, 1), G.extent);
         const slot = kda.slotBytes(G.kda_layers, e.g.lin_heads, e.window, e.g.projWidth()).slot();
         const ring = G.indexRing(extent, @max(e.window, e.prefill_rows));
-        const caches = 11 * extent * G.latent_row + 11 * (extent / 4 + 2) * G.pool_row + 11 * 2 * ring * 128 * 2;
+        const latent = 11 * extent * G.latent_row / (if (e.shard) |s| s.world else 1);
+        const caches = latent + 11 * (extent / 4 + 2) * G.pool_row + 11 * 2 * ring * 128 * 2;
         const mtp_bytes = if (e.mtp) |m| m.cache.arena.buf.len + m.b.arena.buf.len + m.arena.buf.len else 0;
         return slot + caches + mtp_bytes;
     }
@@ -476,8 +511,11 @@ pub const Engine = struct {
             if (!on and i < e.slots.count) break i;
         } else return error.NoFreeSlot;
         const extent = std.mem.alignForward(usize, limit_rows, G.extent);
+        // TF_GLM_KV_SHARD: a stream lives in one part (its owner's latent rows), placed where fewer streams live
+        if (e.shard) |sh| if (extent > sh.part) return error.ContextFull;
         const eid = (try e.pool.alloc(extent)) orelse return error.NoPoolExtent;
         errdefer e.pool.remove(eid) catch unreachable;
+        if (e.shard != null) (try e.pool.get(eid)).owner = slot;
         const base = (try e.pool.get(eid)).base;
         e.seqs[slot] = .{ .slot = slot, .st = try state.State.bind(e.slots, e.caches, slot, base, extent), .alive = true, .eid = eid };
         try e.zeroState(&e.seqs[slot].st);
@@ -501,11 +539,60 @@ pub const Engine = struct {
         if (e.bound == s) e.bound = null;
         if (s.slot < e.used.len) e.used[s.slot] = false;
         if (s.eid) |eid| {
+            // TF_GLM_KV_SHARD: a filling prompt's borrowed twins go back first
+            if (e.shard != null and e.pool.hasTwins(eid)) e.pool.giveBack(eid) catch unreachable;
             e.pool.remove(eid) catch unreachable;
             s.eid = null;
             e.pool_free.store(e.pool.freeRows(), .release);
         }
         s.alive = false;
+    }
+
+    /// TF_GLM_KV_SHARD: where sequence `s`'s extent lies, as rank 0 records it for rank 1 (null: off, or none); with
+    /// TF_GLM_KV_SHARD_CHECK the pool's layout digest too, counted in `checks`.
+    pub fn placement(e: *Engine, s: *const Seq) ?shard_mod.Placement {
+        if (e.shard == null) return null;
+        const eid = s.eid orelse return null;
+        const digest = e.kv_switches.check != 0;
+        const p = shard_mod.Placement.of(&e.pool, eid, digest) catch return null;
+        if (digest) e.kv_counts.checks += 1;
+        return p;
+    }
+
+    /// Rank 1: rank 0's placement against this rank's own. An owner derives from the base, so a placement of its own
+    /// elsewhere would read and write the other rank's rows as this one's: KvShardPlacement ends the pair instead.
+    pub fn checkPlacement(e: *Engine, p: shard_mod.Placement) !void {
+        if (e.shard == null) return error.KvShardPlacement;
+        if (p.digest != 0) e.kv_counts.checks += 1;
+        p.verify(&e.pool) catch |err| {
+            std.log.err("TF_GLM_KV_SHARD: rank 0 placed slot {d}'s extent at {d} ({d} rows, part {d}{s}); this rank's pool differs, so the ranks would read each other's rows", .{ p.owner, p.base, p.size, p.part, if (p.digest != 0) ", with its layout's digest" else "" });
+            return err;
+        };
+    }
+
+    /// TF_GLM_KV_SHARD_CHECK, rank 0: the pool's layout digest at the end of decode round `round`, once every that
+    /// many rounds (null: not this round, or off), for rank 1 to compare with its own (`checkDigest`).
+    pub fn roundDigest(e: *Engine, round: u64) ?u64 {
+        if (e.shard == null or !e.kv_switches.digestAt(round)) return null;
+        e.kv_counts.checks += 1;
+        return e.pool.digest();
+    }
+
+    /// Rank 1: rank 0's layout digest against this rank's own pool: a drift between placements (a release, a twin)
+    /// ends the pair too.
+    pub fn checkDigest(e: *Engine, digest: u64) !void {
+        if (e.shard == null) return error.KvShardPlacement;
+        e.kv_counts.checks += 1;
+        shard_mod.checkLayout(&e.pool, digest) catch |err| {
+            std.log.err("TF_GLM_KV_SHARD: rank 0's pool layout differs from this rank's after the same calls, so the ranks would read each other's rows", .{});
+            return err;
+        };
+    }
+
+    /// TF_GLM_KV_SHARD's stats for /health and /metrics (lanes.kv_parts.Source: read on the lane thread).
+    pub fn readKvParts(ctx: *anyopaque, out: *lanes.kv_parts.Stats) void {
+        const e: *Engine = @ptrCast(@alignCast(ctx));
+        kvPartsOf(&e.pool, e.kv_counts, out);
     }
 
     /// HTTP threads read the published count, never the lane thread's mutable extent list.
@@ -1293,6 +1380,51 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
     try std.testing.expect(!e.committed[1]);
 }
 
+/// One u64 from every rank (`mine` this rank's), in rank order, over the pool agreement's all-gather.
+fn gatherWord(ctx: *const cuda.Context, c: *const comm.Comm, stream: cuda.Stream, mine: u64) ![comm.max_world]u64 {
+    const w: usize = c.world;
+    var words = try cuda.DeviceBuffer.alloc(ctx.d, (1 + w) * 8);
+    defer words.free();
+    var word = mine;
+    try words.upload(0, std.mem.asBytes(&word));
+    try c.allGather(words.ptr, words.ptr + 8, 1, .u64, stream.handle);
+    try stream.synchronize();
+    var all: [comm.max_world]u64 = undefined;
+    try words.download(8, std.mem.sliceAsBytes(all[0..w]));
+    return all;
+}
+
+/// TF_GLM_KV_SHARD's pool sizing: the caches and the decode scratch at a pool's rows, unsharded and sharded
+/// (cuda_pool_capacity.sharded).
+const ShardCost = struct {
+    g: G,
+    streams: usize,
+    window: usize,
+    pub fn plain(c: ShardCost, rows: usize) usize {
+        return state.Caches.bytes(rows, c.streams, 2048) + fwd.Scratch.bytes(c.g, c.window, decodeScratchRows(rows));
+    }
+    pub fn sharded(c: ShardCost, rows: usize) usize {
+        const s = shard_mod.Shard.init(0, 2, rows, shard_mod.trash) catch return std.math.maxInt(usize);
+        return state.Caches.shardBytes(rows, c.streams, 2048, s) + fwd.Scratch.bytes(c.g, c.window, decodeScratchRows(rows));
+    }
+};
+
+/// A pool's parts as /health's kv_shard shows them: each part's free, live and borrowed rows and live streams, and
+/// the counters. Kept prompt states live outside the pool here (cuda_snapshot), so no part holds kept rows.
+pub fn kvPartsOf(p: *const pool_mod.Pool, counts: KvCounts, out: *lanes.kv_parts.Stats) void {
+    const n = @min(p.parts(), out.part.len);
+    out.parts = n;
+    out.part_rows = if (p.part == 0) p.rows else p.part;
+    out.checks = counts.checks;
+    out.carries = counts.carries;
+    out.twins_made = counts.twins_made;
+    out.twins_revoked = counts.twins_revoked;
+    for (out.part[0..n], 0..) |*q, i| {
+        const held = p.rowsIn(i);
+        q.* = .{ .free = p.freeIn(i), .live_rows = held.live, .twin_rows = held.twins, .live = p.live(i) };
+    }
+}
+
 /// The pool every rank can hold: the smallest of the ranks' proposals (one per rank, in rank order).
 fn agreedPool(proposals: []const u64) u64 {
     var m: u64 = std.math.maxInt(u64);
@@ -1305,4 +1437,46 @@ test "the agreed pool is the smallest proposal of every rank, whichever rank mak
     try std.testing.expectEqual(@as(u64, 2048), agreedPool(&.{ 8192, 6144, 2048 })); // rank 2 smallest at TP=3
     try std.testing.expectEqual(@as(u64, 2048), agreedPool(&.{ 2048, 6144, 8192 }));
     try std.testing.expectEqual(@as(u64, 1024), agreedPool(&.{ 8192, 6144, 4096, 1024 })); // rank 3 at TP=4
+}
+
+test "TF_GLM_KV_SHARD: /health's parts from the pool, a stream's share of the latent rows, the sizing's two layouts" {
+    var p = try pool_mod.Pool.initParts(std.testing.allocator, 8 * 2048, 2);
+    defer p.deinit();
+    const a = (try p.alloc(4096)).?;
+    (try p.get(a)).owner = 0;
+    const b = (try p.alloc(2048)).?;
+    (try p.get(b)).owner = 1;
+    try std.testing.expect(try p.borrow(a));
+    var k: lanes.kv_parts.Stats = .{};
+    kvPartsOf(&p, .{ .checks = 3, .twins_made = 1 }, &k);
+    try std.testing.expectEqual(@as(u64, 2), k.parts);
+    try std.testing.expectEqual(@as(u64, 8192), k.part_rows);
+    try std.testing.expectEqual(@as(u64, 3), k.checks);
+    try std.testing.expectEqual(@as(u64, 1), k.twins_made);
+    // part 0: the 4096-row stream; part 1: the 2048-row stream and the first one's 4096-row twin
+    try std.testing.expectEqual(lanes.kv_parts.Part{ .free = 4096, .live_rows = 4096, .live = 1 }, k.part[0]);
+    try std.testing.expectEqual(lanes.kv_parts.Part{ .free = 2048, .live_rows = 2048, .twin_rows = 4096, .live = 1 }, k.part[1]);
+    try std.testing.expectEqual(lanes.kv_parts.Part{}, k.part[2]);
+    // one part (off): the pool as one, as the engine never reports it
+    var one = try pool_mod.Pool.init(std.testing.allocator, 8192);
+    defer one.deinit();
+    var k1: lanes.kv_parts.Stats = .{};
+    kvPartsOf(&one, .{}, &k1);
+    try std.testing.expectEqual(@as(u64, 1), k1.parts);
+    try std.testing.expectEqual(@as(u64, 8192), k1.part[0].free);
+    // a stream's latent rows on one rank of two: a rank's share half of them, everything else alike
+    var e: Engine = undefined;
+    e.g = try G.init(2, 0);
+    e.window = 64;
+    e.prefill_rows = 2048;
+    e.mtp = null;
+    e.shard = null;
+    const plain = e.seqBytes(131072);
+    e.shard = try shard_mod.Shard.init(0, 2, 1 << 20, shard_mod.trash);
+    try std.testing.expectEqual(plain - 11 * 131072 * 528 / 2, e.seqBytes(131072));
+    // the sizing's layouts are cuda_state's, the scratch alike
+    const c: ShardCost = .{ .g = e.g, .streams = 4, .window = 64 };
+    const sh = try shard_mod.Shard.init(1, 2, 1 << 20, shard_mod.trash);
+    try std.testing.expectEqual(state.Caches.bytes(1 << 20, 4, 2048) - state.Caches.shardBytes(1 << 20, 4, 2048, sh), c.plain(1 << 20) - c.sharded(1 << 20));
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), c.sharded(2048)); // not whole parts: never fits
 }

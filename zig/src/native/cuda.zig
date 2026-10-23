@@ -167,6 +167,7 @@ const Host = struct {
     dir: []u8 = &.{}, // the model folder the learner writes its lessons into
     follow_fn: ?*const fn (*anyopaque) anyerror!void = null, // a following rank's loop (two-rank families)
     read_status: ?*const fn (*anyopaque, *?u64, *?u64) void = null,
+    kv_parts: ?lanes.kv_parts.Source = null, // the family's KV-ownership stats (its pool sharded over the ranks)
     store_vt: api.prompt_cache.Snapshots.VTable = undefined, // a family-kept store's snapshot calls (Loaded.cache)
     flush_ns: u64 = 0, // a clean stop stores the kept states not on disk yet, within this long (0: not at all)
 
@@ -226,6 +227,7 @@ const Host = struct {
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
         if (h.read_status != null) h.host.extra_status = .{ .ctx = h, .read = readExtraStatus };
+        h.host.kv_parts = h.kv_parts;
         h.host.cache = h.store;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         if (h.learn != null) h.host.learner = h.learner();
@@ -478,7 +480,9 @@ fn openOwn(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Op
         fo.master_port = o.master_port;
     }
     const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, fo) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
+        // a refusal the family explains (GLM's TF_GLM_KV_SHARD) in its words, else the error's name
+        const why: ?[]const u8 = if (@hasDecl(F, "refusal")) F.refusal(e) else null;
+        problem.* = if (why) |w| try a.dupe(u8, w) else try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
         bound = null;
         return null;
     };
@@ -488,6 +492,9 @@ fn openOwn(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Op
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined };
     h.follow_fn = if (@hasField(@TypeOf(loaded), "follow")) loaded.follow else null;
     h.read_status = if (@hasField(@TypeOf(loaded), "read_status")) loaded.read_status else null;
+    h.kv_parts = if (@hasField(@TypeOf(loaded), "kv_parts")) loaded.kv_parts else null;
+    // a family that had to shorten --context (GLM's TF_GLM_KV_SHARD: a part's) serves the window it holds
+    const served: i64 = if (@hasField(@TypeOf(loaded), "context")) (if (loaded.context) |c| @intCast(c) else window) else window;
     if (@hasField(@TypeOf(loaded), "cache")) if (loaded.cache) |c| if (c.budget > 0) {
         // the family keeps and restores the states; the store picks them (exact reuse, core/prompt_cache.zig)
         h.store_vt = .{ .bytes = c.bytes, .save = c.save, .restore = c.restore, .drop = c.drop };
@@ -514,7 +521,7 @@ fn openOwn(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.Op
     try h.serve(io, loaded.facts, loaded.rows, .{
         .lanes = o.lanes,
         .call_gates = true,
-        .context_window = @intCast(window),
+        .context_window = @intCast(served),
         .prefill_step = F.prefill_step,
         .prompt_cache = h.store != null,
         .structures = loaded.backend.vtable.first_masked != null,

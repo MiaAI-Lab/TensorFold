@@ -71,6 +71,9 @@ pub const LaneHost = struct {
     host_counts: HostCounts = .{},
     /// What status reports under `cache` (published on the engine thread at each noteLive; null without a tier).
     tele: ?api.CacheStats = null,
+    /// A backend's KV-ownership stats (its parts), read on the engine thread at each noteLive, published as `kv_tele`.
+    kv_parts: ?lanes.kv_parts.Source = null,
+    kv_tele: ?api.KvParts = null,
 
     const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
     /// How often an idle host polls work in flight (restores, staged writes, deferred retries).

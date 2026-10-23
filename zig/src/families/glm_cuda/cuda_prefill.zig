@@ -687,6 +687,8 @@ pub const Engine = struct {
         try e.choose(rows, bucket, e.pos_dev, false, e.s.tokens, e.s.counts);
     }
     pub fn dsaLayer(e: *Engine, w: fw.DsaW, ai: usize, rows: usize, pos: usize, done: ?[2]usize) !void {
+        // TF_GLM_KV_SHARD: the other rank's extent with no twin here has no latent rows on this rank to write
+        if (!e.cache.hasLatent()) return error.NoLatentRows;
         const h = e.g.heads;
         const s = &e.s;
         const own = e.ownDsa(rows);

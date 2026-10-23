@@ -14,6 +14,7 @@ const engine = @import("cuda_engine.zig");
 const cache_plan = @import("cuda_cache_plan.zig");
 const spill_mod = @import("cuda_spill.zig");
 const choice_mod = @import("cuda_mtp_choice.zig");
+const shard = @import("cuda_shard.zig");
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3"};
@@ -62,6 +63,10 @@ pub const Loaded = struct {
     follow: ?*const fn (*anyopaque) anyerror!void = null,
     cache: ?lane_backend.CacheHooks = null,
     read_status: ?*const fn (*anyopaque, *?u64, *?u64) void = null,
+    /// TF_GLM_KV_SHARD: the parts' rows and counters for /health and /metrics (null: off)
+    kv_parts: ?lanes.kv_parts.Source = null,
+    /// the window a request may use when the engine had to shorten --context (TF_GLM_KV_SHARD: a part's; null: as asked)
+    context: ?usize = null,
 };
 
 const link_timeout_ms: u32 = 10 * 60 * 1000;
@@ -74,6 +79,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (o.drafts and choice == .mtp and o.parallel != 1) return error.MtpRequiresSingleStream;
     if (o.drafts and choice == .dflash2 and draft_dir == null) return error.MissingDraftDirectory;
     if (o.parallel == 0 or o.parallel > 8) return error.BadParallel;
+    // TF_GLM_KV_SHARD: every rank reads its own; a rank that cannot fails with the others, after the agreement
+    const kv = shard.Switches.read();
+    var kv_switches: shard.Switches = .{};
     const own = try gpa.create(Own);
     errdefer gpa.destroy(own);
     own.* = .{ .gpa = gpa, .rank = o.rank, .world = o.tp };
@@ -94,17 +102,20 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
             own.link = try link.Link.join(io, address, link_timeout_ms);
             try own.link.?.hello(o.rank);
         }
-        const text = try settings(gpa, io, dir, kernels, o);
+        const text = try settings(gpa, io, dir, kernels, o, kv);
         defer gpa.free(text);
         own.link.?.agreeRanks(gpa, o.rank, text) catch |e| {
             if (e == error.RanksDisagree) std.log.err("rank {d} loads with \"{s}\"; the other rank's settings differ", .{ o.rank, text });
+            // a rank that could not read its TF_GLM_KV_SHARD* (its text said `unreadable`) says why
+            _ = kv catch |bad| return kvRefused(bad);
             return e;
         };
+        kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
         own.comm = try comm.Comm.init(gpa, own.link.?, o.rank, o.tp);
         std.log.info("rank {d}: settings agreed, NCCL joined", .{o.rank});
         own.watch = .{ .io = io, .fd = own.link.?.fd, .more = own.link.?.more, .rank = o.rank, .comm = mirror.Coll.of(comm.Comm, &own.comm.?) };
         try own.watch.?.start();
-    }
+    } else kv_switches = kvAdmit(kv, o, choice) catch |e| return kvRefused(e);
     const streams: usize = @max(@as(usize, 1), @min(@as(usize, o.parallel), lane_backend.max_streams));
     own.engine = try engine.Engine.init(gpa, io, ctx, dir, kernels, .{
         .context = o.context,
@@ -118,8 +129,11 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         .draft_choice = choice,
         .vision = o.vision,
         .tower = o.tower,
+        .kv_shard = if (kv_switches.on) kv_switches else null,
     });
     errdefer own.engine.?.deinit();
+    // TF_GLM_KV_SHARD may shorten the window a request uses to a part's (cuda_shard.fit); as asked otherwise
+    const context = own.engine.?.context;
     const window: usize = 16;
     own.serving = try gpa.create(serving.Serving(engine.Engine));
     errdefer gpa.destroy(own.serving.?);
@@ -130,20 +144,42 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
         errdefer if (own.agreement) |*a| a.deinit();
         own.records = .{ .gpa = gpa, .wire = own.bcast.?.wire(), .link = mirrorLink(own.link.?), .watch = &own.watch.? };
     }
-    try own.serving.?.init(gpa, own.engine.?, o.context, o.drafts, streams, window, @as(usize, o.rank), if (own.records) |*r| r.channel() else null);
+    try own.serving.?.init(gpa, own.engine.?, context, o.drafts, streams, window, @as(usize, o.rank), if (own.records) |*r| r.channel() else null);
     if (own.agreement) |*a| own.serving.?.setAgreement(a.gate(), if (own.watch) |*w| w else null);
     const build_key = buildKey(gpa, io, dir, kernels, o) catch 0;
     return .{
         .backend = own.serving.?.laneBackend(),
         .facts = own.serving.?.facts(),
         .rows = @intCast(window),
-        .stream_bytes = own.engine.?.seqBytes(o.context + window),
+        .stream_bytes = own.engine.?.seqBytes(context + window),
         .ctx = own,
         .deinit = Own.release,
         .follow = if (o.tp > 1 and o.rank >= 1) Own.follow else null,
         .cache = cacheFor(own, o, build_key),
         .read_status = Own.readStatus,
+        .kv_parts = if (own.engine.?.shard != null) .{ .ctx = own.engine.?, .read = engine.Engine.readKvParts } else null,
+        .context = if (context != o.context) context else null,
     };
+}
+
+/// TF_GLM_KV_SHARD once the ranks agreed on it (each input is in the settings text, so every rank answers alike):
+/// this rank's own read error, a setting sharding cannot serve, or, until its device paths are built, any `on`.
+fn kvAdmit(read: anyerror!shard.Switches, o: Options, choice: choice_mod.Choice) !shard.Switches {
+    const sw = try read;
+    try shard.refuse(sw, o.tp, o.parallel, o.drafts and choice == .mtp);
+    if (sw.on and !shard.gpu_paths) return error.KvShardNotBuilt;
+    return sw;
+}
+
+/// The refusal in the start-up's log, in words.
+fn kvRefused(err: anyerror) anyerror {
+    std.log.err("{s}", .{shard.why(err) orelse @errorName(err)});
+    return err;
+}
+
+/// The words for a refusal this family explains (native/cuda.zig shows them in place of the error's name).
+pub fn refusal(err: anyerror) ?[]const u8 {
+    return shard.why(err);
 }
 
 fn envText(name: [:0]const u8) ?[]const u8 {
@@ -390,7 +426,9 @@ fn onStop(_: std.posix.SIG) callconv(.c) void {
     std.c._exit(0);
 }
 
-fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []const u8, o: Options) ![]u8 {
+/// What both ranks must load alike, as text (its sha256 crosses the link). TF_GLM_KV_SHARD's words close it when on (or
+/// unreadable); off, the text is as before.
+fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []const u8, o: Options, kv: anyerror!shard.Switches) ![]u8 {
     var snapshot = std.crypto.hash.sha2.Sha256.init(.{});
     for ([_][]const u8{ "config.json", "model.safetensors.index.json", "tokenizer.json" }) |name| try hashFile(gpa, io, &snapshot, dir, name);
     const choice = try choice_mod.environment();
@@ -407,8 +445,10 @@ fn settings(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, kernels: []cons
     try hashFile(gpa, io, &kernel_set, kernels, "aot.json");
     const display_cfg = try @import("cuda_display_kv.zig").Config.read();
     const memory = @import("cuda_display_kv.zig");
-    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}", .{
-        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(),
+    var kv_buf: [80]u8 = undefined;
+    const kv_words = if (kv) |sw| sw.text(&kv_buf) else |_| shard.unreadable;
+    return std.fmt.allocPrint(gpa, "glm5_next display={d}:{s} cache={s} reserve={s} tp={d} checkpoint={s} snapshot={x} context={d} parallel={d} drafts={} eager={} vision={} tower={} kernels={x}{s}", .{
+        display_cfg.bytes, @tagName(display_cfg.kind), memory.env("TF_GLM_CACHE_GIB") orelse memory.env("KV_POOL_GIB") orelse "3", memory.env("TENSORFOLD_MEMORY_RESERVE_GIB") orelse memory.env("MEMORY_RESERVE_GIB") orelse "auto", o.tp, std.fs.path.basename(std.mem.trimEnd(u8, dir, "/")), snapshot.finalResult(), o.context, o.parallel, o.drafts, o.eager, o.vision, o.tower, kernel_set.finalResult(), kv_words,
     });
 }
 
@@ -502,6 +542,35 @@ pub fn prefillChunk(ctx: *anyopaque, rows: usize, pos: usize, parity: *[34]u1, h
     prefill.bindForwardHook();
     const e: *prefill.Engine = @ptrCast(@alignCast(ctx));
     try fw.enterPrompt(@ptrCast(e), rows, pos, parity, head);
+}
+
+test "TF_GLM_KV_SHARD: the settings text carries it only when on, a rank that cannot read it a word no rank sends, and every rank refuses alike after the agreement" {
+    const gpa = std.testing.allocator;
+    const o: Options = .{ .context = 8192, .drafts = false, .parallel = 4, .tp = 2 };
+    const off = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{});
+    defer gpa.free(off);
+    try std.testing.expect(std.mem.indexOf(u8, off, "kv_shard") == null);
+    const on = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true });
+    defer gpa.free(on);
+    try std.testing.expect(std.mem.endsWith(u8, on, " kv_shard=1 carry=1 twins=1 check=1024 lone=0"));
+    try std.testing.expectEqualStrings(off, on[0..off.len]); // the same text, the words appended
+    const every = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, shard.Switches{ .on = true, .check = 64 });
+    defer gpa.free(every);
+    try std.testing.expect(std.mem.endsWith(u8, every, " check=64 lone=0")); // another digest count: the ranks disagree
+    const bad = try settings(gpa, std.testing.io, "/nonexistent-glm", "/nonexistent-kernels", o, error.BadKvShard);
+    defer gpa.free(bad);
+    try std.testing.expect(std.mem.endsWith(u8, bad, shard.unreadable));
+    try std.testing.expect(!std.mem.eql(u8, bad, on) and !std.mem.eql(u8, bad, off));
+    // after the agreement: off passes; this rank's read error; what sharding cannot serve; and, this build, any on
+    try std.testing.expectEqual(shard.Switches{}, try kvAdmit(shard.Switches{}, .{ .context = 8, .drafts = false }, .dflash2));
+    try std.testing.expectError(error.BadKvShardCheck, kvAdmit(error.BadKvShardCheck, o, .dflash2));
+    try std.testing.expectError(error.KvShardNeedsTwoRanks, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = false, .parallel = 4 }, .dflash2));
+    try std.testing.expectError(error.KvShardNeedsParallel, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = false, .tp = 2 }, .dflash2));
+    try std.testing.expectError(error.KvShardWithMtp, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = true, .tp = 2, .parallel = 2 }, .mtp));
+    try std.testing.expectError(error.KvShardWithLone, kvAdmit(shard.Switches{ .on = true, .lone = true }, o, .dflash2));
+    try std.testing.expectError(error.KvShardNotBuilt, kvAdmit(shard.Switches{ .on = true }, o, .dflash2));
+    try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
+    try std.testing.expect(refusal(error.OutOfMemory) == null);
 }
 
 test "serving refuses more than eight lanes before any CUDA call" {

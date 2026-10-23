@@ -4,6 +4,7 @@ pub const native = @import("cuda_native.zig");
 pub const geometry = @import("cuda_geometry.zig");
 pub const state = @import("cuda_state.zig");
 pub const pool = @import("cuda_pool.zig");
+pub const shard = @import("cuda_shard.zig"); // TF_GLM_KV_SHARD (0118): sizes, addresses, glue, the history fetch (host side)
 pub const segments = @import("cuda_segments.zig");
 pub const kda = @import("cuda_kda.zig"); // P4: kda.cu / kda_chunk.cu, the segment table, replay, conv shift
 pub const triton = @import("cuda_triton.zig");
@@ -13,6 +14,8 @@ test {
     _ = geometry;
     _ = state;
     _ = pool;
+    _ = shard;
+    _ = @import("cuda_shard_test.zig");
     _ = segments;
     _ = kda;
     _ = triton;

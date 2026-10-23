@@ -26,6 +26,7 @@ pub const drafter = @import("drafter.zig");
 pub const drafted = @import("drafted.zig");
 pub const logprob = @import("logprob.zig");
 pub const grammar = @import("grammar.zig");
+pub const kv_parts = @import("kv_parts.zig");
 
 pub const Engine = engine.Engine;
 pub const Config = config.Config;

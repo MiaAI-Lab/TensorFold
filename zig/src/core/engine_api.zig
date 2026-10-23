@@ -413,7 +413,12 @@ pub const Status = struct {
     kept: ?prompt_cache.KeptStats = null,
     /// The prompt cache's counters with its durable tier (spill v2); null without one.
     cache: ?CacheStats = null,
+    /// A backend whose pool is sharded over its ranks: its parts' rows and counters (/health's kv_shard); null: none.
+    kv_parts: ?KvParts = null,
 };
+
+/// A backend's KV-ownership counters and every part's rows (lanes.kv_parts).
+pub const KvParts = lanes.kv_parts.Stats;
 
 pub const SubmitError = error{ Closed, Busy, InvalidSpans };
 
