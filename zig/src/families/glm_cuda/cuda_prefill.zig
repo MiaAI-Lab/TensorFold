@@ -14,6 +14,7 @@ const Tri = @import("cuda_triton.zig").Tri;
 const grid = @import("cuda_prefill_grid.zig");
 const split = @import("cuda_prefill_split.zig");
 const micro = @import("cuda_prompt_micro.zig");
+const shard_prompt = @import("cuda_shard_prompt.zig");
 
 fn cdiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
@@ -204,6 +205,9 @@ pub const Engine = struct {
     /// Called right after the chunk's embedding with the hidden state and the chunk's first row and row count: a
     /// prompt with pictures writes the tower's rows over the placeholder rows (cuda_engine's media).
     inject: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque, u64, usize, usize) anyerror!void } = null,
+    /// TF_GLM_KV_SHARD: the history fetch of a stream whose latent rows are on one rank (cuda_shard_prompt.zig); null:
+    /// off, every launch as before.
+    shard: ?*shard_prompt.Fetch = null,
 
     pub fn putI32(e: Engine, addr: u64, value: i32) !void {
         try e.tri.s.d.check(e.tri.s.d.api.cuMemsetD32Async(addr, @as(c_uint, @bitCast(value)), 1, e.tri.s.handle), "cuMemsetD32Async");
@@ -687,14 +691,18 @@ pub const Engine = struct {
         try e.choose(rows, bucket, e.pos_dev, false, e.s.tokens, e.s.counts);
     }
     pub fn dsaLayer(e: *Engine, w: fw.DsaW, ai: usize, rows: usize, pos: usize, done: ?[2]usize) !void {
-        // TF_GLM_KV_SHARD: the other rank's extent with no twin here has no latent rows on this rank to write
-        if (!e.cache.hasLatent()) return error.NoLatentRows;
+        // TF_GLM_KV_SHARD: the stream's latent rows on one rank: its owner sends the history rows the chunk reads and the
+        // other rank attends over a copy of them (cuda_shard_prompt.zig); a prompt borrowing a twin runs as unsharded on
+        // both ranks (no role); without either, a view with no latent rows here (the other rank's extent) has none to write
+        const role: ?shard_prompt.Role = if (e.shard != null) try shard_prompt.roleOf(e.cache) else null;
+        if (role == null and !e.cache.hasLatent()) return error.NoLatentRows;
         const h = e.g.heads;
         const s = &e.s;
         const own = e.ownDsa(rows);
         if (own) try e.dsaOwnFront(w, rows, pos, done) else try e.runFront(.{ .dsa = w }, done, rows);
         const lc = e.cache.latent[ai];
-        try e.tri.lat_write(.{ rows, 1, 1 }, s.lat, 512, lc, lc, e.pos_dev, .{ .LW = 512, .RS = 528, .FP8 = 1 });
+        // (the receiving rank writes the chunk's latents into its copy of the history, after the fetch)
+        if (role == null or role.? == .send) try e.latWrite(lc, e.pos_dev, rows);
         const sparse_rows = e.indexed and pos + rows - 1 >= grid.sparse_from;
         if (!e.indexed and pos + rows > grid.sparse_from) return error.MissingIndex;
         if (e.indexed) {
@@ -708,34 +716,62 @@ pub const Engine = struct {
             try e.tri.pool_keys(.{ rows / 4 + 2, 1, 1 }, e.cache.keys[ai], e.cache.gates[ai], w.ape, pk, pk, e.pos_dev, try ci(rows), try ci(e.ring), .{ .D = 128, .RS = 144, .FP8 = 1 });
         }
         try e.tri.absorb_mma(.{ h, cdiv(rows, 64), 4 }, s.q, w.wk, s.qa, try ci(rows), .{ .H = cz(h), .D = 256, .LW = 512, .BM = 64, .BN = 128, .BK = 64 });
-        const nch = grid.chunksFor(pos, rows);
-        if (pos < grid.sparse_from) {
-            const dense = if (sparse_rows) grid.denseRows(rows, pos) else rows;
-            const hb = grid.headBlock(rows);
-            if (dense <= grid.att_rows) {
-                try e.denseBlock(s.qa, lc, s.ol, dense, e.pos_dev, nch, hb);
-            } else {
-                var r0: usize = 0;
-                var block: usize = 0;
-                while (r0 < dense) {
-                    const n = @min(grid.att_rows, dense - r0);
-                    const at: u64 = if (r0 == 0) e.pos_dev else s.origins + block * 16;
-                    try e.denseBlock(s.qa + r0 * h * 512 * 2, lc, s.ol + r0 * h * 512 * 2, n, at, nch, hb);
-                    r0 += n;
-                    block += 1;
-                }
+        if (role) |r| {
+            // TF_GLM_KV_SHARD (forward.py _sharded_rows): the selection as unsharded (replicated), then the fetch and
+            // the attention over this rank's view or its copy
+            if (sparse_rows) try e.selectTokens(w, ai, rows, pos, own);
+            const f = e.shard.?;
+            var dev: ShardDev = .{ .f = f, .a = .{ .e = e, .rows = rows, .pos = pos, .sparse_rows = sparse_rows } };
+            try shard_prompt.attend(&dev, f.b.p, f.lim, .{ .role = r, .rows = rows, .pos = pos, .sparse = sparse_rows, .tokens = s.tokens, .lc = if (r == .send) lc else 0 }, &f.stats);
+        } else {
+            try e.denseRows(lc, rows, pos, sparse_rows);
+            if (sparse_rows) {
+                try e.selectTokens(w, ai, rows, pos, own);
+                try e.onepass(lc, 0, rows);
             }
-        }
-        if (sparse_rows) {
-            if (own) try e.selectOwn(rows, pos, e.cache.capacity / 4, e.cache.pooled[ai]) else {
-                try e.mat(s.qr, 1536, w.iqb, s.qi, rows, false);
-                try e.selectRows(rows, pos, e.cache.capacity / 4, e.cache.pooled[ai]);
-            }
-            const op = grid.onepassLaunch(h);
-            try e.tri.sparse_onepass(.{ rows, cdiv(h, op.hbt), op.split }, s.qa, lc, lc, s.tokens, s.counts, s.ol, .{ .W = grid.tokens, .H = cz(h), .LW = 512, .SCALE = grid.dense_scale, .HBT = cz(op.hbt), .KTT = 32, .SPLIT = cz(op.split), .STAGES = cz(op.stages), .PREFETCH = cz(op.prefetch), .RS = 528, .FP8 = 1 });
         }
         try e.tri.expand_mma(.{ h, cdiv(rows, 64), 2 }, s.ol, w.wv, s.o, try ci(rows), .{ .H = cz(h), .DV = 256, .LW = 512, .BM = 64, .BN = 128, .BK = 64 });
         try e.blockOut(.{ .mat = .{ .x = s.o, .stride = h * 256, .w = w.o } }, rows);
+    }
+    /// The chunk's latents (s.lat, bf16) into latent rows `lc` from the position POS names (`_lat_write`).
+    pub fn latWrite(e: Engine, lc: u64, pos: u64, rows: usize) !void {
+        try e.tri.lat_write(.{ rows, 1, 1 }, e.s.lat, 512, lc, lc, pos, .{ .LW = 512, .RS = 528, .FP8 = 1 });
+    }
+    /// The rows under the dense limit over latent rows `lc` (none past it): whole 512-row blocks, each from its origin.
+    pub fn denseRows(e: Engine, lc: u64, rows: usize, pos: usize, sparse_rows: bool) !void {
+        if (pos >= grid.sparse_from) return;
+        const h = e.g.heads;
+        const s = &e.s;
+        const nch = grid.chunksFor(pos, rows);
+        const dense = if (sparse_rows) grid.denseRows(rows, pos) else rows;
+        const hb = grid.headBlock(rows);
+        if (dense <= grid.att_rows) {
+            try e.denseBlock(s.qa, lc, s.ol, dense, e.pos_dev, nch, hb);
+        } else {
+            var r0: usize = 0;
+            var block: usize = 0;
+            while (r0 < dense) {
+                const n = @min(grid.att_rows, dense - r0);
+                const at: u64 = if (r0 == 0) e.pos_dev else s.origins + block * 16;
+                try e.denseBlock(s.qa + r0 * h * 512 * 2, lc, s.ol + r0 * h * 512 * 2, n, at, nch, hb);
+                r0 += n;
+                block += 1;
+            }
+        }
+    }
+    /// The chunk's tokens and counts (rows past the dense limit): the own-row selection or the unsplit one.
+    fn selectTokens(e: *Engine, w: fw.DsaW, ai: usize, rows: usize, pos: usize, own: bool) !void {
+        if (own) return e.selectOwn(rows, pos, e.cache.capacity / 4, e.cache.pooled[ai]);
+        try e.mat(e.s.qr, 1536, w.iqb, e.s.qi, rows, false);
+        try e.selectRows(rows, pos, e.cache.capacity / 4, e.cache.pooled[ai]);
+    }
+    /// Rows [lo, hi) of the chunk over their tokens in latent rows `lc` (`_sparse_onepass`: a row's bits depend on its
+    /// queries, its tokens and the rows they name only; rows with count 0 are left alone).
+    pub fn onepass(e: Engine, lc: u64, lo: usize, hi: usize) !void {
+        const h = e.g.heads;
+        const s = &e.s;
+        const op = grid.onepassLaunch(h);
+        try e.tri.sparse_onepass(.{ hi - lo, cdiv(h, op.hbt), op.split }, s.qa + lo * h * 512 * 2, lc, lc, s.tokens + lo * grid.tokens * 4, s.counts + lo * 4, s.ol + lo * h * 512 * 2, .{ .W = grid.tokens, .H = cz(h), .LW = 512, .SCALE = grid.dense_scale, .HBT = cz(op.hbt), .KTT = 32, .SPLIT = cz(op.split), .STAGES = cz(op.stages), .PREFETCH = cz(op.prefetch), .RS = 528, .FP8 = 1 });
     }
     fn mlp(e: Engine, w: fw.MlpW, rows: usize, out: u64) !void {
         try e.mlpFront(w, 0, rows);
@@ -839,6 +875,84 @@ pub const Engine = struct {
             try e.tri.fmm(.{ cdiv(1, cfg.bm), cdiv(e.g.vocab, cfg.bn), 1 }, e.last_hidden, e.weights.head, e.weights.head_scale, e.b.logits, e.b.logits, 1, 4096, .{ .N = cz(e.g.vocab), .K = 4096, .SK = 1, .BM = cz(cfg.bm), .BLOCK_N = cz(cfg.bn), .BK = 64, .F32 = 0, .SEQ = 0 });
         }
         try e.putI32(e.pos_dev, try ci(pos + rows));
+    }
+};
+
+/// A sharded chunk's attention launches (cuda_shard_prompt.attend's device calls them): the unsharded chunk's, over
+/// `att` (this rank's view or its copy of the history).
+pub const ShardAttn = struct {
+    e: *const Engine,
+    rows: usize,
+    pos: usize,
+    sparse_rows: bool,
+    /// The chunk's latents into `att` at their positions (`pos` null: the chunk's POS), or from the row a word names.
+    pub fn latWrite(a: ShardAttn, att: u64, pos: ?u64) !void {
+        try a.e.latWrite(att, pos orelse a.e.pos_dev, a.rows);
+    }
+    pub fn dense(a: ShardAttn, att: u64) !void {
+        try a.e.denseRows(att, a.rows, a.pos, a.sparse_rows);
+    }
+    pub fn sparse(a: ShardAttn, att: u64, lo: usize, hi: usize) !void {
+        try a.e.onepass(att, lo, hi);
+    }
+};
+
+/// cuda_shard_prompt.attend's device on the GPU: glm_shard.cu's fetch kernels and the NCCL transfers on the chunk's
+/// stream, held against the split's side stream (with microbatching the other half's chain runs its collectives there,
+/// and two collectives of one communicator must never run at once: forward.py waits for that stream and it for the
+/// fetch); the attention launches through `a`.
+const ShardDev = struct {
+    f: *shard_prompt.Fetch,
+    a: ShardAttn,
+    fn stream(dv: *const ShardDev) cuda.Stream {
+        return dv.a.e.tri.s;
+    }
+    pub fn mark(dv: *ShardDev, tokens: u64, n: usize, m: u64, limit: usize) !void {
+        try dv.f.k.mark(dv.stream(), tokens, n, m, limit);
+    }
+    pub fn scan(dv: *ShardDev, m: u64, n: usize, sums: u64) !void {
+        try dv.f.k.scan(dv.stream(), m, n, sums);
+    }
+    /// The union's count (the scan's total): the host waits for the stream (prompt chunks are never captured).
+    pub fn count(dv: *ShardDev, sums: u64) !usize {
+        const s = dv.stream();
+        try s.synchronize();
+        var raw: [4]u8 = undefined;
+        try s.d.check(s.d.api.cuMemcpyDtoH_v2(&raw, sums + shard_prompt.scan_segs * 4, 4), "shard fetch count");
+        const n = std.mem.readInt(i32, &raw, .little);
+        if (n < 0) return error.BadFetchCount;
+        return @intCast(n);
+    }
+    pub fn compact(dv: *ShardDev, src: u64, cum: u64, limit: usize, dst: u64) !void {
+        try dv.f.k.compact(dv.stream(), src, cum, limit, dst);
+    }
+    pub fn renumber(dv: *ShardDev, tokens: u64, n: usize, cum: u64, limit: usize) !void {
+        try dv.f.k.renumber(dv.stream(), tokens, n, cum, limit);
+    }
+    pub fn hold(dv: *ShardDev) !void {
+        const l = dv.a.e.lane orelse return;
+        try l.share_out.record(l.stream);
+        try dv.stream().wait(l.share_out);
+    }
+    pub fn release(dv: *ShardDev) !void {
+        const l = dv.a.e.lane orelse return;
+        try l.share_in.record(dv.stream());
+        try l.stream.wait(l.share_in);
+    }
+    pub fn send(dv: *ShardDev, at: u64, n: usize) !void {
+        try dv.f.comm.exchangeBytes(@intCast(dv.f.sh.peer()), &.{.{ at, n }}, &.{}, dv.stream().handle);
+    }
+    pub fn recv(dv: *ShardDev, at: u64, n: usize) !void {
+        try dv.f.comm.exchangeBytes(@intCast(dv.f.sh.peer()), &.{}, &.{.{ at, n }}, dv.stream().handle);
+    }
+    pub fn latWrite(dv: *ShardDev, att: u64, pos: ?u64) !void {
+        try dv.a.latWrite(att, pos);
+    }
+    pub fn dense(dv: *ShardDev, att: u64) !void {
+        try dv.a.dense(att);
+    }
+    pub fn sparse(dv: *ShardDev, att: u64, lo: usize, hi: usize) !void {
+        try dv.a.sparse(att, lo, hi);
     }
 };
 

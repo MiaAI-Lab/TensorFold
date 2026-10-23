@@ -314,6 +314,14 @@ pub const Comm = struct {
         return if (c.extra) |x| x.r != null else false;
     }
 
+    /// Whether an all-gather of `bytes` a rank goes over RoCE (allGatherThen's choice: by the size alone, so alike on
+    /// every rank, which open it together and agree on its slot).
+    pub fn roceFits(c: *const Comm, bytes: usize) bool {
+        const x = c.extra orelse return false;
+        const r = &(x.r orelse return false);
+        return r.fits(bytes);
+    }
+
     /// The RoCE side's proxy failure or a kernel's timed-out wait, if any, as text in `buf` (the stream traps on its own).
     pub fn roceFailure(c: *const Comm, buf: []u8) ?[]const u8 {
         const x = c.extra orelse return null;

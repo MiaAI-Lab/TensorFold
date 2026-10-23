@@ -121,6 +121,8 @@ pub const Verify = struct {
     pub fn forward(v: *Verify, spans: []const Segment) !void {
         const r = try v.stage(spans);
         if (v.graphs[r]) |graph| try graph.launchOn(v.f.tri.s) else try v.f.compute(r);
+        // TF_GLM_KV_SHARD: owner decode's round, counted (graph warm-ups and captures are not served rounds)
+        if (v.f.shard) |sd| sd.tally(r, v.graphs[r] != null);
     }
 };
 test "compile BatchedVerify graph and staging entry points" {

@@ -7,6 +7,7 @@ const lanes = @import("lanes");
 const decode = @import("flashnext").decode;
 const shard = @import("cuda_shard.zig");
 const wire = @import("cuda_spill_wire.zig");
+const keep = @import("cuda_shard_keep.zig");
 
 const be = lanes.backend;
 
@@ -267,12 +268,19 @@ pub fn Lanes(comptime E: type) type {
                 self.dropLane(s, l);
                 return err;
             };
-            self.placed(l);
             const requested = s.reuse.at > 0;
             var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
             if (requested) {
                 if (!(try self.agreeOn(from != null))) from = null;
             }
+            if (from) |k| {
+                const here = self.resumeHere(l, k) catch |err| {
+                    self.dropLane(s, l);
+                    return self.lost("a resume's placement", err);
+                };
+                if (!here) from = null;
+            }
+            self.placed(l);
             var f: Filling = .{ .fl = undefined };
             if (from) |k| {
                 if (k.keeper) |kp| e.copyPrefix(l.seq, kp, k.snap.pos, k.snap.mtp_len) catch |err| {
@@ -449,13 +457,22 @@ pub fn Lanes(comptime E: type) type {
                 self.dropLane(s, l);
                 return err;
             };
-            self.placed(l);
             // a resume both ranks can make (each holds the state), else both prefill from the start
             const requested = s.reuse.at > 0;
             var from: ?*Kept = if (requested) self.keptOf(s.reuse.saved) else null;
             if (requested) {
                 if (!(try self.agreeOn(from != null))) from = null;
             }
+            // TF_GLM_KV_SHARD: the extent where the state's latent rows can reach it, decided alike on both ranks (or
+            // none: from the start), before rank 0 records where it lies
+            if (from) |k| {
+                const here = self.resumeHere(l, k) catch |err| {
+                    self.dropLane(s, l);
+                    return self.lost("a resume's placement", err);
+                };
+                if (!here) from = null;
+            }
+            self.placed(l);
             e.bind(l.seq);
             const first = self.pass(s, l, from) catch |err| {
                 self.dropLane(s, l);
@@ -512,7 +529,9 @@ pub fn Lanes(comptime E: type) type {
                     }
                 }
                 e.bind(ls[i].seq);
+                const lent = self.borrow(ls[i]) catch |err| return self.burstLost(ss, ls[0..made], err);
                 const r = e.prefillWith(ss[i].prompt(), ss[i].sampling, .{}) catch |err| return self.burstLost(ss, ls[0..made], err);
+                if (lent) self.giveBack(ls[i]);
                 ls[i].first = self.take(r.first);
                 i += 1;
             }
@@ -542,6 +561,9 @@ pub fn Lanes(comptime E: type) type {
             s.cached = @intCast(at);
             s.reuse_failed = s.reuse.at > 0 and from == null;
             self.dropTentative();
+            // TF_GLM_KV_SHARD_TWINS: a fresh prompt fills with rows of the other part borrowed, given back once it is in
+            // (a failure on the way ends the pair, and the lane's release gives them back)
+            const lent = if (from == null) try self.borrow(l) else false;
             for (s.reuse.marks) |m| {
                 if (m <= at or m >= ids.len) continue;
                 // a keep at m must leave every rank's keep floor (the memory reserve) alone: the ranks
@@ -582,8 +604,29 @@ pub fn Lanes(comptime E: type) type {
             defer if (bits) |m| self.gpa.free(m);
             const mask: []const u32 = if (comptime masked) try self.firstMask(s, &bits) else &.{};
             const r = try e.prefillWith(ids, s.sampling, .{ .resume_from = if (live == null) cur else null, .live_from = live, .mask = mask, .media = s.media });
+            if (lent) self.giveBack(l);
             self.endPass();
             return r.first;
+        }
+
+        /// TF_GLM_KV_SHARD_TWINS: the lane's fresh prompt borrows free rows of the other part (the engine's borrowRows),
+        /// alike on both ranks: whether it did.
+        fn borrow(self: *Self, l: *Lane) !bool {
+            if (comptime !@hasDecl(E, "borrowRows")) return false;
+            return self.e.borrowRows(l.seq);
+        }
+
+        /// The rows `borrow` lent, back before the prompt's first decode round.
+        fn giveBack(self: *Self, l: *Lane) void {
+            if (comptime @hasDecl(E, "giveRows")) self.e.giveRows(l.seq);
+        }
+
+        /// TF_GLM_KV_SHARD: whether the lane's new extent can take kept state `k`'s latent rows (the engine's
+        /// placeResume: there already, moved into the state's part, or carried at the restore), else the prompt runs
+        /// from 0. Both ranks hold the state (agreed) and the same pool, so they answer alike.
+        fn resumeHere(self: *Self, l: *Lane, k: *const Kept) !bool {
+            if (comptime !@hasDecl(E, "placeResume")) return true;
+            return self.e.placeResume(l.seq, k.snap);
         }
 
         /// The bits of the stream's first token: the driver's (`first_mask`, set for rank 1 and by a Leader), else its grammar's.
@@ -1542,11 +1585,13 @@ test "GLM lane backend interleaves eight streams and preserves serial keyed outp
 
 /// An engine whose sequence is its tokens and whose kept state copies them (GLM's snapshot buffer): the first draw is a
 /// hash of every token, so a resumed pass equals a fresh one exactly when the state restored whole. Its spill tier is a
-/// map in memory. With a `pool` (TF_GLM_KV_SHARD's two parts) each sequence holds an extent placed as the engine's.
+/// map in memory. With a `pool` (TF_GLM_KV_SHARD's two parts) each sequence holds an extent placed as the engine's, a
+/// fresh prompt borrows the other part's rows while it fills, and a resume goes to its state's home part, carries, or
+/// starts from 0 (cuda_shard_keep, as the engine).
 const MiniEngine = struct {
     pub const snap_holds_rows = true;
-    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null };
-    pub const Snap = struct { id: u64, pos: usize, mtp_len: usize = 0, tokens: []u32 };
+    pub const Seq = struct { tokens: std.ArrayList(u32) = .empty, eid: ?u64 = null, lent: bool = false };
+    pub const Snap = struct { id: u64, pos: usize, mtp_len: usize = 0, tokens: []u32, home: ?usize = null };
     pub const PrefillOptions = struct { keep_at: ?usize = null, resume_from: ?*const Snap = null, live_from: ?usize = null, mask: []const u32 = &.{}, media: ?*const lanes.Media = null };
     pub const Prefilled = struct { first: u32, kept: ?*Snap = null };
     pub const Window = struct { seq: *Seq, tokens: []const u32 };
@@ -1568,6 +1613,11 @@ const MiniEngine = struct {
     trace: std.ArrayList([2]usize) = .empty, // every prefillWith's rows: [begin, end)
     pool: ?@import("cuda_pool.zig").Pool = null, // TF_GLM_KV_SHARD's parts (null: off)
     check: u32 = 0, // TF_GLM_KV_SHARD_CHECK
+    twins: bool = true, // TF_GLM_KV_SHARD_TWINS
+    carry: bool = true, // TF_GLM_KV_SHARD_CARRY
+    lent_fills: usize = 0, // prefillWith calls whose sequence held borrowed rows, held (pinned) all along
+    carries: usize = 0, // resumes whose state's rows a carry brought
+    refused_small: usize = 0,
 
     fn hash(tokens: []const u32) u32 {
         return @truncate(std.hash.Wyhash.hash(3, std.mem.sliceAsBytes(tokens)));
@@ -1593,7 +1643,10 @@ const MiniEngine = struct {
         return s;
     }
     pub fn freeSeq(e: *MiniEngine, s: *Seq) void {
-        if (e.pool) |*p| p.remove(s.eid.?) catch unreachable;
+        if (e.pool) |*p| {
+            if (p.hasTwins(s.eid.?)) p.giveBack(s.eid.?) catch unreachable;
+            p.remove(s.eid.?) catch unreachable;
+        }
         s.tokens.deinit(e.gpa);
         e.gpa.destroy(s);
         e.seqs -= 1;
@@ -1612,9 +1665,40 @@ const MiniEngine = struct {
     fn snapOf(e: *MiniEngine, tokens: []const u32) !*Snap {
         const s = try e.gpa.create(Snap);
         e.next_id += 1;
-        s.* = .{ .id = e.next_id, .pos = tokens.len, .tokens = try e.gpa.dupe(u32, tokens) };
+        const home: ?usize = if (e.pool) |*p| (if (e.bound) |q| p.partOf((try p.extent(q.eid.?)).base) else null) else null;
+        s.* = .{ .id = e.next_id, .pos = tokens.len, .tokens = try e.gpa.dupe(u32, tokens), .home = home };
         e.snaps += 1;
         return s;
+    }
+    pub fn borrowRows(e: *MiniEngine, s: *Seq) !bool {
+        const p = if (e.pool) |*q| q else return false;
+        if (!e.twins or s.tokens.items.len != 0) return false;
+        s.lent = (try keep.borrow(p, s.eid.?)) != null;
+        return s.lent;
+    }
+    pub fn giveRows(e: *MiniEngine, s: *Seq) void {
+        const p = if (e.pool) |*q| q else return;
+        if (!s.lent) return;
+        p.giveBack(s.eid.?) catch unreachable;
+        s.lent = false;
+    }
+    pub fn placeResume(e: *MiniEngine, s: *Seq, snap: *const Snap) !bool {
+        const p = if (e.pool) |*q| q else return true;
+        switch (try keep.resumeIn(p, s.eid.?, snap.home.?, snap.pos, e.carry)) {
+            .here => return true,
+            .move => |base| {
+                _ = try p.move(s.eid.?, base, null, true);
+                return true;
+            },
+            .carry => {
+                e.carries += 1;
+                return true;
+            },
+            .recompute => |why| {
+                e.refused_small += @intFromBool(why == .small);
+                return false;
+            },
+        }
     }
     pub fn prefillWith(e: *MiniEngine, prompt: []const u32, _: ?lanes.Sampling, o: PrefillOptions) !Prefilled {
         const q = e.bound.?;
@@ -1628,6 +1712,10 @@ const MiniEngine = struct {
             e.resumed += 1;
         } else q.tokens.clearRetainingCapacity(); // the engine's cold reset of a used sequence
         try e.trace.append(e.gpa, .{ q.tokens.items.len, prompt.len });
+        if (q.lent) {
+            if (!e.pool.?.holding(q.eid.?)) return error.TwinNotHeld;
+            e.lent_fills += 1;
+        }
         try q.tokens.appendSlice(e.gpa, prompt[q.tokens.items.len..]);
         const kept: ?*Snap = if (o.keep_at) |k| (if (e.refuse_keep or e.refuse_keep_at == k) null else try e.snapOf(prompt[0..k])) else null;
         return .{ .first = hash(q.tokens.items), .kept = kept };
@@ -1988,6 +2076,120 @@ test "TF_GLM_KV_SHARD_CHECK: every that many decode rounds rank 0's layout diges
         sink.notes.clearRetainingCapacity();
         try std.testing.expectError(error.BadNote, r1.applyNote(&.{ @backingInt(Note.layout), 1, 2 }));
     }
+}
+
+test "TF_GLM_KV_SHARD: a fresh prompt fills with borrowed rows on both ranks, held throughout, given back before the placement checks; a resume goes to its state's part, else carries, else starts from 0" {
+    const gpa = std.testing.allocator;
+    const Pool = @import("cuda_pool.zig").Pool;
+    const B = Lanes(MiniEngine);
+    var e0: MiniEngine = .{ .gpa = gpa, .spill_on = true, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
+    defer e0.deinit();
+    var e1: MiniEngine = .{ .gpa = gpa, .spill_on = true, .pool = try Pool.initParts(gpa, 8 * 2048, 2), .check = 1 };
+    defer e1.deinit();
+    var r0 = B.init(gpa, &e0, true, 1 << 20, 8);
+    defer r0.deinit();
+    var r1 = B.init(gpa, &e1, true, 1 << 20, 8);
+    defer r1.deinit();
+    r1.follower = true;
+    var sink: NoteSink = .{ .gpa = gpa };
+    defer sink.deinit();
+    r0.notes = .{ .ptr = &sink, .send = NoteSink.send };
+    const hooks = r0.cacheHooks(1 << 30, .{}, 0.5, 5);
+    var big: [2200]u32 = undefined;
+    for (&big, 0..) |*t, i| t.* = @intCast(i * 13 % 997);
+    const Base = struct {
+        fn of(e: *MiniEngine, r: anytype, st: *const lanes.Stream) usize {
+            return (e.pool.?.extent(r.lanes.get(st).?.seq.eid.?) catch unreachable).base;
+        }
+    };
+    // 1. a fresh prompt (4,096 rows, part 0) keeps at 64 and 2,112: both ranks borrow part 1's rows for the whole pass
+    // (two fills, each with the twin held), give them back at its end, and rank 1's placement check (with the digest)
+    // passes after its own pass
+    var adopter: Adopter = .{ .hooks = hooks };
+    var s1 = try lanes.Stream.init(gpa, .{ .id = "a", .prompt = &big, .max_new = 4, .reuse = .{ .marks = &.{ 64, 2112 }, .hook = .{ .ptr = &adopter, .at = Adopter.at } } });
+    defer s1.deinit(gpa);
+    try B.prefillFn(&r0, &s1);
+    try B.prefillFn(&r1, &s1);
+    try std.testing.expectEqual(@as(usize, 3), e0.lent_fills);
+    try std.testing.expectEqual(@as(usize, 3), e1.lent_fills);
+    try std.testing.expectEqual(@as(usize, 0), e0.pool.?.rowsIn(1).twins + e1.pool.?.rowsIn(1).twins);
+    try std.testing.expectEqual(MiniEngine.hash(&big), try firstToken(B, &r0, &s1));
+    try std.testing.expectEqual(@as(usize, 0), Base.of(&e0, &r0, &s1));
+    try sink.take(&r1);
+    const k64 = adopter.saved[0];
+    const k2112 = adopter.saved[1];
+    try std.testing.expectEqual(@as(?usize, 0), r0.keptOf(k2112).?.snap.home);
+    try std.testing.expectEqual(@as(?usize, 0), r1.keptOf(r1.savedFor(r0.keptOf(k2112).?.key)).?.snap.home);
+    // 2. a resume from 2,112 while s1 lives: placed in part 1 (fewer streams), moved home to part 0 where there is room,
+    // before rank 0 records it; no borrow (the rows come from the state). Each rank's stream names its own state.
+    const R = struct {
+        fn run(gpa_: std.mem.Allocator, b0: *B, b1: *B, k: *anyopaque, at: u32, prompt: []const u32, sk: *NoteSink, x: *lanes.Stream, y: *lanes.Stream) !void {
+            x.* = try lanes.Stream.init(gpa_, .{ .id = "r", .prompt = prompt, .max_new = 4, .reuse = .{ .saved = k, .at = at } });
+            y.* = try lanes.Stream.init(gpa_, .{ .id = "r", .prompt = prompt, .max_new = 4, .reuse = .{ .saved = b1.savedFor(b0.keptOf(k).?.key), .at = at } });
+            try B.prefillFn(b0, x);
+            try B.prefillFn(b1, y);
+            try sk.take(b1);
+        }
+    };
+    var res0 = .{ e0.resumed, e1.resumed };
+    var s2: lanes.Stream = undefined;
+    var s2b: lanes.Stream = undefined;
+    try R.run(gpa, &r0, &r1, k2112, 2112, &big, &sink, &s2, &s2b);
+    defer s2.deinit(gpa);
+    defer s2b.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 4096), Base.of(&e0, &r0, &s2));
+    try std.testing.expectEqual(@as(usize, 4096), Base.of(&e1, &r1, &s2b));
+    try std.testing.expect(e0.resumed > res0[0] and e1.resumed > res0[1] and s2.cached == 2112 and !s2.reuse_failed);
+    try std.testing.expectEqual(@as(usize, 3), e0.lent_fills);
+    try std.testing.expectEqual(@as(usize, 0), e0.carries);
+    // 3. again, with part 0 full: it stays in part 1 and the state's rows are carried (2,112 tokens: past the minimum)
+    res0 = .{ e0.resumed, e1.resumed };
+    var s3: lanes.Stream = undefined;
+    var s3b: lanes.Stream = undefined;
+    try R.run(gpa, &r0, &r1, k2112, 2112, &big, &sink, &s3, &s3b);
+    defer s3.deinit(gpa);
+    defer s3b.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 8192), Base.of(&e0, &r0, &s3));
+    try std.testing.expectEqual(@as(usize, 1), e0.carries);
+    try std.testing.expectEqual(@as(usize, 1), e1.carries);
+    try std.testing.expect(e0.resumed > res0[0] and s3.cached == 2112);
+    // 4. the carry off (TF_GLM_KV_SHARD_CARRY=0, both ranks): the prompt from 0 instead
+    e0.carry = false;
+    e1.carry = false;
+    res0 = .{ e0.resumed, e1.resumed };
+    var s4: lanes.Stream = undefined;
+    var s4b: lanes.Stream = undefined;
+    try R.run(gpa, &r0, &r1, k2112, 2112, &big, &sink, &s4, &s4b);
+    defer s4.deinit(gpa);
+    defer s4b.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 12288), Base.of(&e0, &r0, &s4));
+    try std.testing.expect(e0.resumed == res0[0] and e1.resumed == res0[1] and s4.cached == 0 and s4.reuse_failed);
+    try std.testing.expectEqual(@as(usize, 1), e0.carries);
+    // (a fresh pass after all, which borrowed nothing: part 0 has no room for a twin)
+    try std.testing.expectEqual(@as(usize, 3), e0.lent_fills);
+    B.releaseFn(&r0, &s4);
+    B.releaseFn(&r1, &s4b);
+    // 5. the carry on, a state under the minimum (64 tokens) with no room at home: from 0, counted
+    e0.carry = true;
+    e1.carry = true;
+    var s5: lanes.Stream = undefined;
+    var s5b: lanes.Stream = undefined;
+    try R.run(gpa, &r0, &r1, k64, 64, big[0..100], &sink, &s5, &s5b);
+    defer s5.deinit(gpa);
+    defer s5b.deinit(gpa);
+    try std.testing.expect(s5.reuse_failed and s5.cached == 0);
+    try std.testing.expectEqual(@as(usize, 1), e0.refused_small);
+    try std.testing.expectEqual(@as(usize, 1), e1.refused_small);
+    try std.testing.expectEqual(e0.pool.?.digest(), e1.pool.?.digest());
+    B.releaseFn(&r0, &s1);
+    B.releaseFn(&r1, &s1);
+    B.releaseFn(&r0, &s2);
+    B.releaseFn(&r1, &s2b);
+    B.releaseFn(&r0, &s3);
+    B.releaseFn(&r1, &s3b);
+    B.releaseFn(&r0, &s5);
+    B.releaseFn(&r1, &s5b);
+    try std.testing.expectEqual(@as(usize, 0), e0.pool.?.extents.items.len);
 }
 
 fn firstToken(comptime B: type, r: *B, s: *lanes.Stream) !u32 {

@@ -789,8 +789,14 @@ fn secSwitches(t: *T) !void {
     t.check("refuse: no TF_GLM_MULTI_LONE", R.refused(set, 2, 8, false, error.KvShardWithLone));
     t.check("refuse: two ranks, streams, DFlash2 or no drafts", if (shard.refuse(on, 2, 8, false)) |_| true else |_| false);
     var worded = true;
-    for ([_]anyerror{ error.BadKvShard, error.BadKvShardCarry, error.BadKvShardTwins, error.BadKvShardCheck, error.KvShardNeedsTwoRanks, error.KvShardNeedsParallel, error.KvShardWithMtp, error.KvShardWithLone, error.KvShardNotBuilt }) |e| worded = worded and shard.why(e) != null;
-    t.check("refuse: every refusal in words", worded and shard.why(error.OutOfMemory) == null and std.mem.indexOf(u8, shard.why(error.KvShardNotBuilt).?, "GPU paths are not in this build yet") != null);
+    for ([_]anyerror{ error.BadKvShard, error.BadKvShardCarry, error.BadKvShardTwins, error.BadKvShardCheck, error.KvShardNeedsTwoRanks, error.KvShardNeedsParallel, error.KvShardWithMtp, error.KvShardWithLone, error.KvShardNotBuilt, error.NoKvShardKernels }) |e| worded = worded and shard.why(e) != null;
+    t.check("refuse: every refusal in words", worded and shard.why(error.OutOfMemory) == null and std.mem.indexOf(u8, shard.why(error.NoKvShardKernels).?, "glm_shard.fatbin") != null);
+    t.check("refuse: this build carries the GPU paths", shard.gpu_paths);
+    // glm_shard.cu's image is optional in the build: one that embeds kernels without it refuses sharding at start
+    const no_image = if (shard.kernelsIn(true, &.{})) |_| false else |e| e == error.NoKvShardKernels;
+    const fine = if (shard.kernelsIn(true, "fatbin")) |_| true else |_| false;
+    const host = if (shard.kernelsIn(false, &.{})) |_| true else |_| false;
+    t.check("refuse: kernels embedded without glm_shard's, but not a host-only build or one with them", no_image and fine and host);
 }
 
 fn secAgreePool(t: *T) !void {

@@ -24,17 +24,19 @@ pub const pooled_bytes = G.pool_row / G.pool;
 
 // -- switches -------------------------------------------------------------------------------------------------------
 
-/// Whether this build carries sharding's device paths (owner decode, the prompt's history fetch, borrowing: round 2).
-/// Without them TF_GLM_KV_SHARD=1 is refused at start, after the ranks agree on it: nothing half-works.
-pub const gpu_paths = false;
+/// Whether this build carries sharding's device paths: owner decode (cuda_shard_decode.zig), the prompt's history
+/// fetch (cuda_shard_prompt.zig), prompt borrowing and kept states' carries (cuda_shard_keep.zig). Without them
+/// TF_GLM_KV_SHARD=1 is refused at start, after the ranks agree on it: nothing half-works.
+pub const gpu_paths = true;
 
 /// TF_GLM_KV_SHARD ("1": on) and its knobs, as every rank reads them (cuda_native agrees them over the settings
-/// frame): TF_GLM_KV_SHARD_CARRY, a kept state carried to the other part when that saves a recompute, an eviction or
-/// a pause (on unless "0"); TF_GLM_KV_SHARD_TWINS, a filling prompt borrowing free rows of the other part (on unless
-/// "0"; prompts only, no decode twins); TF_GLM_KV_SHARD_CHECK, decode rounds between the ranks' layout digests
+/// frame): TF_GLM_KV_SHARD_CARRY, a kept state's latent rows carried to the other part when its own has no room for the
+/// resume, which would otherwise recompute (on unless "0"; cuda_shard_keep.zig); TF_GLM_KV_SHARD_TWINS, a filling prompt
+/// borrowing free rows of the other part (on unless "0"; prompts only, no decode twins); TF_GLM_KV_SHARD_CHECK, decode rounds between the ranks' layout digests
 /// (DS TF_DS_KV_SHARD_CHECK: `check_rounds` unless set; a digest also rides each placement; 0: none, each placement
 /// still checked). TF_GLM_MULTI_LONE ("1") is read only to be refused. Off: the knobs are not read, and nothing
-/// changes.
+/// changes. TF_GLM_SPILL_V2 is not read here: spill v2's admission refuses it with sharding, and only with its tier on
+/// (--spill-gib and --snapshot-dir), where it would store a kept state that does not name its part.
 pub const Switches = struct {
     on: bool = false,
     carry: bool = true,
@@ -109,6 +111,13 @@ pub fn refuse(s: Switches, world: u32, parallel: u32, mtp: bool) !void {
     if (s.lone) return error.KvShardWithLone;
 }
 
+/// glm_shard.cu's image in a build that embeds kernels (`images`; a host-only build embeds none and launches nothing).
+/// It is optional, so a prebuilt fatbin set from before it still builds a server that runs unsharded; TF_GLM_KV_SHARD=1
+/// is then refused at start (one binary: every rank alike), not at the first load of its kernels.
+pub fn kernelsIn(images: bool, glm_shard: []const u8) !void {
+    if (images and glm_shard.len == 0) return error.NoKvShardKernels;
+}
+
 /// The start-up's words for a refusal of TF_GLM_KV_SHARD (null: not one of its errors).
 pub fn why(err: anyerror) ?[]const u8 {
     return switch (err) {
@@ -121,6 +130,7 @@ pub fn why(err: anyerror) ?[]const u8 {
         error.KvShardWithMtp => "TF_GLM_KV_SHARD=1 does not run with the MTP drafter (DRAFTER=mtp)",
         error.KvShardWithLone => "TF_GLM_KV_SHARD=1 does not run with TF_GLM_MULTI_LONE=1",
         error.KvShardNotBuilt => "TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet",
+        error.NoKvShardKernels => "TF_GLM_KV_SHARD=1: this build has no glm_shard kernels (its fatbins came without glm_shard.fatbin)",
         else => null,
     };
 }
@@ -440,7 +450,9 @@ pub fn steps(k: Kind) []const Step {
 }
 
 /// The check of a layer's transfers as they are issued: `begin` at its first, `take` before each, `done` at its end.
-/// Any other order is ShardOrder, before a launch, so neither rank waits on a transfer the other never makes.
+/// Any other order is ShardOrder, before a launch, so neither rank waits on a transfer the other never makes. Not
+/// called by the device paths: each issues a layer's transfers in one function from replicated inputs
+/// (cuda_shard_decode.run, cuda_shard_prompt.attend), whose two-rank models pair every send with its receive.
 pub const Cursor = struct {
     s: []const Step = &.{},
     i: usize = 0,

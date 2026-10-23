@@ -43,6 +43,9 @@ const pool_mod = @import("cuda_pool.zig");
 const capacity = @import("cuda_pool_capacity.zig");
 const display = @import("cuda_display_kv.zig");
 const shard_mod = @import("cuda_shard.zig");
+const shard_dec = @import("cuda_shard_decode.zig");
+const shard_prompt = @import("cuda_shard_prompt.zig");
+const shard_keep = @import("cuda_shard_keep.zig");
 
 pub const Options = struct {
     context: usize,
@@ -65,8 +68,10 @@ pub const Options = struct {
 };
 
 /// TF_GLM_KV_SHARD's counters (/health's kv_shard): layout digests sent or compared (TF_GLM_KV_SHARD_CHECK; a
-/// mismatch ends the pair), carries, twins.
-pub const KvCounts = struct { checks: u64 = 0, carries: u64 = 0, twins_made: u64 = 0, twins_revoked: u64 = 0 };
+/// mismatch ends the pair), carries (each a resume whose state's home part had no room: kv_parts' `carry_rescued`), the
+/// tokens and owner-only bytes they moved, resumes that started from 0 rather than carry a state under the minimum,
+/// prompts filled with borrowed twins and twins taken back.
+pub const KvCounts = struct { checks: u64 = 0, carries: u64 = 0, moved_tokens: u64 = 0, moved_bytes: u64 = 0, refused_small: u64 = 0, twins_made: u64 = 0, twins_revoked: u64 = 0 };
 
 /// `tag`: the id of the kept state this sequence's caches stand at (set when it is saved from or restored into the
 /// sequence; the position tells whether anything was written since), so a resume of the same state skips the copy.
@@ -74,7 +79,8 @@ pub const KvCounts = struct { checks: u64 = 0, carries: u64 = 0, twins_made: u64
 pub const Seq = struct { slot: usize, st: state.State, alive: bool = false, tag: u64 = 0, eid: ?u64 = null };
 /// A kept prompt state (cuda_snapshot.zig): one device buffer holding the sequence's state after `pos` tokens.
 /// `refs`: the owner's, and one for each background write that reads the buffer (the last release frees it).
-pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?cuda.DeviceBuffer = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1) };
+/// `home`: TF_GLM_KV_SHARD, the part its stream lay in, whose owner alone holds its latent rows (null: unsharded).
+pub const Snap = struct { id: u64 = 0, pos: usize = 0, mtp_len: usize = 0, buf: ?cuda.DeviceBuffer = null, sec: snapshot.Sections = undefined, refs: std.atomic.Value(u32) = .init(1), home: ?u8 = null };
 const SpillJob = struct { snap: *Snap, tokens: []u32, at: u32, key: u64 };
 /// `mask`: structured output's bits for the first token (one row, the grammar's words); empty: unconstrained.
 /// `media`: picture and clip rows for this prompt.
@@ -189,6 +195,10 @@ pub const Engine = struct {
     /// spill v2: its pinned staging (Options.spill_v2, taken before the pool) and one event a staging slot
     tier_staging: ?cuda.HostBuffer = null,
     tier_events: []cuda.Event = &.{},
+    /// TF_GLM_KV_SHARD: owner decode's kernels, exchange buffers and side stream (e.fwd.shard points here)
+    kv_dec: ?shard_dec.Decode = null,
+    /// TF_GLM_KV_SHARD: the prompt chunks' history fetch, its kernels, buffers and counters (e.pe.shard points here)
+    kv_prompt: ?shard_prompt.Fetch = null,
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !*Engine {
         if (o.world < 1 or o.world > 4) return error.UnsupportedTp;
@@ -243,6 +253,10 @@ pub const Engine = struct {
         e.shard = null;
         e.kv_switches = o.kv_shard orelse .{};
         e.kv_counts = .{};
+        e.kv_dec = null;
+        errdefer if (e.kv_dec) |*k| k.deinit();
+        e.kv_prompt = null;
+        errdefer if (e.kv_prompt) |*k| k.deinit();
         if (o.kv_shard) |sw| try shard_mod.refuse(sw, o.world, @intCast(streams), false);
         var why: cfgs.Why = .{};
         e.cfg = try cfgs.Config.read(gpa, io, dir, .{}, &why);
@@ -427,7 +441,7 @@ pub const Engine = struct {
                 // owner is base / part, so the ranks check they cut the same parts (each sized them itself)
                 const c = o.comm orelse return error.KvShardNeedsTwoRanks;
                 const unsharded = pool_rows;
-                const p = try capacity.sharded(unsharded, e.context, window, ShardCost{ .g = e.g, .streams = streams, .window = window });
+                const p = try capacity.sharded(unsharded, e.context, window, ShardCost{ .g = e.g, .streams = streams, .window = window, .fetch = shard_prompt.bytes(e.context, e.prefill_rows) });
                 const all = try gatherWord(ctx, c, e.stream, p.rows);
                 if (!shard_mod.same(all[0..c.world])) return error.KvShardPoolMismatch;
                 e.shard = try shard_mod.Shard.init(o.rank, o.world, p.rows, shard_mod.trash);
@@ -456,6 +470,14 @@ pub const Engine = struct {
             scratch = try fwd.Scratch.init(ctx.d, e.g, window, decodeScratchRows(pool_rows));
             scratch_live = true;
             e.fwd.s = scratch;
+            if (e.shard) |sh| {
+                // owner decode's kernels, exchange buffers and side stream, before any graph captures them
+                e.kv_dec = try shard_dec.Decode.init(ctx.d, o.comm orelse return error.KvShardNeedsTwoRanks, sh, window, &e.tables);
+                e.fwd.shard = &e.kv_dec.?;
+                // the prompt chunks' history fetch: the copy sized from the context it serves (at most the one counted)
+                e.kv_prompt = try shard_prompt.Fetch.init(ctx.d, o.comm.?, sh, e.context, e.prefill_rows);
+                e.pe.shard = &e.kv_prompt.?;
+            }
         }
         e.pool = if (e.shard != null) try pool_mod.Pool.initParts(gpa, pool_rows, 2) else try pool_mod.Pool.init(gpa, pool_rows);
         errdefer e.pool.deinit();
@@ -497,6 +519,8 @@ pub const Engine = struct {
         e.pe.b.deinit();
         e.fwd.hc.deinit();
         e.memo.deinit();
+        if (e.kv_dec) |*k| k.deinit();
+        if (e.kv_prompt) |*k| k.deinit();
         e.fwd.s.deinit();
         e.fwd.b.deinit();
         e.tables.deinit();
@@ -536,7 +560,11 @@ pub const Engine = struct {
         const extent = std.mem.alignForward(usize, limit_rows, G.extent);
         // TF_GLM_KV_SHARD: a stream lives in one part (its owner's latent rows), placed where fewer streams live
         if (e.shard) |sh| if (extent > sh.part) return error.ContextFull;
-        const eid = (try e.pool.alloc(extent)) orelse return error.NoPoolExtent;
+        const eid = (try e.pool.alloc(extent)) orelse blk: {
+            // TF_GLM_KV_SHARD: rows lent to a prompt no fill holds now come back first (multi.py _room's _revoke_twins)
+            if (e.revokeTwins() == 0) return error.NoPoolExtent;
+            break :blk (try e.pool.alloc(extent)) orelse return error.NoPoolExtent;
+        };
         errdefer e.pool.remove(eid) catch unreachable;
         if (e.shard != null) (try e.pool.get(eid)).owner = slot;
         const base = (try e.pool.get(eid)).base;
@@ -569,6 +597,95 @@ pub const Engine = struct {
             e.pool_free.store(e.pool.freeRows(), .release);
         }
         s.alive = false;
+    }
+
+    // -- TF_GLM_KV_SHARD: borrowing, a resume's latent rows (cuda_shard_keep.zig); every rank makes the same calls ----
+
+    /// TF_GLM_KV_SHARD_TWINS: fresh sequence `s`'s prompt fills with free rows of the other part borrowed, so both ranks
+    /// hold its latent rows and attend as unsharded (nothing sent); held until `giveRows`. False: off, not fresh, or no
+    /// room there (the prompt fills sharded, the history fetched).
+    pub fn borrowRows(e: *Engine, s: *Seq) !bool {
+        if (e.shard == null or !e.kv_switches.twins) return false;
+        const eid = s.eid orelse return false;
+        if (s.st.pos != 0) return false;
+        const twin = (try shard_keep.borrow(&e.pool, eid)) orelse return false;
+        errdefer e.pool.giveBack(eid) catch unreachable;
+        s.st.cache = try e.caches.viewBorrowed(s.st.base, s.st.capacity, s.slot, twin);
+        e.kv_counts.twins_made += 1;
+        e.pool_free.store(e.pool.freeRows(), .release);
+        return true;
+    }
+
+    /// The rows `borrowRows` lent, back to the pool (the prompt is in, or a placement needs them): `s` goes on with its
+    /// owner's rows alone. Nothing when it holds none.
+    pub fn giveRows(e: *Engine, s: *Seq) void {
+        const eid = s.eid orelse return;
+        if (e.shard == null or !e.pool.hasTwins(eid)) return;
+        e.pool.giveBack(eid) catch unreachable;
+        s.st.cache = e.caches.view(s.st.base, s.st.capacity, s.slot) catch unreachable; // (bound so before the borrow)
+        e.pool_free.store(e.pool.freeRows(), .release);
+    }
+
+    /// Every twin no fill holds back to the pool, its prompt going on with the owner's rows alone: how many prompts
+    /// gave theirs (a fill holds its twin from start to end, so a placement between fills finds none in practice).
+    fn revokeTwins(e: *Engine) usize {
+        if (e.shard == null) return 0;
+        var n: usize = 0;
+        for (e.used[0..e.slots.count], e.seqs[0..e.slots.count]) |on, *s| {
+            if (!on) continue;
+            const eid = s.eid orelse continue;
+            if (!shard_keep.revocable(&e.pool, eid)) continue;
+            e.giveRows(s);
+            e.kv_counts.twins_revoked += 1;
+            n += 1;
+        }
+        return n;
+    }
+
+    /// A prefill about to resume kept state `snap` into fresh sequence `s` (cuda_shard_keep.resumeIn): the extent stays,
+    /// moves into the state's home part (rebound before any row is written), or keeps its part and the rows are carried
+    /// at the restore; false: it must start from 0 (carry off, or the state under carry_min). Every rank alike, before
+    /// rank 0 records the placement. Off: true.
+    pub fn placeResume(e: *Engine, s: *Seq, snap: *const Snap) !bool {
+        if (e.shard == null) return true;
+        const eid = s.eid orelse return error.NoPoolExtent;
+        const home = snap.home orelse return error.KvShardNoHome;
+        switch (try shard_keep.resumeIn(&e.pool, eid, home, snap.pos, e.kv_switches.carry)) {
+            .here, .carry => return true,
+            .move => |base| {
+                _ = try e.pool.move(eid, base, null, true);
+                const x = try e.pool.extent(eid);
+                const at = s.st.pos;
+                const cur = s.st.cur;
+                s.st = try state.State.bind(e.slots, e.caches, s.slot, x.base, x.size);
+                s.st.pos = at;
+                s.st.cur = cur;
+                return true;
+            },
+            .recompute => |why| {
+                if (why == .small) e.kv_counts.refused_small += 1;
+                return false;
+            },
+        }
+    }
+
+    /// TF_GLM_KV_SHARD_CARRY: a resume's latent rows from the home owner's kept state (`send`) into the new extent's
+    /// owner's planes (`recv`), through the prompt fetch's copy (idle between prompt chunks), on the engine's stream;
+    /// counted on both ranks.
+    fn carryIn(e: *Engine, role: shard_keep.Latent, s: *const Seq, snap: *const Snap, buf: cuda.DeviceBuffer) !void {
+        const f = &(e.kv_prompt orelse return error.KvShardNeedsTwoRanks);
+        if (role == .send and !snap.sec.rows) return error.NoLatentRows;
+        if (role == .recv and !s.st.cache.hasLatent()) return error.NoLatentRows;
+        var src: [G.dsa_layers]u64 = @splat(0);
+        if (snap.sec.rows) for (&src, 0..) |*p, i| {
+            p.* = buf.ptr + snap.sec.latent + i * snap.sec.latentBytes();
+        };
+        var dev: CarryDev = .{ .e = e, .f = f };
+        _ = try shard_keep.carry(&dev, role, src, s.st.cache.latent, snap.pos, f.b.p.copy, @min(f.lim.piece, f.lim.hist + f.lim.chunk));
+        e.kv_counts.carries += 1;
+        e.kv_counts.moved_tokens += snap.pos;
+        e.kv_counts.moved_bytes += shard_mod.carryBytes(snap.pos);
+        if (e.g.rank == 0 and snap.pos >= 8192) std.log.info("kv shard carry: {d} tokens, part {d} -> {d}", .{ snap.pos, snap.home.?, e.pool.partOf(s.st.base) });
     }
 
     /// TF_GLM_KV_SHARD: where sequence `s`'s extent lies, as rank 0 records it for rank 1 (null: off, or none); with
@@ -616,6 +733,11 @@ pub const Engine = struct {
     pub fn readKvParts(ctx: *anyopaque, out: *lanes.kv_parts.Stats) void {
         const e: *Engine = @ptrCast(@alignCast(ctx));
         kvPartsOf(&e.pool, e.kv_counts, out);
+        if (e.kv_prompt) |*f| promptOf(f.stats, out);
+        if (e.kv_dec) |*d| {
+            out.owner_rounds = d.stats.rounds;
+            out.owner_bytes = d.stats.bytes;
+        }
     }
 
     /// HTTP threads read the published count, never the lane thread's mutable extent list.
@@ -717,9 +839,14 @@ pub const Engine = struct {
 
     /// This engine's state buffer for `at` tokens: rows, rings, recurrent states and (with drafts) DFlash2's rings.
     fn sectionsFor(e: *const Engine, at: usize) snapshot.Sections {
+        return e.sectionsHeld(at, true);
+    }
+
+    /// `sectionsFor`, the latent rows held or not (TF_GLM_KV_SHARD: only the stream's owner holds them).
+    fn sectionsHeld(e: *const Engine, at: usize, rows: bool) snapshot.Sections {
         const ring = e.caches.ring;
         const draft_bytes: usize = if (e.drafter) |p| draftOf(p, 0).bytes() else 0;
-        return snapshot.sections(e.g, at, ring, draft_bytes);
+        return snapshot.sectionsOf(e.g, at, ring, draft_bytes, rows);
     }
 
     fn draftOf(p: *const draft_pkg.Package, slot: usize) snapshot.Draft {
@@ -729,7 +856,8 @@ pub const Engine = struct {
         return d;
     }
 
-    /// What a kept state of `at` tokens holds on the device.
+    /// What a kept state of `at` tokens holds on the device (TF_GLM_KV_SHARD: on its home part's owner; the budget
+    /// counts that on every rank, the other rank's state being the latent rows smaller).
     pub fn snapBytes(e: *const Engine, at: usize) usize {
         return e.sectionsFor(at).total;
     }
@@ -842,10 +970,11 @@ pub const Engine = struct {
         return cache_plan.fits(m.available, e.keep_reserve, bytes);
     }
 
-    /// The bound sequence's state after `at` tokens (its position), copied into a new buffer.
+    /// The bound sequence's state after `at` tokens (its position), copied into a new buffer. TF_GLM_KV_SHARD: the
+    /// latent rows only on the rank that owns the stream's extent (a borrowed twin's are the other rank's), its home.
     pub fn takeSnap(e: *Engine, s: *Seq, at: usize) !*Snap {
         if (at == 0 or at != s.st.pos or at % 64 != 0) return error.BadKeepPoint;
-        const sec = e.sectionsFor(at);
+        const sec = e.sectionsHeld(at, if (e.shard) |sh| sh.owns(s.st.base) else true);
         if (e.keep_reserve > 0) if (cache_plan.memNow()) |m| if (!cache_plan.fits(m.available, e.keep_reserve, sec.total)) return error.BelowMemoryReserve;
         const snap = try e.gpa.create(Snap);
         errdefer e.gpa.destroy(snap);
@@ -856,17 +985,26 @@ pub const Engine = struct {
         try snapshot.save(e.copier(), e.g, sec, buf.ptr, &s.st, draft);
         try e.stream.synchronize();
         e.snap_next += 1;
-        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec };
+        snap.* = .{ .id = e.snap_next, .pos = at, .buf = buf, .sec = sec, .home = if (e.shard) |sh| @intCast(sh.owner(s.st.base)) else null };
         s.tag = snap.id;
         return snap;
     }
 
     /// Put a kept state into the sequence: its rows, rings, recurrent states and the drafter's window; the position.
+    /// TF_GLM_KV_SHARD: the latent rows back where the state and the extent are on one rank, else carried from the home
+    /// owner to the extent's (placeResume chose); never into a borrowed twin (a resume does not borrow).
     pub fn restoreSnap(e: *Engine, s: *Seq, snap: *const Snap) !void {
         const buf = snap.buf orelse return error.NoStateKept;
         const draft: ?snapshot.Draft = if (e.drafter) |p| draftOf(p, s.slot) else null;
         if ((snap.sec.draft != snap.sec.total) != (draft != null)) return error.DrafterMismatch;
-        try snapshot.restore(e.copier(), e.g, snap.sec, buf.ptr, &s.st, draft);
+        var rows = true;
+        if (e.shard) |sh| {
+            if (s.st.cache.twin) return error.KvShardTwinRestore;
+            const role = shard_keep.latentRole(sh, snap.home orelse return error.KvShardNoHome, sh.owner(s.st.base));
+            rows = role == .copy;
+            if (role == .send or role == .recv) try e.carryIn(role, s, snap, buf);
+        }
+        try snapshot.restore(e.copier(), e.g, snap.sec, buf.ptr, &s.st, draft, rows);
         try e.stream.synchronize();
         s.st.pos = snap.pos;
         s.tag = snap.id;
@@ -1489,6 +1627,107 @@ test "CLI commit publishes normalized target rows for the next MTP absorb" {
     try std.testing.expect(!e.committed[1]);
 }
 
+/// A host engine of TF_GLM_KV_SHARD's pool for rank `r` (no device: views are arithmetic over made-up planes).
+fn hostShardEngine(e: *Engine, r: usize, rows: usize) !void {
+    e.g = try G.init(2, r);
+    e.shard = try shard_mod.Shard.init(r, 2, rows, shard_mod.trash);
+    e.kv_switches = .{ .on = true };
+    e.kv_counts = .{};
+    e.pool = try pool_mod.Pool.initParts(std.testing.allocator, rows, 2);
+    e.pool_free = .init(rows);
+    e.caches = .{ .arena = undefined, .rows = rows, .streams = 4, .ring = 64, .latent = @splat(0x100000), .pooled = @splat(0x200000), .keys = @splat(0x300000), .gates = @splat(0x400000), .shard = e.shard };
+    e.slots = .{ .arena = undefined, .g = e.g, .count = 4, .rows = 32, .rec = 0x1000, .conv = 0x2000, .proj = 0x3000, .out = 0x4000, .k = 0x5000, .v = 0x6000, .gates = 0x7000, .b = 0x8000, .pos_dev = 0x9000 };
+    e.used = @splat(false);
+}
+
+/// newSeq's placement and binding without its device clears.
+fn hostSeq(e: *Engine, slot: usize, rows: usize) !*Seq {
+    const eid = (try e.pool.alloc(rows)) orelse return error.NoPoolExtent;
+    (try e.pool.get(eid)).owner = slot;
+    const x = try e.pool.extent(eid);
+    e.seqs[slot] = .{ .slot = slot, .st = try state.State.bind(e.slots, e.caches, slot, x.base, x.size), .alive = true, .eid = eid };
+    e.used[slot] = true;
+    return &e.seqs[slot];
+}
+
+test "TF_GLM_KV_SHARD: a fresh prompt borrows the other part's rows on both ranks and gives them back; a placement takes back only twins no fill holds; a resume moves home, else keeps its part for a carry, else starts from 0" {
+    const rows = 8 * G.extent;
+    var es: [2]Engine = undefined;
+    for (&es, 0..) |*e, r| try hostShardEngine(e, r, rows);
+    defer for (&es) |*e| e.pool.deinit();
+    // stream 0 in part 0 (rank 0's): its prompt borrows 2 extents of part 1 on both ranks, the views marked
+    for (&es) |*e| {
+        const s = try hostSeq(e, 0, 2 * G.extent);
+        try std.testing.expect(try e.borrowRows(s));
+        try std.testing.expect(s.st.cache.twin and s.st.cache.hasLatent());
+        try std.testing.expectEqual(@as(u64, 1), e.kv_counts.twins_made);
+        try std.testing.expectEqual(rows - 4 * G.extent, e.poolStatus().pool_free_tokens);
+    }
+    const s0 = &es[0].seqs[0];
+    const t0 = &es[1].seqs[0];
+    try std.testing.expect(s0.st.cache.owner and !t0.st.cache.owner);
+    try std.testing.expectEqual(@as(u64, 0x100000), s0.st.cache.latent[0]); // rank 0: its own rows (local 0)
+    try std.testing.expectEqual(@as(u64, 0x100000), t0.st.cache.latent[0]); // rank 1: the twin at its part's first row
+    try std.testing.expectEqual(es[0].pool.digest(), es[1].pool.digest());
+    // a placement takes back no twin a fill holds; one no fill holds goes back, the view as bound before the borrow
+    for (&es) |*e| try std.testing.expectEqual(@as(usize, 0), e.revokeTwins());
+    for (&es) |*e| {
+        e.pool.hold(e.seqs[0].eid.?, false);
+        try std.testing.expectEqual(@as(usize, 1), e.revokeTwins());
+        try std.testing.expectEqual(@as(u64, 1), e.kv_counts.twins_revoked);
+        try std.testing.expect(!e.seqs[0].st.cache.twin and !e.pool.hasTwins(e.seqs[0].eid.?));
+    }
+    try std.testing.expect(!t0.st.cache.hasLatent() and s0.st.cache.hasLatent());
+    // borrowed again, then given back as a prompt's end does; twins off, or a sequence past its start, borrow nothing
+    for (&es) |*e| {
+        try std.testing.expect(try e.borrowRows(&e.seqs[0]));
+        e.giveRows(&e.seqs[0]);
+        e.giveRows(&e.seqs[0]); // (nothing to give twice)
+        try std.testing.expectEqual(rows - 2 * G.extent, e.poolStatus().pool_free_tokens);
+        e.kv_switches.twins = false;
+        try std.testing.expect(!try e.borrowRows(&e.seqs[0]));
+        e.kv_switches.twins = true;
+        e.seqs[0].st.pos = 64;
+        try std.testing.expect(!try e.borrowRows(&e.seqs[0]));
+        e.seqs[0].st.pos = 0;
+    }
+    try std.testing.expect(!t0.st.cache.hasLatent() and !t0.st.cache.twin);
+    // a resume of a state kept in part 0: stream 1 placed in part 1 (fewer streams), moved home where part 0 has room
+    const home0: Snap = .{ .pos = 4096, .home = 0 };
+    for (&es) |*e| {
+        const s = try hostSeq(e, 1, 2 * G.extent);
+        try std.testing.expectEqual(@as(usize, 4 * G.extent), s.st.base);
+        try std.testing.expect(try e.placeResume(s, &home0));
+        try std.testing.expectEqual(@as(usize, 2 * G.extent), s.st.base);
+        try std.testing.expectEqual(e.g.rank == 0, s.st.cache.hasLatent()); // rebound: rank 0's rows now
+    }
+    try std.testing.expectEqual(es[0].pool.digest(), es[1].pool.digest());
+    // part 0 full: stream 2 keeps part 1 and the restore will carry; the carry off, or a state under the minimum: from 0
+    for (&es) |*e| {
+        const s = try hostSeq(e, 2, 2 * G.extent);
+        try std.testing.expect(try e.placeResume(s, &home0));
+        try std.testing.expectEqual(@as(usize, 4 * G.extent), s.st.base);
+        e.kv_switches.carry = false;
+        try std.testing.expect(!try e.placeResume(s, &home0));
+        e.kv_switches.carry = true;
+        try std.testing.expect(!try e.placeResume(s, &.{ .pos = shard_keep.carry_min - 64, .home = 0 }));
+        try std.testing.expectEqual(@as(u64, 1), e.kv_counts.refused_small);
+        try std.testing.expectError(error.KvShardNoHome, e.placeResume(s, &.{ .pos = 4096 }));
+        // the carry's counters reach /health as rescues
+        e.kv_counts.carries = 1;
+        var k: lanes.kv_parts.Stats = .{};
+        kvPartsOf(&e.pool, e.kv_counts, &k);
+        try std.testing.expect(k.carries == 1 and k.carry_rescued == 1 and k.refused_small == 1 and k.twins_made == 2 and k.twins_revoked == 1);
+    }
+    // unsharded: every resume as before, nothing borrowed
+    var plain: Engine = undefined;
+    plain.shard = null;
+    var q: Seq = .{ .slot = 0, .st = undefined, .eid = 0 };
+    try std.testing.expect(try plain.placeResume(&q, &home0));
+    try std.testing.expect(!try plain.borrowRows(&q));
+    plain.giveRows(&q);
+}
+
 /// One u64 from every rank (`mine` this rank's), in rank order, over the pool agreement's all-gather.
 fn gatherWord(ctx: *const cuda.Context, c: *const comm.Comm, stream: cuda.Stream, mine: u64) ![comm.max_world]u64 {
     const w: usize = c.world;
@@ -1503,35 +1742,77 @@ fn gatherWord(ctx: *const cuda.Context, c: *const comm.Comm, stream: cuda.Stream
     return all;
 }
 
+/// cuda_shard_keep.carry's device on the GPU: NCCL transfers and copies on the engine's stream (the prompt's), held
+/// against the row split's side stream as the history fetch's are (cuda_prefill's ShardDev).
+const CarryDev = struct {
+    e: *Engine,
+    f: *const shard_prompt.Fetch,
+    pub fn send(dv: *CarryDev, at: u64, n: usize) !void {
+        try dv.f.comm.exchangeBytes(@intCast(dv.f.sh.peer()), &.{.{ at, n }}, &.{}, dv.e.stream.handle);
+    }
+    pub fn recv(dv: *CarryDev, at: u64, n: usize) !void {
+        try dv.f.comm.exchangeBytes(@intCast(dv.f.sh.peer()), &.{}, &.{.{ at, n }}, dv.e.stream.handle);
+    }
+    pub fn copy(dv: *CarryDev, dst: u64, src: u64, n: usize) !void {
+        try Engine.copyBytes(dv.e, dst, src, n);
+    }
+    pub fn hold(dv: *CarryDev) !void {
+        const l = dv.e.pe.lane orelse return;
+        try l.share_out.record(l.stream);
+        try dv.e.stream.wait(l.share_out);
+    }
+    pub fn release(dv: *CarryDev) !void {
+        const l = dv.e.pe.lane orelse return;
+        try l.share_in.record(dv.e.stream);
+        try l.stream.wait(l.share_in);
+    }
+};
+
 /// TF_GLM_KV_SHARD's pool sizing: the caches and the decode scratch at a pool's rows, unsharded and sharded
-/// (cuda_pool_capacity.sharded).
+/// (cuda_pool_capacity.sharded); sharded adds owner decode's exchange buffers and the prompt fetch's (`fetch` bytes,
+/// shard_prompt.bytes at the requested context: what the part's context allocates at most).
 const ShardCost = struct {
     g: G,
     streams: usize,
     window: usize,
+    fetch: usize = 0,
     pub fn plain(c: ShardCost, rows: usize) usize {
         return state.Caches.bytes(rows, c.streams, 2048) + fwd.Scratch.bytes(c.g, c.window, decodeScratchRows(rows));
     }
     pub fn sharded(c: ShardCost, rows: usize) usize {
         const s = shard_mod.Shard.init(0, 2, rows, shard_mod.trash) catch return std.math.maxInt(usize);
-        return state.Caches.shardBytes(rows, c.streams, 2048, s) + fwd.Scratch.bytes(c.g, c.window, decodeScratchRows(rows));
+        return state.Caches.shardBytes(rows, c.streams, 2048, s) + fwd.Scratch.bytes(c.g, c.window, decodeScratchRows(rows)) + shard_dec.bytes(c.window) + c.fetch;
     }
 };
 
 /// A pool's parts as /health's kv_shard shows them: each part's free, live and borrowed rows and live streams, and
-/// the counters. Kept prompt states live outside the pool here (cuda_snapshot), so no part holds kept rows.
+/// the counters. Kept prompt states live outside the pool here (cuda_snapshot), so no part holds kept rows; a carry
+/// is made only where the state's own part had no room (every one `carry_rescued`).
 pub fn kvPartsOf(p: *const pool_mod.Pool, counts: KvCounts, out: *lanes.kv_parts.Stats) void {
     const n = @min(p.parts(), out.part.len);
     out.parts = n;
     out.part_rows = if (p.part == 0) p.rows else p.part;
     out.checks = counts.checks;
     out.carries = counts.carries;
+    out.carry_rescued = counts.carries;
+    out.moved_tokens = counts.moved_tokens;
+    out.moved_bytes = counts.moved_bytes;
+    out.refused_small = counts.refused_small;
     out.twins_made = counts.twins_made;
     out.twins_revoked = counts.twins_revoked;
     for (out.part[0..n], 0..) |*q, i| {
         const held = p.rowsIn(i);
         q.* = .{ .free = p.freeIn(i), .live_rows = held.live, .twin_rows = held.twins, .live = p.live(i) };
     }
+}
+
+/// A rank's prompt fetch counters as /health's kv_shard shows them (rank 0's: it sends or receives every fetch).
+pub fn promptOf(s: shard_prompt.Stats, out: *lanes.kv_parts.Stats) void {
+    out.prompt_fetches = s.fetches;
+    out.prompt_rows = s.rows;
+    out.prompt_bytes = s.bytes;
+    out.prompt_syncs = s.syncs;
+    out.prompt_blocked = s.blocked;
 }
 
 /// The pool every rank can hold: the smallest of the ranks' proposals (one per rank, in rank order).
@@ -1584,8 +1865,16 @@ test "TF_GLM_KV_SHARD: /health's parts from the pool, a stream's share of the la
     e.shard = try shard_mod.Shard.init(0, 2, 1 << 20, shard_mod.trash);
     try std.testing.expectEqual(plain - 11 * 131072 * 528 / 2, e.seqBytes(131072));
     // the sizing's layouts are cuda_state's, the scratch alike
-    const c: ShardCost = .{ .g = e.g, .streams = 4, .window = 64 };
+    const c: ShardCost = .{ .g = e.g, .streams = 4, .window = 64, .fetch = shard_prompt.bytes(1 << 20, 2048) };
     const sh = try shard_mod.Shard.init(1, 2, 1 << 20, shard_mod.trash);
-    try std.testing.expectEqual(state.Caches.bytes(1 << 20, 4, 2048) - state.Caches.shardBytes(1 << 20, 4, 2048, sh), c.plain(1 << 20) - c.sharded(1 << 20));
+    // (and owner decode's exchange buffers and the prompt fetch's on the sharded side)
+    try std.testing.expectEqual(state.Caches.bytes(1 << 20, 4, 2048) - state.Caches.shardBytes(1 << 20, 4, 2048, sh) - shard_dec.bytes(64) - shard_prompt.bytes(1 << 20, 2048), c.plain(1 << 20) - c.sharded(1 << 20));
+    // the prompt fetch's counters on /health
+    var k2: lanes.kv_parts.Stats = .{};
+    promptOf(.{ .fetches = 11, .rows = 4000, .bytes = 4000 * 528, .syncs = 13, .blocked = 1, .blocks = 3 }, &k2);
+    try std.testing.expectEqual(@as(u64, 11), k2.prompt_fetches);
+    try std.testing.expectEqual(@as(u64, 4000 * 528), k2.prompt_bytes);
+    try std.testing.expectEqual(@as(u64, 13), k2.prompt_syncs);
+    try std.testing.expectEqual(@as(u64, 1), k2.prompt_blocked);
     try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), c.sharded(2048)); // not whole parts: never fits
 }

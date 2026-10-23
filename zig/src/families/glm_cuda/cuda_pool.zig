@@ -323,6 +323,13 @@ pub const Pool = struct {
             if (x.twin == eid) x.held = held;
         }
     }
+    /// Whether a twin of extent `eid` is pinned (`hold`): its fill is part way through its layers.
+    pub fn holding(p: Pool, eid: u64) bool {
+        for (p.extents.items) |x| {
+            if (x.twin == eid and x.held) return true;
+        }
+        return false;
+    }
     /// Every twin of extent `eid` back to the pool (its prompt fills on with the owner's rows alone).
     pub fn giveBack(p: *Pool, eid: u64) !void {
         var n: usize = 0;

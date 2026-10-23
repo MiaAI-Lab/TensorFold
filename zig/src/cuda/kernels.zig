@@ -47,6 +47,7 @@ pub const fn_qmm_prefill: []const u8 = if (available) &Blob("fatbin_fn_qmm_prefi
 pub const fn_pack: []const u8 = if (available) &Blob("fatbin_fn_pack").bytes else &.{};
 pub const torch_fn_ops: []const u8 = if (available) &Blob("fatbin_torch_fn_ops").bytes else &.{};
 pub const glm_msa: []const u8 = if (available) &Blob("fatbin_glm_msa").bytes else &.{};
+pub const glm_shard: []const u8 = if (options.glm_shard) &Blob("fatbin_glm_shard").bytes else &.{};
 pub const torch_fn_logsumexp: []const u8 = if (available) &Blob("fatbin_torch_fn_logsumexp").bytes else &.{};
 pub const fn_experts_prompt: []const u8 = if (available) &Blob("fatbin_fn_experts_prompt").bytes else &.{};
 pub const fn_qmmf: []const u8 = if (available) &Blob("fatbin_fn_qmmf").bytes else &.{};

@@ -73,6 +73,7 @@ const kernels = [_]Kernel{
     .{ .name = "fn_roce", .flags = &.{"-O3"} }, // ours (decode D1): the one-shot RoCE all-gather's GPU half (cuda/roce.zig)
     // GLM-5.3-Flash (glm5_next), P5 MLA/DSA: the only CUDA in the attention path (the rest is Triton, replayed from cubins)
     .{ .name = "glm_msa", .flags = &.{ "-O3", "-lineinfo" } }, // glm5_next/cuda/msa.py, tensorfold_glm_flash_msa_v2 (TF_GLM_MSA=1)
+    .{ .name = "glm_shard", .optional = true, .flags = torch_ops }, // ours: TF_GLM_KV_SHARD's byte movers (GLM 0118 port: cuda_shard_decode.zig, cuda_shard_prompt.zig); without it sharding is refused at start
 };
 
 /// torch.utils.cpp_extension's own nvcc flags (torch 2.13): C++20 and which half/bf16 operators the headers define.
@@ -197,6 +198,9 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const weights_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/flashnext/weights_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "flashnext", .module = mods.flashnext } } });
     const hc_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_hc_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
     b.step("glm-hc-check", "Build tf-glm-hc-check: HC partial byte oracle (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-hc-check", .root_module = hc_check }), .{}).step);
+    // TF_GLM_KV_SHARD: glm_shard.cu's kernels against their host rules (docs/glm-port/gpu-validation.md)
+    const shard_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_shard_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
+    b.step("glm-shard-check", "Build tf-glm-shard-check: glm_shard.cu's kernels against their host rules (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-shard-check", .root_module = shard_check }), .{}).step);
     // GLM vision tower: the GPU tower against the Python reference's stages (zig/tests/vision/tower)
     const vision_check = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_vision_check.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "glm_cuda", .module = mods.glm_cuda } } });
     b.step("glm-vision-check", "Build tf-glm-vision-check: the vision tower stage by stage against the Python tower (GPU)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-vision-check", .root_module = vision_check }), .{}).step);
@@ -263,7 +267,16 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const prefill_tool = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/glm_prefill_check.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "glm_cuda", .module = mods.glm_cuda }} });
     b.step("glm-prefill-check", "Build tf-glm-prefill-check REFERENCE_DIR ACTUAL_DIR (prompt chunk byte oracle)").dependOn(&b.addInstallArtifact(b.addExecutable(.{ .name = "tf-glm-prefill-check", .root_module = prefill_tool }), .{}).step);
     const glm_test = b.addRunArtifact(b.addTest(.{ .root_module = mods.glm_cuda }));
-    b.step("test-glm-cuda-host", "GLM CUDA CPU contracts (foundations, packed sampling, rounds, lanes)").dependOn(&glm_test.step);
+    const glm_host = b.step("test-glm-cuda-host", "GLM CUDA CPU contracts (foundations, packed sampling, rounds, lanes)");
+    glm_host.dependOn(&glm_test.step);
+    // TF_GLM_KV_SHARD: glm_shard.cu's kernels as host C++, every block and thread in turn, against their reference
+    const shard_emulate = b.addExecutable(.{ .name = "glm-shard-emulate", .root_module = b.createModule(.{ .target = host, .optimize = .debug, .link_libcpp = true }) });
+    shard_emulate.root_module.addCSourceFile(.{ .file = b.path("tools/glm_shard_emulate/emulate.cpp"), .flags = &.{"-std=c++20"} });
+    shard_emulate.root_module.addIncludePath(b.path("tools/glm_shard_emulate"));
+    const shard_emulated = b.addRunArtifact(shard_emulate);
+    shard_emulated.expectExitCode(0);
+    glm_host.dependOn(&shard_emulated.step);
+    step.dependOn(&shard_emulated.step);
     const serve_test = b.step("test-glm-serve", "GLM serving and drafted-versus-serial CPU contracts");
     serve_test.dependOn(&glm_test.step);
     const cli_tests = b.createModule(.{

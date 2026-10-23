@@ -12,6 +12,7 @@ const hc = @import("cuda_hc.zig");
 const kd = @import("cuda_kda_interface.zig");
 const side_mod = @import("cuda_side.zig");
 const l2pf = @import("cuda_l2pf.zig");
+const shard_dec = @import("cuda_shard_decode.zig");
 pub const Comm = @import("cuda_comm.zig").Comm;
 pub const KdaW = struct { proj: mm.Q4, fb: mm.Q4, gb: mm.Q4, o: mm.Q4, fa_off: usize, ga_off: usize, b_off: usize, conv: u64, a_log: u64, dt_bias: u64, norm: u64 };
 pub const DsaW = struct { proj: mm.Q4, qb: mm.Q4, o: mm.Q4, kw: mm.Q4, iqb: mm.Q4, q_norm: u64, kv_norm: u64, wk: u64, wv: u64, gate: u64, ln_w: u64, ln_b: u64, ape: u64 };
@@ -156,6 +157,8 @@ pub const Forward = struct {
     side: ?*const side_mod.Side = null,
     /// TF_GLM_L2PF: the next kernels' weights prefetched on a side stream at three sites a layer (l2pf.py); null: off.
     pf: ?*l2pf.Prefetch = null,
+    /// TF_GLM_KV_SHARD: owner-computed decode (cuda_shard_decode.zig); null: off, every launch as before.
+    shard: ?*shard_dec.Decode = null,
     /// Optional diagnostic observer runs outside graph capture; it synchronizes/copies at the layer boundary.
     observer: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque, usize, u64, usize) anyerror!void } = null,
     pub fn mat(f: *const Forward, x: u64, stride: usize, xs: u64, w: mm.Q4, out: u64, rows: usize, fp32: bool) !void {
@@ -204,12 +207,15 @@ pub const Forward = struct {
         const dense = origin != null and !f.tables.anySparse();
         const lc = f.caches.latent[li];
         const pk = f.caches.pooled[li];
+        // TF_GLM_KV_SHARD: the MTP head's caches are not sharded (refused at start)
+        if (f.shard != null and origin != null) return error.KvShardWithMtp;
         try f.mat(f.b.normed, 4096, f.b.xs, w.proj, s.dp, rows, false);
         try f.norm(s.dp, 2048, w.q_norm, s.qr, 1536, s.qr_sums, rows);
         // q_b consumes qr sums before the shared sums scratch is reused for latents.
         try f.mat(s.qr, 1536, s.qr_sums, w.qb, s.q, rows, false);
         try f.norm(s.dp + 1536 * 2, 2048, w.kv_norm, s.lat, 512, s.sums, rows);
-        try t.seg_lat_write(.{ rows, 1, 1 }, s.lat, 512, lc, lc, pos, base, .{ .LW = 512, .RS = 528, .FP8 = 1 });
+        // TF_GLM_KV_SHARD: a row this rank does not own writes its trash row (pooled keys and selection as before)
+        if (f.shard != null) try shard_dec.latWrite(t, f.tables, rows, s.lat, lc) else try t.seg_lat_write(.{ rows, 1, 1 }, s.lat, 512, lc, lc, pos, base, .{ .LW = 512, .RS = 528, .FP8 = 1 });
         try f.mat(f.b.normed, 4096, f.b.xs, w.kw, s.ikr, rows, false);
         try f.router(w.gate, s.igr, 128, rows);
         try t.seg_index_write(.{ rows, 1, 1 }, s.ikr, 160, s.igr, w.ln_w, w.ln_b, f.caches.keys[li], f.caches.gates[li], pos, ibase, ci(f.caches.ring), 1e-6, .{ .D = 128 }); // sparse.py:612: the indexer LayerNorm eps is 1e-6 (not the model eps)
@@ -225,10 +231,15 @@ pub const Forward = struct {
         if (f.pf) |pre| try pre.site(f.tri.s, index, .o, rows);
         const hb: usize = if (rows >= 8) 32 else 16;
         const nch: usize = if (dense) (@as(usize, @intCast(f.tables.plane(0)[rows - 1])) + 1 + 511) / 512 else 5;
-        if (dense) {
-            try t.dense_chunks(.{ rows, (h + hb - 1) / hb, nch }, s.qa, lc, lc, origin.?, s.po, s.pm, s.pl, ci(rows), .{ .H = c(h), .LW = 512, .CH = 512, .SCALE = 0.0625, .HBT = c(hb), .KTT = 32, .RS = 528, .FP8 = 1 });
-        } else try t.seg_chunks(.{ rows, (h + hb - 1) / hb, 5 }, s.qa, lc, lc, pos, base, spr, s.tokens, s.counts, s.po, s.pm, s.pl, ci(rows), .{ .W = 2051, .H = c(h), .LW = 512, .CH = 512, .SCALE = 0.0625, .HBT = c(hb), .KTT = 32, .RS = 528, .FP8 = 1 });
-        try t.merge(.{ rows, h, 1 }, s.po, s.pm, s.pl, s.ol, s.counts, ci(rows), .{ .H = c(h), .LW = 512, .NCH = c(nch), .SPARSE = 0 });
+        if (f.shard) |sd| {
+            // TF_GLM_KV_SHARD: each row's owner attends all 64 heads (two passes); s.ol ends with this rank's heads
+            try sd.attend(t, .{ .rows = rows, .rank = f.g.rank, .hb = hb, .qa = s.qa, .lc = lc, .pos = pos, .lbase = try shard_dec.plane(f.tables, .lbase), .sparse = try shard_dec.plane(f.tables, .sparse_eff), .own = try shard_dec.plane(f.tables, .own), .tokens = s.tokens, .counts = s.counts, .out = s.ol, .po = s.po, .pm = s.pm, .pl = s.pl });
+        } else {
+            if (dense) {
+                try t.dense_chunks(.{ rows, (h + hb - 1) / hb, nch }, s.qa, lc, lc, origin.?, s.po, s.pm, s.pl, ci(rows), .{ .H = c(h), .LW = 512, .CH = 512, .SCALE = 0.0625, .HBT = c(hb), .KTT = 32, .RS = 528, .FP8 = 1 });
+            } else try t.seg_chunks(.{ rows, (h + hb - 1) / hb, 5 }, s.qa, lc, lc, pos, base, spr, s.tokens, s.counts, s.po, s.pm, s.pl, ci(rows), .{ .W = 2051, .H = c(h), .LW = 512, .CH = 512, .SCALE = 0.0625, .HBT = c(hb), .KTT = 32, .RS = 528, .FP8 = 1 });
+            try t.merge(.{ rows, h, 1 }, s.po, s.pm, s.pl, s.ol, s.counts, ci(rows), .{ .H = c(h), .LW = 512, .NCH = c(nch), .SPARSE = 0 });
+        }
         try t.expand_v(.{ h, 16, 1 }, s.ol, w.wv, s.o, ci(rows), .{ .H = c(h), .DV = 256, .LW = 512, .BN = 16 });
         try f.mat(s.o, h * 256, try f.sums(s.o, h * 256, h * 256, rows), w.o, f.b.part, rows, true);
     }
@@ -272,6 +283,8 @@ pub const Forward = struct {
     pub fn compute(f: *const Forward, rows: usize) !void {
         if (rows == 0 or rows > f.b.rows or rows > f.s.rows) return error.BadRows;
         if (f.g.world > 1 and (f.comm == null or f.comm.?.world != f.g.world or f.comm.?.rank != f.g.rank)) return error.MissingCommunicator;
+        // TF_GLM_KV_SHARD: the window's crossing rows and whether it is being captured, for its exchanges
+        if (f.shard) |sd| try sd.round(f.tables, f.tri.s);
         try f.tri.embed(f.b.ids, f.weights.embed, f.b.x, rows, 4);
         var ki: usize = 0;
         var ai: usize = 0;

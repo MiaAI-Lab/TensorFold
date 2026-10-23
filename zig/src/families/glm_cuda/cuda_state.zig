@@ -79,7 +79,9 @@ pub const Slots = struct {
 /// `latent` then points at the extent's twin here, else it is `no_latent`, as Python's Plane.view gives None: nothing
 /// on this rank may write or copy a latent row of it, and a consumer refuses such a view or branches on `owner`. The
 /// rows of its decode windows reach this rank's trash rows through the window's glue, not a view.) `capacity` stays
-/// the extent's: the pooled keys hold every row on every rank.
+/// the extent's: the pooled keys hold every row on every rank. `twin`: the stream's prompt fills with borrowed rows
+/// (TF_GLM_KV_SHARD_TWINS), so both ranks hold its latent rows (the owner its own, the other rank its twin) and both
+/// attend as unsharded.
 pub const CacheView = struct {
     latent: [11]u64,
     pooled: [11]u64,
@@ -88,6 +90,7 @@ pub const CacheView = struct {
     ring_base: usize,
     capacity: usize,
     owner: bool = true,
+    twin: bool = false,
     /// Whether `latent` addresses the extent's rows on this rank (its own, or its twin).
     pub fn hasLatent(v: CacheView) bool {
         return v.latent[0] != no_latent;
@@ -190,7 +193,19 @@ pub const Caches = struct {
     pub fn viewTwin(c: Caches, base: usize, size: usize, slot: usize, twin: usize) !CacheView {
         const s = c.shard orelse return error.BadTwin;
         if (s.owns(base) or !s.owns(twin) or twin % G.extent != 0 or !s.within(twin, size)) return error.BadTwin;
-        return c.viewAt(base, size, slot, twin);
+        var v = try c.viewAt(base, size, slot, twin);
+        v.twin = true;
+        return v;
+    }
+    /// A filling prompt's view while it borrows twin rows at pool row `twin` (in the part the extent is not in): on
+    /// the extent's owner its own rows, on the other rank its twin (`viewTwin`), both marked `twin`.
+    pub fn viewBorrowed(c: Caches, base: usize, size: usize, slot: usize, twin: usize) !CacheView {
+        const s = c.shard orelse return error.BadTwin;
+        if (!s.owns(base)) return c.viewTwin(base, size, slot, twin);
+        if (s.owns(twin) or twin % G.extent != 0 or !s.within(twin, size)) return error.BadTwin;
+        var v = try c.viewAt(base, size, slot, null);
+        v.twin = true;
+        return v;
     }
     fn viewAt(c: Caches, base: usize, size: usize, slot: usize, twin: ?usize) !CacheView {
         if (base % G.extent != 0 or size == 0 or size % G.extent != 0 or base > c.rows or size > c.rows - base or slot >= c.streams) return error.BadExtent;
@@ -342,8 +357,14 @@ test "TF_GLM_KV_SHARD caches: latent planes a part and its trash rows, pooled ke
     try std.testing.expectEqual(mine.pooled[0], theirs.pooled[0]);
     try std.testing.expectEqual(mine.capacity, theirs.capacity);
     const twin = try at.caches(s0).viewTwin(8192 + 2048, 4096, 1, 2048);
-    try std.testing.expect(!twin.owner and twin.hasLatent());
+    try std.testing.expect(!twin.owner and twin.hasLatent() and twin.twin and !mine.twin and !theirs.twin);
     try std.testing.expectEqual(@as(u64, 0x100000 + 2048 * 528), twin.latent[0]);
+    // a borrowing prompt: the owner keeps its own rows, the other rank its twin; both marked
+    const lent = try at.caches(s1).viewBorrowed(8192 + 2048, 4096, 1, 2048);
+    try std.testing.expect(lent.owner and lent.twin and lent.latent[3] == mine.latent[3] and lent.pooled[3] == mine.pooled[3]);
+    try std.testing.expectEqual(twin, try at.caches(s0).viewBorrowed(8192 + 2048, 4096, 1, 2048));
+    try std.testing.expectError(error.BadTwin, at.caches(s1).viewBorrowed(8192 + 2048, 4096, 1, 8192)); // a twin in its own part
+    try std.testing.expectError(error.BadTwin, at.caches(null).viewBorrowed(0, 2048, 0, 8192));
     // an extent across the parts, a twin in the other part or past this one, or one of an owned extent: refused
     try std.testing.expectError(error.BadExtent, at.caches(s0).view(6144, 4096, 0));
     try std.testing.expectError(error.BadTwin, at.caches(s0).viewTwin(8192, 2048, 0, 8192 + 4096));

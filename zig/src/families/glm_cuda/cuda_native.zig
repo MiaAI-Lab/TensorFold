@@ -196,11 +196,13 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 }
 
 /// TF_GLM_KV_SHARD once the ranks agreed on it (each input is in the settings text, so every rank answers alike):
-/// this rank's own read error, a setting sharding cannot serve, or, until its device paths are built, any `on`.
+/// this rank's own read error, a setting sharding cannot serve, or any `on` in a build without its device paths or
+/// glm_shard.cu's kernels.
 fn kvAdmit(read: anyerror!shard.Switches, o: Options, choice: choice_mod.Choice) !shard.Switches {
     const sw = try read;
     try shard.refuse(sw, o.tp, o.parallel, o.drafts and choice == .mtp);
     if (sw.on and !shard.gpu_paths) return error.KvShardNotBuilt;
+    if (sw.on) try shard.kernelsIn(cuda.kernels.available, cuda.kernels.glm_shard);
     return sw;
 }
 
@@ -380,6 +382,12 @@ fn openSpill(own: *Own, o: Options, build_key: u64) ?SpillSettings {
         root = envText("SPILL_DIR") orelse "";
     }
     if (!(gib > 0)) return null;
+    if (own.engine.?.shard != null) {
+        // TF_GLM_KV_SHARD: a kept state's latent rows are on its home part's owner only, and a stored one does not say
+        // which part that was (spill and sharding together: round 3); every rank leaves the tier off alike
+        if (o.rank == 0) std.log.warn("spill: off with TF_GLM_KV_SHARD=1 (a stored state does not record the part its latent rows lie in yet)", .{});
+        return null;
+    }
     if (root.len == 0) {
         const home = envText("HOME") orelse return null;
         root = std.fmt.allocPrint(own.gpa, "{s}/.cache/tensorfold-spill", .{home}) catch return null;
@@ -754,15 +762,16 @@ test "TF_GLM_KV_SHARD: the settings text carries it only when on, a rank that ca
     defer gpa.free(bad);
     try std.testing.expect(std.mem.endsWith(u8, bad, shard.unreadable));
     try std.testing.expect(!std.mem.eql(u8, bad, on) and !std.mem.eql(u8, bad, off));
-    // after the agreement: off passes; this rank's read error; what sharding cannot serve; and, this build, any on
+    // after the agreement: off passes; this rank's read error; what sharding cannot serve; on, with this build's GPU paths
     try std.testing.expectEqual(shard.Switches{}, try kvAdmit(shard.Switches{}, .{ .context = 8, .drafts = false }, .dflash2));
     try std.testing.expectError(error.BadKvShardCheck, kvAdmit(error.BadKvShardCheck, o, .dflash2));
     try std.testing.expectError(error.KvShardNeedsTwoRanks, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = false, .parallel = 4 }, .dflash2));
     try std.testing.expectError(error.KvShardNeedsParallel, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = false, .tp = 2 }, .dflash2));
     try std.testing.expectError(error.KvShardWithMtp, kvAdmit(shard.Switches{ .on = true }, .{ .context = 8, .drafts = true, .tp = 2, .parallel = 2 }, .mtp));
     try std.testing.expectError(error.KvShardWithLone, kvAdmit(shard.Switches{ .on = true, .lone = true }, o, .dflash2));
-    try std.testing.expectError(error.KvShardNotBuilt, kvAdmit(shard.Switches{ .on = true }, o, .dflash2));
+    try std.testing.expectEqual(shard.Switches{ .on = true }, try kvAdmit(shard.Switches{ .on = true }, o, .dflash2));
     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
+    try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: this build has no glm_shard kernels (its fatbins came without glm_shard.fatbin)", refusal(error.NoKvShardKernels).?);
     try std.testing.expect(refusal(error.OutOfMemory) == null);
 }
 
@@ -827,6 +836,30 @@ test "TF_GLM_SPILL_V2: the settings text carries it only when on and after KV sh
     for ([_]anyerror{ error.BadSpillV2, error.SpillV2NeedsTwoRanks, error.SpillV2WithMtp, error.SpillV2WithKvShard, error.SpillV2NoPromptCache, error.SpillV2StoreFailed, error.StagingTooSmall, error.NoEngineId, error.NoRecipePatches, error.NoModelRevision, error.NoDrafterRevision, error.SpillIdentityMismatch }) |e|
         try std.testing.expect(std.mem.startsWith(u8, refusal(e).?, "TF_GLM_SPILL_"));
     try std.testing.expectEqualStrings("TF_GLM_KV_SHARD=1: KV sharding's GPU paths are not in this build yet", refusal(error.KvShardNotBuilt).?);
+}
+
+test "TF_GLM_KV_SHARD=1 is admitted whatever TF_GLM_SPILL_V2 holds: spill v2's own admission refuses the pair, and only with its tier on" {
+    const C = struct {
+        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    };
+    const gpa = std.testing.allocator;
+    const names = [_][:0]const u8{ "TF_GLM_KV_SHARD", "TF_GLM_SPILL_V2" };
+    var was: [names.len]?[:0]u8 = undefined;
+    for (names, &was) |n, *w| w.* = if (std.c.getenv(n.ptr)) |v| try gpa.dupeSentinel(u8, std.mem.span(v), 0) else null;
+    defer for (names, was) |n, w| if (w) |v| {
+        _ = C.setenv(n.ptr, v.ptr, 1);
+        gpa.free(v);
+    } else {
+        _ = C.unsetenv(n.ptr);
+    };
+    _ = C.setenv("TF_GLM_KV_SHARD", "1", 1);
+    // no spill tier asked for (no --spill-gib): nothing would spill, so nothing is refused
+    const o: Options = .{ .context = 8192, .drafts = false, .parallel = 4, .tp = 2 };
+    for ([_][:0]const u8{ "1", " 1 ", "0", "yes" }) |v| {
+        _ = C.setenv("TF_GLM_SPILL_V2", v.ptr, 1);
+        try std.testing.expect((try kvAdmit(shard.Switches.read(), o, .dflash2)).on);
+    }
 }
 
 test "serving refuses more than eight lanes before any CUDA call" {

@@ -13,6 +13,8 @@
 //! Nothing else carries over a chunk boundary: the HC streams, the router, the selections are chunk-local, and
 //! `pos_dev` is written by every chunk. Pure arithmetic and copies: tests run on host memory standing in for the
 //! device (`Copier`).
+//! TF_GLM_KV_SHARD: the latent rows are on the stream's owner only, so only that rank's buffer holds them
+//! (`Sections.rows`); every other section is on both ranks (cuda_shard_keep.zig puts them back, or carries them).
 const std = @import("std");
 const state = @import("cuda_state.zig");
 const G = state.Geometry;
@@ -53,7 +55,10 @@ pub const Sections = struct {
     conv: usize,
     draft: usize,
     total: usize,
+    /// whether the buffer holds the latent rows (TF_GLM_KV_SHARD: on the rank that owned the stream's extent only)
+    rows: bool = true,
 
+    /// A latent plane's rows of the state (the latent section holds 11 of them when `rows`).
     pub fn latentBytes(s: Sections) usize {
         return s.at * G.latent_row;
     }
@@ -75,10 +80,15 @@ pub fn convLayerBytes(g: G) usize {
 
 /// The buffer's sections for a state of `at` tokens; `draft_bytes` 0 without a drafter. Every section 256-aligned.
 pub fn sections(g: G, at: usize, ring: usize, draft_bytes: usize) Sections {
-    var s: Sections = .{ .at = at, .ring = ring, .latent = 0, .pooled = 0, .rings = 0, .rec = 0, .conv = 0, .draft = 0, .total = 0 };
+    return sectionsOf(g, at, ring, draft_bytes, true);
+}
+
+/// `sections`, the latent rows held or not (`rows`; TF_GLM_KV_SHARD: false on the rank that did not own the stream).
+pub fn sectionsOf(g: G, at: usize, ring: usize, draft_bytes: usize, rows: bool) Sections {
+    var s: Sections = .{ .at = at, .ring = ring, .latent = 0, .pooled = 0, .rings = 0, .rec = 0, .conv = 0, .draft = 0, .total = 0, .rows = rows };
     var off: usize = 0;
     s.latent = off;
-    off += std.mem.alignForward(usize, G.dsa_layers * s.latentBytes(), 256);
+    if (rows) off += std.mem.alignForward(usize, G.dsa_layers * s.latentBytes(), 256);
     s.pooled = off;
     off += std.mem.alignForward(usize, G.dsa_layers * s.pooledBytes(), 256);
     s.rings = off;
@@ -93,12 +103,12 @@ pub fn sections(g: G, at: usize, ring: usize, draft_bytes: usize) Sections {
     return s;
 }
 
-/// Copy a sequence's state out of its live caches into `buf` (a device buffer of `s.total` bytes).
+/// Copy a sequence's state out of its live caches into `buf` (a device buffer of `s.total` bytes): the latent rows
+/// when the sections hold them (a view with none here cannot give them: NoLatentRows, before any copy).
 pub fn save(c: Copier, g: G, s: Sections, buf: u64, st: *const state.State, draft: ?Draft) !void {
-    // TF_GLM_KV_SHARD: the other rank's extent has no latent rows here (a sharded state: owner rows only, round 3)
-    if (!st.cache.hasLatent()) return error.NoLatentRows;
+    if (s.rows and !st.cache.hasLatent()) return error.NoLatentRows;
     for (0..G.dsa_layers) |i| {
-        try c.go(buf + s.latent + i * s.latentBytes(), st.cache.latent[i], s.latentBytes());
+        if (s.rows) try c.go(buf + s.latent + i * s.latentBytes(), st.cache.latent[i], s.latentBytes());
         try c.go(buf + s.pooled + i * s.pooledBytes(), st.cache.pooled[i], s.pooledBytes());
         try c.go(buf + s.rings + (2 * i) * s.ringBytes(), st.cache.keys[i], s.ringBytes());
         try c.go(buf + s.rings + (2 * i + 1) * s.ringBytes(), st.cache.gates[i], s.ringBytes());
@@ -110,12 +120,13 @@ pub fn save(c: Copier, g: G, s: Sections, buf: u64, st: *const state.State, draf
     if (draft) |d| try draftCopy(c, d, buf + s.draft, true);
 }
 
-/// Put a saved state into a sequence's caches. The recurrent states go to the parity each layer holds now.
-pub fn restore(c: Copier, g: G, s: Sections, buf: u64, st: *const state.State, draft: ?Draft) !void {
-    // TF_GLM_KV_SHARD: the other rank's extent has no latent rows here (a sharded state: owner rows only, round 3)
-    if (!st.cache.hasLatent()) return error.NoLatentRows;
+/// Put a saved state into a sequence's caches. The recurrent states go to the parity each layer holds now. `rows`: the
+/// latent rows too, which needs them in the buffer and the view (NoLatentRows, before any copy); TF_GLM_KV_SHARD puts
+/// them back only on the rank that holds both (cuda_shard_keep.latentRole), and a carry brings them otherwise.
+pub fn restore(c: Copier, g: G, s: Sections, buf: u64, st: *const state.State, draft: ?Draft, rows: bool) !void {
+    if (rows and (!s.rows or !st.cache.hasLatent())) return error.NoLatentRows;
     for (0..G.dsa_layers) |i| {
-        try c.go(st.cache.latent[i], buf + s.latent + i * s.latentBytes(), s.latentBytes());
+        if (rows) try c.go(st.cache.latent[i], buf + s.latent + i * s.latentBytes(), s.latentBytes());
         try c.go(st.cache.pooled[i], buf + s.pooled + i * s.pooledBytes(), s.pooledBytes());
         try c.go(st.cache.keys[i], buf + s.rings + (2 * i) * s.ringBytes(), s.ringBytes());
         try c.go(st.cache.gates[i], buf + s.rings + (2 * i + 1) * s.ringBytes(), s.ringBytes());
@@ -262,7 +273,7 @@ test "a saved state restores the rows, rings, recurrent parity and drafter ring 
     try save(c, a.g, s, @intFromPtr(buf.ptr), &a.st, a.draft(1));
     const before = try gpa.dupe(u8, b.latent[4]);
     defer gpa.free(before);
-    try restore(c, a.g, s, @intFromPtr(buf.ptr), &b.st, b.draft(0));
+    try restore(c, a.g, s, @intFromPtr(buf.ptr), &b.st, b.draft(0), true);
     for (0..11) |i| {
         try std.testing.expectEqualSlices(u8, a.latent[i][0 .. at * G.latent_row], b.latent[i][0 .. at * G.latent_row]);
         try std.testing.expectEqualSlices(u8, a.pooled[i][0 .. (at / 4 + 1) * G.pool_row], b.pooled[i][0 .. (at / 4 + 1) * G.pool_row]);
@@ -288,7 +299,7 @@ test "a saved state restores the rows, rings, recurrent parity and drafter ring 
     };
 }
 
-test "TF_GLM_KV_SHARD: a state whose view has no latent rows on this rank (the other rank's extent) is neither saved nor restored, before any copy" {
+test "TF_GLM_KV_SHARD: latent rows a view does not have here are neither saved nor restored, before any copy; without them the rest is" {
     const gpa = std.testing.allocator;
     var a = try Fake.init(gpa, 256, 64, 0);
     defer a.deinit();
@@ -305,8 +316,38 @@ test "TF_GLM_KV_SHARD: a state whose view has no latent rows on this rank (the o
     const c: Copier = .{ .ptr = &count, .copy = Count.copy };
     const s = sections(a.g, 192, 64, 0);
     try std.testing.expectError(error.NoLatentRows, save(c, a.g, s, 0x1000, &a.st, null));
-    try std.testing.expectError(error.NoLatentRows, restore(c, a.g, s, 0x1000, &a.st, null));
+    try std.testing.expectError(error.NoLatentRows, restore(c, a.g, s, 0x1000, &a.st, null, true));
+    try std.testing.expectError(error.NoLatentRows, restore(c, a.g, sectionsOf(a.g, 192, 64, 0, false), 0x1000, &a.st, null, true));
     try std.testing.expectEqual(@as(usize, 0), count.n);
+    // the other rank's sections: the latent section empty, everything else alike
+    const t = sectionsOf(a.g, 192, 64, 0, false);
+    try std.testing.expectEqual(s.total - std.mem.alignForward(usize, G.dsa_layers * s.latentBytes(), 256), t.total);
+    try std.testing.expectEqual(s.conv - s.pooled, t.conv - t.pooled);
+}
+
+test "TF_GLM_KV_SHARD: a state kept without its latent rows saves and restores everything else, the latent rows left alone" {
+    const gpa = std.testing.allocator;
+    var a = try Fake.init(gpa, 256, 64, 1);
+    defer a.deinit();
+    var b = try Fake.init(gpa, 256, 64, 0);
+    defer b.deinit();
+    a.fill(3);
+    b.fill(4);
+    const at = 128;
+    const s = sectionsOf(a.g, at, 64, a.draft(1).bytes(), false);
+    const buf = try gpa.alloc(u8, s.total);
+    defer gpa.free(buf);
+    const c = HostCopy.copier();
+    // the rank without the stream's rows: its view has none
+    a.st.cache.owner = false;
+    a.st.cache.latent = @splat(state.no_latent);
+    try save(c, a.g, s, @intFromPtr(buf.ptr), &a.st, a.draft(1));
+    const before = try gpa.dupe(u8, b.latent[7]);
+    defer gpa.free(before);
+    try restore(c, a.g, s, @intFromPtr(buf.ptr), &b.st, b.draft(0), false);
+    try std.testing.expectEqualSlices(u8, before, b.latent[7]);
+    for (0..11) |i| try std.testing.expectEqualSlices(u8, a.pooled[i][0 .. (at / 4 + 1) * G.pool_row], b.pooled[i][0 .. (at / 4 + 1) * G.pool_row]);
+    try std.testing.expectEqualSlices(u8, a.conv, b.conv);
 }
 
 test "section sizes follow the geometry and stay 256-aligned" {

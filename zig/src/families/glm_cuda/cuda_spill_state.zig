@@ -754,7 +754,7 @@ test "pack then unpack gives the kept state back, whole blocks, a tail and a one
         var other = try Live.init(gpa, 4096 + 256, 128, l.drafter);
         defer other.deinit();
         other.run(99, 0, 4096 + 256);
-        try snapshot.restore(HostCopy.snapCopier(), live.g, u.kept.sec, u.kept.buf, &other.st, other.draft());
+        try snapshot.restore(HostCopy.snapCopier(), live.g, u.kept.sec, u.kept.buf, &other.st, other.draft(), true);
         for (0..11) |i| {
             try testing.expectEqualSlices(u8, live.latent[i][0 .. at * G.latent_row], other.latent[i][0 .. at * G.latent_row]);
             try testing.expectEqualSlices(u8, live.pooled[i][0 .. at / 4 * G.pool_row], other.pooled[i][0 .. at / 4 * G.pool_row]);
@@ -847,7 +847,7 @@ test "two turns of a conversation and a fork share their earlier blocks: equal n
     var t2 = try live.keep(&l);
     defer t2.deinit(gpa);
     // a fork: turn 1 resumed (its kept state restored) and another reply computed from 3,072 to 4,096
-    try snapshot.restore(HostCopy.snapCopier(), live.g, t1.k.sec, t1.k.buf, &live.st, null);
+    try snapshot.restore(HostCopy.snapCopier(), live.g, t1.k.sec, t1.k.buf, &live.st, null, true);
     live.run(2, 3072, 4096);
     var fk = try live.keep(&l);
     defer fk.deinit(gpa);
@@ -1081,7 +1081,7 @@ test "the store: two turns and a fork written, their shared blocks once, each re
     live.run(1, 3072, 4608);
     var t2 = try live.keep(&l);
     defer t2.deinit(gpa);
-    try snapshot.restore(HostCopy.snapCopier(), live.g, t1.k.sec, t1.k.buf, &live.st, null);
+    try snapshot.restore(HostCopy.snapCopier(), live.g, t1.k.sec, t1.k.buf, &live.st, null, true);
     live.run(2, 3072, 4096);
     var fk = try live.keep(&l);
     defer fk.deinit(gpa);
