@@ -32,6 +32,7 @@ pub fn health(srv: *Server, conn: *Conn, a: Allocator) !void {
     }
     try o.put(a, "memory", .{ .object = memory });
     if (status.kept) |k| try keptFields(a, o, k);
+    if (status.cache) |c| try putCache(a, o, c);
     try o.put(a, "live", try live.snapshot(a, srv.engine));
     if (srv.config.recipe.glm) try @import("glm_health.zig").add(srv, a, o, status);
     routes.sendValue(conn, a, 200, .{ .object = o });
@@ -69,6 +70,30 @@ fn keptFields(a: Allocator, o: *json.Object, k: api.prompt_cache.KeptStats) !voi
         for (names, k.spill) |name, v| try sp.put(a, name, try json.intValue(a, v));
         try o.put(a, "spill", .{ .object = sp });
     }
+}
+
+/// The prompt cache's counters with its durable tier (spill v2, the DeepSeek port's names): chats_continued and
+/// chats_continued_prefill_tokens on top, every counter under prompt_cache (beside the kept states' hits, misses,
+/// evicted and restored_from_disk), the tier's own under prompt_cache.spill (an array, one object per rank, rank 0
+/// first).
+pub fn putCache(a: Allocator, o: *json.Object, c: api.CacheStats) Allocator.Error!void {
+    try o.put(a, "chats_continued", try json.intValue(a, c.chats_continued));
+    try o.put(a, "chats_continued_prefill_tokens", try json.intValue(a, c.chats_continued_prefill_tokens));
+    const pc = if (o.get("prompt_cache")) |v| (if (v == .object) v.object else try json.newObject(a)) else try json.newObject(a);
+    const info = @typeInfo(api.CacheStats).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| if (T == u64) try pc.put(a, name, try json.intValue(a, @field(c, name)));
+    if (c.spill) |rc| {
+        const ranks = rc.slice();
+        const arr = try a.alloc(Value, ranks.len);
+        for (ranks, arr, 0..) |t, *v, r| {
+            const sp = try json.newObject(a);
+            try sp.put(a, "rank", try json.intValue(a, r));
+            inline for (@typeInfo(@TypeOf(t)).@"struct".field_names) |name| try sp.put(a, name, try json.intValue(a, @field(t, name)));
+            v.* = .{ .object = sp };
+        }
+        try pc.put(a, "spill", .{ .array = arr });
+    }
+    try o.put(a, "prompt_cache", .{ .object = pc });
 }
 
 pub fn models(srv: *Server, conn: *Conn, a: Allocator) !void {
@@ -208,4 +233,32 @@ test "health shows the kept prompt states: count, bytes, caps, the own/shared mi
     const text = try json.stringify(a, .{ .object = o }, .{});
     for ([_][]const u8{ "\"kept_prompts\": 3", "\"kept_bytes\": 1000", "\"kept_bytes_cap\": 4096", "\"own\": 2", "\"shared\": 1", "\"chats\": 2", "\"rows\": 300", "\"by_chat\": [[1, 2, 200], [2, 1, 100]]", "\"hits\": 5", "\"restored_from_disk\": 1", "\"spill\"", "\"writes\": 6" }) |want|
         try std.testing.expect(std.mem.indexOf(u8, text, want) != null);
+}
+
+test "health's v2 tier counters: the continuation names on top, every counter under prompt_cache beside the kept states', the tier's per rank under spill" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const o = try json.newObject(a);
+    try keptFields(a, o, .{ .prompts = 1, .hits = 5, .evicted = 2 }); // (a tier turns v1 off: no top-level spill)
+    var ranks: api.prompt_cache.RankCounts = .{ .n = 2 };
+    ranks.ranks[0].points = 5;
+    ranks.ranks[1].points = 4;
+    try putCache(a, o, .{ .chats_continued = 1, .memory_hits = 5, .evicted = 2, .disk_hits_committed = 3, .restores_deferred = 2, .spill = ranks });
+    try std.testing.expectEqualStrings("1", o.get("chats_continued").?.int);
+    try std.testing.expect(o.get("spill") == null);
+    const pc = o.get("prompt_cache").?.object;
+    try std.testing.expectEqualStrings("5", pc.get("hits").?.int); // the kept states' own names stay
+    try std.testing.expectEqualStrings("5", pc.get("memory_hits").?.int);
+    try std.testing.expectEqualStrings("3", pc.get("disk_hits_committed").?.int);
+    try std.testing.expectEqualStrings("2", pc.get("restores_deferred").?.int);
+    try std.testing.expectEqualStrings("0", pc.get("parked").?.int);
+    const spill = pc.get("spill").?.array;
+    try std.testing.expectEqual(@as(usize, 2), spill.len);
+    try std.testing.expectEqualStrings("5", spill[0].object.get("points").?.int);
+    try std.testing.expectEqualStrings("1", spill[1].object.get("rank").?.int);
+    try std.testing.expectEqualStrings("4", spill[1].object.get("points").?.int);
+    const none = try json.newObject(a);
+    try putCache(a, none, .{});
+    try std.testing.expect(none.get("prompt_cache").?.object.get("spill") == null);
 }

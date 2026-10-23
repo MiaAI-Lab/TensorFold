@@ -53,6 +53,7 @@ pub const Fake = struct {
     answer_cycles: bool = false,
     prefill_chunks: usize = 0,
     prefill_count: usize = 0,
+    bursts: usize = 0, // backendBurst's prefill_many calls
     prefill_hook: ?*const fn (ctx: *anyopaque, s: *Stream, chunk: usize) void = null,
     prefill_hook_ctx: ?*anyopaque = null,
     /// backendSliced: prompt tokens a fill takes a step (its pass runs when they reach the prompt's length)
@@ -82,6 +83,17 @@ pub const Fake = struct {
 
     pub fn backend(x: *Fake) be.Backend {
         return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts } };
+    }
+
+    /// The same target with `prefill_many`: a burst's prompts each run whole, one after another in the one call (Mia's
+    /// GLM engine, whose `manyFit` never holds; `bursts` counts the calls).
+    pub fn backendBurst(x: *Fake) be.Backend {
+        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .features = features, .release = release, .first_row = firstRow, .alternatives = alternatives, .held = heldDrafts, .prefill_many = prefillMany } };
+    }
+
+    fn prefillMany(ptr: *anyopaque, ss: []const *Stream) anyerror!void {
+        self(ptr).bursts += 1;
+        for (ss) |s| try prefill(ptr, s);
     }
 
     /// The same target filling its prompt a chunk a call (`prefill_chunks`), as a backend with `prefill_step`.

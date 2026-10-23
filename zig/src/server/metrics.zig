@@ -165,8 +165,34 @@ pub const Metrics = struct {
         try histogram(w, "request_prefill_time_seconds", "Seconds a finished request's prompt pass took, under vLLM's name.", snap.prefill);
         try gauge(w, "client_disconnections_total", "counter", "Requests a client left before the reply left the server.", snap.disconnects);
         if (status.preemptions) |p| try gauge(w, "preemptions_total", "counter", "Requests that had to give a lane up to a later one.", p);
+        if (status.cache) |c| try cacheFamilies(w, c);
     }
 };
+
+/// The prompt cache's counters with its durable tier (spill v2, the DeepSeek port's names): continuation's, then
+/// tensorfold:prompt_cache_* and the tier's tensorfold:spill_*{rank="N"}.
+pub fn cacheFamilies(w: *std.Io.Writer, c: api.CacheStats) !void {
+    const H = api.CacheStats.help;
+    try gauge(w, "chats_continued", "counter", H.chats_continued, c.chats_continued);
+    try gauge(w, "chats_continued_prefill_tokens", "counter", H.chats_continued_prefill_tokens, c.chats_continued_prefill_tokens);
+    const info = @typeInfo(api.CacheStats).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| if (T == u64) {
+        try gauge(w, "prompt_cache_" ++ name, comptime kindOf(&api.CacheStats.gauges, name), @field(H, name), @field(c, name));
+    };
+    if (c.spill) |rc| { // every rank's, labelled (the disk tiers are per rank)
+        const T = api.prompt_cache.TierCounts;
+        inline for (@typeInfo(T).@"struct".field_names) |name| {
+            try family(w, "spill_" ++ name, comptime kindOf(&T.gauges, name), @field(T.help, name));
+            for (rc.slice(), 0..) |t, r| try w.print("{s}spill_{s}{{rank=\"{d}\"}} {d}\n", .{ prefix, name, r, @field(t, name) });
+        }
+    }
+}
+
+fn kindOf(comptime gauges: []const []const u8, comptime name: []const u8) []const u8 {
+    @setEvalBranchQuota(100_000);
+    for (gauges) |g| if (std.mem.eql(u8, g, name)) return "gauge";
+    return "counter";
+}
 
 fn family(w: *std.Io.Writer, name: []const u8, kind: []const u8, help: []const u8) !void {
     try w.print("# HELP {s}{s} {s}\n# TYPE {s}{s} {s}\n", .{ prefix, name, help, prefix, name, kind });
@@ -366,4 +392,34 @@ test "request counter append failure frees its label" {
     m.httpRequest(std.testing.io, "client", 200);
     try std.testing.expectEqual(@as(u64, 2), m.requests.items[0].count);
     try std.testing.expectEqual(allocations, failing.allocations);
+}
+
+test "cache families: present only with the v2 tier's counters, every field with its kind and help, the tier's per rank" {
+    const gpa = std.testing.allocator;
+    var m: Metrics = .{ .gpa = gpa };
+    var stub: RenderStub = .{};
+    var plain: std.Io.Writer.Allocating = .init(gpa);
+    defer plain.deinit();
+    try m.render(std.testing.io, &plain.writer, stub.engine(), 4096);
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "chats_continued") == null);
+    try std.testing.expect(std.mem.indexOf(u8, plain.written(), "prompt_cache_") == null);
+    var ranks: api.prompt_cache.RankCounts = .{ .n = 2 };
+    ranks.ranks[0] = .{ .writes_committed = 9, .staging_peak = 7 };
+    ranks.ranks[1] = .{ .writes_committed = 8, .crc_errors = 1 };
+    stub.status_value.cache = .{ .chats_continued = 1, .restores_active = 2, .restores_deferred = 3, .spill = ranks };
+    var out: std.Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try m.render(std.testing.io, &out.writer, stub.engine(), 4096);
+    const body = out.written();
+    for ([_][]const u8{
+        "tensorfold:chats_continued 1\n",
+        "# TYPE tensorfold:prompt_cache_restores_active gauge\n",
+        "tensorfold:prompt_cache_restores_active 2\n",
+        "# TYPE tensorfold:prompt_cache_disk_hits_committed counter\n",
+        "tensorfold:prompt_cache_restores_deferred 3\n",
+        "tensorfold:spill_writes_committed{rank=\"0\"} 9\n",
+        "tensorfold:spill_writes_committed{rank=\"1\"} 8\n",
+        "tensorfold:spill_crc_errors{rank=\"1\"} 1\n",
+        "# TYPE tensorfold:spill_staging_peak gauge\n",
+    }) |line| try std.testing.expect(std.mem.indexOf(u8, body, line) != null);
 }

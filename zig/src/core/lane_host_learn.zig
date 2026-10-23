@@ -14,10 +14,11 @@ pub fn submit(ctx: *anyopaque, request: *const api.LearnRequest, sink: api.Learn
     h.wake.signal(h.io);
 }
 
-/// Learning runs only when nothing else waits: no stream, queued request or cancel (called under the lock).
+/// Learning runs only when nothing else waits: no stream, queued or parked request or cancel (called under the lock;
+/// moved weights clear the prompt cache, which cancels its restores in flight).
 pub fn ready(h: *const LaneHost) bool {
     const work = h.lesson_open or h.lessons.items.len > 0;
-    return h.learner != null and work and h.queued.items.len == 0 and h.admitted.items.len == 0 and h.cancels.items.len == 0;
+    return h.learner != null and work and h.queued.items.len == 0 and h.admitted.items.len == 0 and h.cancels.items.len == 0 and h.waitingCount() == 0;
 }
 
 /// One unit of learning: open the next lesson if none is open, then step it; moved weights drop every kept prompt.

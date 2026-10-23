@@ -1,4 +1,9 @@
 //! Exact prompt reuse: states are keyed by tokens and canonical decoded intervals through their position.
+//!
+//! The durable tier (`Tier`, spill v2) ports wojo's GLM 0110 (PR #124; BadAd84's block-tier design) as the DeepSeek
+//! port's core has it: kept states are written when kept and read back by restore jobs. It is off until a tier is set
+//! (`setTier`); with none the store behaves and counts exactly as before. A set tier turns the family's v1 disk tier
+//! (`Policy.spill`: `evict`/`stored`/`load`) off: the two are exclusive, and v1 is the rollback.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const imprint = @import("prompt_imprint.zig");
@@ -62,6 +67,10 @@ pub const Snapshots = struct {
         spill_stats: ?*const fn (ptr: *anyopaque, out: *[8]u64) void = null,
         /// Learned state `key`'s files under `dir` removed (the cap needs room, or they no longer read back).
         forget: ?*const fn (ptr: *anyopaque, dir: [:0]const u8, key: u64) void = null,
+        /// Whether `saved` still restores for a prompt of `len` tokens (not stale: the family's own rule); null: always.
+        /// Lookups pass the rest over before comparing lengths, so a stale long state never shadows a usable one or a
+        /// durable point, and a restore of the same point replaces it (`adopt`).
+        usable: ?*const fn (ptr: *anyopaque, saved: Saved, len: u32) bool = null,
     };
 };
 
@@ -165,6 +174,8 @@ pub const Entry = struct {
     chat: u32 = 0, // the conversation (Policy): its request's (`Store.join`), else the state it extends (`chatOf`)
     own: bool = true, // a conversation's own state, not a shared cut
     spilled: bool = false, // the family stored it on disk already (an early write)
+    point: ?u64 = null, // its durable point in the tier (written at keep, or restored from)
+    lineage: []Fork = &.{}, // the computation its rows belong to (store-owned; empty without a tier)
 };
 
 pub const Counts = struct { hits: u64 = 0, misses: u64 = 0, kept: u64 = 0, evicted: u64 = 0, refused: u64 = 0, failed: u64 = 0, restored: u64 = 0, chats_continued: u64 = 0, chats_continued_prefill_tokens: u64 = 0 };
@@ -198,6 +209,297 @@ pub const Kept = struct { held: bool, shared: usize };
 /// The entry a backend restores itself (null: the pass starts at 0) and the pass's marks.
 pub const Lookup = struct { entry: ?*Entry = null, marks: []const u32 = &.{} };
 
+// -- the durable tier (spill v2) --------------------------------------------------------------------------------------
+// A Tier keeps kept states past the memory budget and past the process (GLM's spill tier glues core/spill's per-rank
+// block store and the family's packing to it). The store calls it on the engine thread only and never waits on disk:
+// `lookup` reads the tier's own index, a restore is a job polled between rounds and prompt slices, a write is enqueued
+// at keep and staged by `pump`. All-rank agreement (presence, validation, commit) is the family's, inside `begin` and
+// `poll`: a job is ready only once every rank installed its copy, and failed everywhere when any rank's copy fails.
+//
+// A point holds a state's tokens and its rows, not which rows were decoded (`Entry.decode_spans`): only a state whose
+// rows are all prefilled (no span through its position) is written, and a request that names decoded rows never looks
+// the tier up (as v1's spillRecall), so a family that keeps decoded rows' bits (`LaneHost.decoded_rows`) never mixes
+// them with prefill-only points. GLM names no decoded rows.
+
+/// A durable point the tier holds and found for a prompt.
+pub const Point = struct {
+    /// The tier's name for the point while it lives (a digest of the point on disk).
+    id: u64,
+    /// Prompt tokens the state stands after, and the ids it covers (`at` plus the store's lookahead).
+    at: u32,
+    tokens: u32,
+    /// Memory a restored copy takes in the store (0: the family's `bytes(at)`).
+    bytes: u64 = 0,
+    /// The conversation that wrote it (`Store.groupOf`) and whether it is a shared prefix (persisted with the point).
+    group: u64 = 0,
+    shared: bool = false,
+};
+
+/// A durable lookup: the longest point whose ids are a prefix of `key`, `beyond < at <= max_at`, where a state of the
+/// store may stand (on `grid` when set, at one of `starts` when any). The store checks the answer again.
+pub const Want = struct {
+    key: []const u32,
+    beyond: u32,
+    max_at: u32,
+    /// A planned family's chunk rows when its request names no chunk starts (Rules.grid; 0: anywhere).
+    grid: u32 = 0,
+    /// A planned family's request chunk starts: a point must stand on one (empty: `grid` decides).
+    starts: []const u32 = &.{},
+    lookahead: u32 = 0,
+};
+
+/// A kept state the tier writes (enqueued at keep). `saved` stays the family's: the tier reads it until `release`.
+/// (The DeepSeek port's `Kept`; here `Kept` is the paged store's keep result.)
+pub const Write = struct {
+    saved: Saved,
+    /// Its ids (`at` plus lookahead), valid during the call only.
+    key: []const u32,
+    at: u32,
+    bytes: u64,
+    /// Its conversation (`Store.groupOf` its chat: not repeated by a later process) and whether it is a shared prefix.
+    group: u64 = 0,
+    shared: bool = false,
+    /// The point its rows' computation forks from (the state its pass resumed from; null: a fresh prefill, or a resumed
+    /// state that was never written), and where.
+    parent: ?u64 = null,
+    fork: u32 = 0,
+    /// The computation its rows belong to (0110's lineage; block names are salted with it), valid during the call:
+    /// set whether or not the resumed state was ever written, so sibling forks name their shared blocks alike.
+    lineage: []const Fork = &.{},
+};
+
+/// One step of a state's lineage: computation `name` produced the rows from `at` on (the first step's `at` is 0). A
+/// pass that resumes a state at `at` forks that state's lineage there (GLM 0110 `fork`: the same names for the blocks
+/// before `at`, its own from the block holding `at` on); a fresh prefill starts a lineage of its own.
+pub const Fork = struct { name: u64, at: u32 };
+
+/// A restore job after a poll.
+pub const Poll = union(enum) {
+    /// Still reading or copying: blocks copied so far of its total.
+    pending: struct { done: u64 = 0, total: u64 = 0 },
+    /// Installed on every rank: a family state the store adopts (it owns it from here; `bytes` of memory, 0: bytes(at)),
+    /// and the point's lineage (valid during the call; the store copies it).
+    ready: struct { saved: Saved, bytes: u64 = 0, lineage: []const Fork = &.{} },
+    /// Aborted everywhere (absent on a rank, CRC/size, a guard): the tier released what it reserved.
+    failed: anyerror,
+};
+
+/// The tier's own counters (core/spill fills them; totals unless marked a gauge), one set a rank.
+pub const TierCounts = struct {
+    points: u64 = 0, // gauge: published points
+    blocks: u64 = 0, // gauge: unique blocks on disk
+    stored_bytes: u64 = 0, // gauge: unique bytes on disk (blocks, point files, temporaries)
+    cap_bytes: u64 = 0, // gauge: --spill-gib
+    disk_free_bytes: u64 = 0, // gauge: free bytes on the store's file system
+    staging_bytes: u64 = 0, // gauge: host staging held now (writes, reads, small states)
+    staging_peak: u64 = 0, // gauge: its peak
+    writes_pending: u64 = 0, // gauge: queued points not yet published
+    writes_queued: u64 = 0,
+    writes_committed: u64 = 0,
+    writes_cancelled: u64 = 0, // unpublished points cancelled, for any of the reasons below
+    writes_cancelled_guard: u64 = 0, // their source was about to change and staging could not finish in budget
+    writes_cancelled_staging: u64 = 0, // the staging cap had no room
+    writes_cancelled_shutdown: u64 = 0, // the flush deadline passed
+    writes_failed: u64 = 0,
+    forced_staging: u64 = 0, // ranges staged at once because their source was about to change
+    no_space: u64 = 0, // writes refused by the cap or the free-disk floor
+    dedup_blocks: u64 = 0,
+    dedup_bytes: u64 = 0,
+    written_bytes: u64 = 0,
+    presence_refused: u64 = 0, // a rank lacked the point: no rank restored it
+    compatible_misses: u64 = 0, // lookups with no compatible point
+    crc_errors: u64 = 0,
+    size_errors: u64 = 0, // truncated or oversized files, manifest bounds broken
+    reads: u64 = 0,
+    read_bytes: u64 = 0,
+    read_failed: u64 = 0,
+    evicted_turns: u64 = 0,
+    evicted_forks: u64 = 0,
+    evicted_conversations: u64 = 0,
+    evicted_shared: u64 = 0,
+    quota_trims: u64 = 0,
+    recovered_points: u64 = 0, // published points found at start
+    dropped_temporaries: u64 = 0, // incomplete records removed at start
+
+    pub const gauges = [_][]const u8{ "points", "blocks", "stored_bytes", "cap_bytes", "disk_free_bytes", "staging_bytes", "staging_peak", "writes_pending" };
+
+    /// Each field's /metrics help (a missing one fails the build).
+    pub const help = .{
+        .points = "Published points in this rank's disk tier.",
+        .blocks = "Unique blocks on this rank's disk.",
+        .stored_bytes = "Unique bytes the disk tier holds (blocks, point files, temporaries).",
+        .cap_bytes = "The disk tier's cap (--spill-gib).",
+        .disk_free_bytes = "Free bytes on the disk tier's file system.",
+        .staging_bytes = "Host staging the disk tier holds now.",
+        .staging_peak = "The most host staging the disk tier has held.",
+        .writes_pending = "Kept states queued for the disk, not yet published.",
+        .writes_queued = "Kept states queued for the disk.",
+        .writes_committed = "Points published on disk (manifest last).",
+        .writes_cancelled = "Unpublished points cancelled (a guard could not stage, staging full, shutdown).",
+        .writes_cancelled_guard = "Unpublished points cancelled because their source was about to change.",
+        .writes_cancelled_staging = "Unpublished points cancelled because staging had no room.",
+        .writes_cancelled_shutdown = "Unpublished points cancelled at the flush deadline.",
+        .writes_failed = "Disk writes that failed.",
+        .forced_staging = "Ranges staged at once because their source was about to change.",
+        .no_space = "Writes refused by the cap or the free-disk floor.",
+        .dedup_blocks = "Blocks linked to equal bytes already on disk.",
+        .dedup_bytes = "Bytes those links saved.",
+        .written_bytes = "Bytes written to disk.",
+        .presence_refused = "Restores refused because a rank lacked the point.",
+        .compatible_misses = "Durable lookups with no compatible point.",
+        .crc_errors = "Blocks or sections that failed their CRC.",
+        .size_errors = "Files truncated or past their manifest's bounds.",
+        .reads = "Points read for restores.",
+        .read_bytes = "Bytes read for restores.",
+        .read_failed = "Restore reads that failed.",
+        .evicted_turns = "Old turns evicted from disk.",
+        .evicted_forks = "Abandoned forks evicted from disk.",
+        .evicted_conversations = "Whole conversations evicted from disk.",
+        .evicted_shared = "Shared-prefix points evicted from disk.",
+        .quota_trims = "Writes that trimmed their conversation to its quota.",
+        .recovered_points = "Published points found at start.",
+        .dropped_temporaries = "Incomplete records removed at start.",
+    };
+};
+
+/// Tier.begin's refusals for capacity: nothing was reserved and the same begin may succeed once a restore in flight
+/// ends. core/spill's store: TooMany (its reads in flight), NoSlot (no staging slot); a family tier: TooManyRestores
+/// (its cap of restores in flight); any tier: Busy. error.TierFull: the store's own refusal when the tier reports
+/// itself full (Tier.VTable.full) before any room is made.
+pub const capacity_errors = [_]anyerror{ error.TierFull, error.TooManyRestores, error.TooMany, error.NoSlot, error.Busy };
+
+/// Refusals that name the point itself, never deferred (Store.deferrable): the store's NoTier and BadPoint; a family
+/// tier's UnknownPoint, BadPoint, SpillMissing (absent here), SpillNotOnEveryRank; core/spill's Missing; the fake
+/// tier's PointMissing. No wait cures them (the tier forgets a point it learned is gone), with one exception:
+/// SpillNotOnEveryRank is also GLM's answer while a rank's own write of the point is still queued (`incomplete`, kept
+/// on every rank), which a later ask would find published. It stays here: rank 0 cannot see that write publish without
+/// asking every rank `has` again, a gather each time, and the case needs a lookup to choose the point (its memory state
+/// already evicted) while another rank is still writing it.
+pub const point_errors = [_]anyerror{
+    error.NoTier,
+    error.BadPoint,
+    error.UnknownPoint,
+    error.SpillMissing,
+    error.SpillNotOnEveryRank,
+    error.Missing,
+    error.PointMissing,
+};
+
+/// The ranks a tier reports counters for (TP ranks; more are not reported).
+pub const max_ranks = 8;
+
+/// Each rank's TierCounts (rank 0 first): `n` of `ranks` are filled.
+pub const RankCounts = struct {
+    n: u32 = 0,
+    ranks: [max_ranks]TierCounts = @splat(.{}),
+
+    pub fn slice(r: *const RankCounts) []const TierCounts {
+        return r.ranks[0..r.n];
+    }
+};
+
+/// Lifetime and cost (the store relies on both): the tier outlives the Store (Store.deinit cancels restores and
+/// releases written entries through it, so the backend deinitializes the tier after the store). `lookup` and
+/// `counts` run on every admission and every round: O(1)-ish, from memory, no I/O and no CUDA. `poll`, `pump` and
+/// `release` run between rounds and between a fill's prompt slices, so each must be bounded per call: by its
+/// `budget_ns` and by a block cap of its own (GLM's PUMP_BLOCKS).
+pub const Tier = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// The longest durable point `want` allows, from the tier's own index (no disk I/O, no CUDA); null: none.
+        lookup: *const fn (ptr: *anyopaque, want: *const Want) ?Point,
+        /// Start restoring `point` into a new family state (reserve on every rank, then read): a job for `poll`.
+        /// A refusal for capacity that a later call may not meet (too many restores in flight, no read slot) is one
+        /// of `capacity_errors` with nothing reserved: the host then defers the request briefly and asks again
+        /// (Store.deferrable), instead of prefilling a prompt a restore would have served. Any other refusal while
+        /// restores are in flight that does not name the point (`point_errors`) is deferred too, asked again when they
+        /// end: it then waits for them rather than prefilling beside them, and begins if what it lacked came back (a
+        /// tier's own capacity does; GLM's SpillReserve, its destination's memory, does not: a restore keeps its
+        /// destination as the kept state).
+        begin: *const fn (ptr: *anyopaque, point: *const Point) anyerror!u64,
+        /// Whether `begin` would refuse for capacity now (the restores in flight at the tier's cap, no read slot), asked
+        /// before the store makes room for a restore, so a refusal costs no kept state (error.TierFull, nothing evicted).
+        /// Null: never full (a capacity refusal from `begin` then comes after the room was made).
+        full: ?*const fn (ptr: *anyopaque) bool = null,
+        /// begin's refusals of `point` itself that no room cures, decided from the tier's own records with nothing read,
+        /// reserved or sent (GLM: the point unknown, or gone from this rank's store; KvShardHomeFull): asked after `full`
+        /// and before the store makes room for the restore, so such a refusal evicts no kept state for a restore that
+        /// never starts. The error is the one `begin` would return. What `begin` may still refuse after the room is
+        /// what the room may cure (the destination's memory: GLM's SpillReserve) or what needs every rank (GLM's
+        /// `has`). Null: no such check (every refusal from `begin` then comes after the room was made).
+        check: ?*const fn (ptr: *anyopaque, point: *const Point) anyerror!void = null,
+        /// Progress the job by at most `budget_ns` of engine-thread copies; after ready or failed the job is gone.
+        poll: *const fn (ptr: *anyopaque, job: u64, budget_ns: u64) Poll,
+        /// Stop a pending job: reads stop, issued DMA is waited for, reservations go (called once per job at most).
+        cancel: *const fn (ptr: *anyopaque, job: u64) void,
+        /// Enqueue the write of a state just kept: the point's name (null: not written, e.g. under the minimum).
+        keep: *const fn (ptr: *anyopaque, write: *const Write) ?u64,
+        /// The point's memory twin is about to be dropped: stage what the write still reads from `saved`, or cancel it.
+        release: ?*const fn (ptr: *anyopaque, point: u64, saved: Saved) void = null,
+        /// The point became a shared prefix: persist the flag (atomically; never resurrecting a deleted point).
+        share: ?*const fn (ptr: *anyopaque, point: u64) void = null,
+        /// The point's state was resumed: its last use, for eviction order.
+        touch: ?*const fn (ptr: *anyopaque, point: u64) void = null,
+        /// The point is unusable (a peer failed it, its install failed, old weights): drop it, published or queued. A
+        /// queued write is cancelled, never staged, and nothing reads its `saved` once this returns (a staging copy in
+        /// flight is waited for): Store.clear drops the state right after, without `release`.
+        forget: *const fn (ptr: *anyopaque, point: u64) void,
+        /// Stage queued writes for at most `budget_ns` (engine thread: between rounds and slices, and at idle).
+        pump: ?*const fn (ptr: *anyopaque, budget_ns: u64) void = null,
+        /// Whether writes still wait for `pump` (the host keeps servicing while idle).
+        busy: ?*const fn (ptr: *anyopaque) bool = null,
+        /// Clean shutdown: stage and drain within `budget_ns`; returns the points left unpublished.
+        flush: *const fn (ptr: *anyopaque, budget_ns: u64) u64,
+        /// Each rank's counters into `out` (rank 0 first; the peers' as their last replies carried them): how many.
+        counts: *const fn (ptr: *anyopaque, out: []TierCounts) usize,
+    };
+};
+
+/// A restore in flight: one job per point, shared by every request waiting for it (0110's duplicate-load avoidance).
+pub const Restore = struct {
+    point: Point,
+    job: u64,
+    key: []u32, // the point's ids (store-owned)
+    done: u64 = 0, // blocks copied so far of `total` (its last poll)
+    total: u64 = 0,
+    bytes: u64 = 0, // the memory its destination holds from begin (charged to the budget until it ends)
+};
+
+/// How a polled restore stands.
+pub const Restored = enum { pending, adopted, dropped, failed };
+
+/// The store's own counters for its tier (totals; the tier's are TierCounts). Continued chats count in `Counts`.
+pub const TierStats = struct {
+    disk_lookups: u64 = 0,
+    disk_hits: u64 = 0, // lookups that found a durable point longer than the best usable memory state
+    disk_hits_committed: u64 = 0, // restores adopted as memory states (every rank agreed)
+    restores_begun: u64 = 0,
+    restores_shared: u64 = 0, // requests that joined a restore already in flight
+    restores_failed: u64 = 0,
+    restores_cancelled: u64 = 0,
+    restores_dropped: u64 = 0, // adopted nothing: the budget cannot hold it, or memory had it meanwhile
+    restores_refused: u64 = 0, // not begun: the budget could not hold its destination, or the tier was full (once a request)
+    restored_tokens: u64 = 0,
+    writes_enqueued: u64 = 0,
+    shared_promoted: u64 = 0,
+    flushes: u64 = 0,
+    flush_timeouts: u64 = 0,
+    flush_unpublished: u64 = 0,
+};
+
+/// A side-effect-free look at what a prompt would resume: the best usable memory state, and a longer durable point.
+pub const Probe = struct { memory: ?*Entry = null, durable: ?Point = null };
+
+/// What a keep records beyond the state: its conversation and lineage (the tier writes them with it).
+pub const KeepInfo = struct {
+    chat: u32 = 0, // its request's conversation (`join`; 0: the conversation of the state it extends, `chatOf`)
+    parent: ?u64 = null, // the point of the state its pass resumed from (null: none, or never written)
+    fork: u32 = 0, // where that pass resumed
+    lineage: []const Fork = &.{}, // the pass's (Store.passLineage), copied into the entry
+};
+
 pub const Store = struct {
     gpa: Allocator,
     family: Snapshots,
@@ -213,6 +515,13 @@ pub const Store = struct {
     policy: Policy = .{},
     next_chat: u32 = 1,
     roots: std.AutoHashMapUnmanaged(u32, u32) = .empty, // each conversation's first prompt length (continuedChat)
+    tier: ?Tier = null, // spill v2: kept states written at keep, read back by restore jobs (setTier)
+    group_seed: u32 = 0, // the high half of every conversation's and lineage's name on the tier (setTier)
+    restoring: std.ArrayList(*Restore) = .empty,
+    restoring_bytes: u64 = 0, // destinations the restores in flight reserved (charged like kept states)
+    refused_for: Refusal = .none, // why the last restoreBeginOver returned NoRoom (deferrable)
+    next_lineage: u64 = 0,
+    tier_stats: TierStats = .{},
 
     const SHARED_KEYS = 64;
 
@@ -221,6 +530,8 @@ pub const Store = struct {
     }
 
     pub fn deinit(s: *Store) void {
+        while (s.restoring.items.len > 0) s.restoreCancel(s.restoring.items[s.restoring.items.len - 1]);
+        s.restoring.deinit(s.gpa);
         for (s.entries.items) |e| s.free(e);
         s.entries.deinit(s.gpa);
         s.shared_keys.deinit(s.gpa);
@@ -228,11 +539,34 @@ pub const Store = struct {
         s.held = 0;
     }
 
+    /// The durable tier from here (null: none). A tier turns the family's v1 disk tier off (`policy.spill`): the two
+    /// are exclusive. Its conversations (`groupOf`) and lineages are named under `group_seed` so they do not repeat a
+    /// previous process's on disk.
+    pub fn setTier(s: *Store, tier: ?Tier, group_seed: u32) void {
+        s.tier = tier;
+        if (tier == null) return;
+        s.policy.spill = false;
+        s.group_seed = group_seed;
+        if (s.next_lineage == 0) s.next_lineage = @as(u64, group_seed) << 32;
+    }
+
+    /// Conversation `chat`'s name on the tier: unique past this process (its seed above the chat id).
+    pub fn groupOf(s: *const Store, chat: u32) u64 {
+        return @as(u64, s.group_seed) << 32 | chat;
+    }
+
+    /// The family's v1 disk tier is on: by the policy, and never under a v2 tier.
+    fn spills(s: *const Store) bool {
+        return s.policy.spill and s.tier == null;
+    }
+
     fn free(s: *Store, e: *Entry) void {
+        if (e.point) |p| if (s.tier) |t| if (t.vtable.release) |f| f(t.ptr, p, e.saved); // a write still reading it stages first
         s.family.vtable.drop(s.family.ptr, e.saved);
         s.gpa.free(e.tokens);
         s.gpa.free(e.decode_spans);
         s.gpa.free(e.last);
+        s.gpa.free(e.lineage);
         s.gpa.destroy(e);
     }
 
@@ -240,7 +574,7 @@ pub const Store = struct {
     /// conversation does not hold it (multi.py `_superseded`).
     fn evict(s: *Store, i: usize, to_disk: bool) void {
         const e = s.entries.items[i];
-        if (to_disk and s.policy.spill and !e.spilled) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
+        if (to_disk and s.spills() and !e.spilled) if (s.family.vtable.evict) |f| if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
         s.remove(i);
     }
 
@@ -262,14 +596,53 @@ pub const Store = struct {
         return if (s.family.vtable.spare) |f| f(s.family.ptr) else 0;
     }
 
-    /// What the budget leaves past the kept states and the spare storage: a family readies storage only inside it.
+    /// What the budget leaves past the kept states, the restores in flight and the spare storage: a family readies
+    /// storage only inside it.
     pub fn room(s: *const Store) u64 {
-        return s.budget -| s.held -| s.spare();
+        return s.budget -| s.held -| s.restoring_bytes -| s.spare();
+    }
+
+    /// Room for `bytes` of new storage beside the kept states, the restores in flight and the spare storage: spare that
+    /// is in the way trimmed first, then states evicted (never `skip`; `prompt`'s superseded ones first), trimming
+    /// again after each since a dropped state's storage may come back spare. False: the budget cannot hold it.
+    fn makeRoom(s: *Store, bytes: u64, skip: ?*Entry, prompt: []const u32) bool {
+        // never evict for room that evicting everything evictable could not make
+        if (s.restoring_bytes + bytes + (if (skip) |e| e.bytes else 0) > s.budget) return false;
+        while (true) {
+            const free_ = s.spare();
+            if (s.held + s.restoring_bytes + free_ + bytes <= s.budget) return true;
+            if (free_ > 0) if (s.family.vtable.trim) |f| {
+                f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes -| bytes);
+                if (s.spare() < free_) continue;
+            };
+            s.evict(s.victimBut(skip, prompt) orelse return false, true);
+            s.counts.evicted += 1;
+        }
     }
 
     /// Whether a state at `at` may start or end a prompt pass: anywhere, or a chunk start for planned families.
     fn usable(s: *const Store, at: u32, starts: []const u32) bool {
         return at > 0 and (!s.rules.planned or s.startAt(starts, at) == at);
+    }
+
+    /// Whether a state at `at` may serve a prompt of `len` tokens (as `find` asks of a kept one): at least one row left,
+    /// its lookahead inside the prompt, on the request's chunk starts or the family's grid.
+    pub fn eligible(s: *const Store, at: u32, len: usize, starts: []const u32) bool {
+        return at < len and @as(usize, at) + s.rules.lookahead <= len and s.usable(at, starts);
+    }
+
+    /// The furthest position `eligible` allows for a prompt of `len` tokens (null: none).
+    pub fn maxAt(s: *const Store, len: usize, starts: []const u32) ?u32 {
+        if (len < 2) return null;
+        const hi: u32 = @intCast(@min(len -| @max(1, s.rules.lookahead), std.math.maxInt(u32)));
+        const at = if (s.rules.planned) s.startAt(starts, hi) else hi;
+        return if (s.eligible(at, len, starts)) at else null;
+    }
+
+    /// Whether a kept state still restores for a prompt of `len` tokens: the family's own rule (`usable`; none: always).
+    fn live(s: *const Store, e: *const Entry, len: usize) bool {
+        const f = s.family.vtable.usable orelse return true;
+        return f(s.family.ptr, e.saved, @intCast(@min(len, std.math.maxInt(u32))));
     }
 
     /// The chunk start at or before `at`: the request's, else the family's grid (0 when none).
@@ -298,9 +671,274 @@ pub const Store = struct {
             const n = e.tokens.len;
             if (prompt[n - 1] != e.tokens[n - 1] or !std.mem.eql(u32, prompt[0..n], e.tokens)) continue;
             if (!modes.equal(e.decode_spans, spans, e.at)) continue;
+            if (!s.live(e, prompt.len)) continue; // stale: never shadows a shorter usable state or a durable point
             best = e;
         }
         return best;
+    }
+
+    /// What `key` would resume, changing nothing in memory: the best usable kept state, and the tier's longer point
+    /// (none for a request that names decoded rows: a point holds prefill arithmetic only).
+    pub fn probe(s: *Store, key: []const u32, starts: []const u32, spans: []const modes.Span) Probe {
+        const m = s.find(key, starts, spans);
+        const t = s.tier orelse return .{ .memory = m };
+        if (spans.len > 0) return .{ .memory = m };
+        const have: u32 = if (m) |e| e.at else 0;
+        s.tier_stats.disk_lookups += 1;
+        const max_at = s.maxAt(key.len, starts) orelse return .{ .memory = m };
+        if (max_at <= have) return .{ .memory = m };
+        const planned_starts = s.rules.planned and starts.len > 0;
+        const want: Want = .{
+            .key = key,
+            .beyond = have,
+            .max_at = max_at,
+            .grid = if (s.rules.planned and !planned_starts) s.rules.grid else 0,
+            .starts = if (planned_starts) starts else &.{},
+            .lookahead = s.rules.lookahead,
+        };
+        const p = t.vtable.lookup(t.ptr, &want) orelse return .{ .memory = m };
+        if (!s.pointFits(p, key, starts, have)) return .{ .memory = m };
+        s.tier_stats.disk_hits += 1;
+        return .{ .memory = m, .durable = p };
+    }
+
+    /// A durable answer checked again: past the memory hit, eligible here, its ids inside the key, inside the budget.
+    fn pointFits(s: *const Store, p: Point, key: []const u32, starts: []const u32, have: u32) bool {
+        if (p.at <= have or @as(u64, p.at) + s.rules.lookahead != p.tokens or p.tokens > key.len) return false;
+        if (!s.eligible(p.at, key.len, starts)) return false;
+        return s.pointBytes(p) <= s.budget;
+    }
+
+    fn pointBytes(s: *const Store, p: Point) u64 {
+        return if (p.bytes > 0) p.bytes else s.family.vtable.bytes(s.family.ptr, p.at);
+    }
+
+    /// A restore of `p` (found by `probe` for `key`): the job already in flight for it, or a new one. A new job's
+    /// destination is charged to the budget from here until it ends (room made first, as for a keep, and any state may
+    /// go: the host begins one only while no admitted pass holds a looked-up entry, LaneHost.entryHeld):
+    /// error.NoRoom when the budget cannot hold it.
+    pub fn restoreBegin(s: *Store, p: Point, key: []const u32) !*Restore {
+        return s.restoreBeginOver(p, key, .{});
+    }
+
+    /// How restoreBeginOver treats the prompt's own memory state and counts its refusals.
+    pub const Over = struct {
+        /// The best usable memory state for the key (Probe.memory): kept while the budget holds it beside the restore.
+        have: ?*Entry = null,
+        /// The same request asking again (a deferred restore): a refusal is not counted again.
+        again: bool = false,
+    };
+
+    /// Why a restore's room was refused (NoRoom): restores in flight hold the budget's rest (their charge goes when
+    /// they end, so asking again may succeed), or the budget cannot hold the destination however long one waits.
+    pub const Refusal = enum { none, restores_in_flight, budget };
+
+    /// restoreBegin for a request whose best memory state is `o.have`. A full tier (Tier.VTable.full) refuses first,
+    /// with error.TierFull and nothing evicted, so the shorter state is still there to resume; then the tier's check
+    /// of the point (Tier.VTable.check), whose refusal (begin's own error) evicts nothing either. The room is made only
+    /// once both pass. It spares `have` when the budget holds both it and the restore (a refusal by the tier then
+    /// leaves it), and evicts it as restoreBegin does when the budget cannot hold both: a restore that can start always
+    /// beats the shorter state. After a refusal `have` may be gone: look it up again (Store.find), never through the
+    /// old pointer.
+    pub fn restoreBeginOver(s: *Store, p: Point, key: []const u32, o: Over) !*Restore {
+        for (s.restoring.items) |r| if (r.point.id == p.id) {
+            s.tier_stats.restores_shared += 1;
+            return r;
+        };
+        const t = s.tier orelse return error.NoTier;
+        if (p.tokens > key.len) return error.BadPoint;
+        if (t.vtable.full) |full| if (full(t.ptr)) {
+            if (!o.again) s.tier_stats.restores_refused += 1;
+            return error.TierFull;
+        };
+        if (t.vtable.check) |check| try check(t.ptr, &p); // (a refusal of the point: not counted, as begin's are not)
+        const bytes = s.pointBytes(p);
+        s.refused_for = .none;
+        const spare_have = if (o.have) |e| s.restoring_bytes + bytes + e.bytes <= s.budget else false;
+        const made = s.makeRoom(bytes, if (spare_have) o.have else null, key) or (spare_have and s.makeRoom(bytes, null, key));
+        if (!made) {
+            if (!o.again) s.tier_stats.restores_refused += 1;
+            // the room failed with nothing spared: only what the restores in flight hold stands in the way
+            s.refused_for = if (s.restoring.items.len > 0 and bytes <= s.budget) .restores_in_flight else .budget;
+            return error.NoRoom;
+        }
+        const r = try s.gpa.create(Restore);
+        errdefer s.gpa.destroy(r);
+        const k = try s.gpa.dupe(u32, key[0..p.tokens]);
+        errdefer s.gpa.free(k);
+        try s.restoring.ensureUnusedCapacity(s.gpa, 1);
+        const job = try t.vtable.begin(t.ptr, &p);
+        r.* = .{ .point = p, .job = job, .key = k, .bytes = bytes };
+        s.restoring.appendAssumeCapacity(r);
+        s.restoring_bytes += bytes;
+        s.tier_stats.restores_begun += 1;
+        return r;
+    }
+
+    /// Whether a refused restoreBeginOver is worth asking again: a refusal for capacity (capacity_errors), a NoRoom only
+    /// the restores in flight caused (their charge goes when they end), or any other refusal while restores are in
+    /// flight that does not name the point itself (point_errors). The last kind is asked again when they end, so the
+    /// request waits for them instead of prefilling beside them (g2's dual restore: a 38K-token prefill from 0 stalled
+    /// the other restore 18.8 s); it begins then only if what the tier lacked came back. A family's capacity does
+    /// (already capacity_errors); GLM's SpillReserve (its destination's memory: the keep floor or the allocation) does
+    /// not, since a restore keeps its destination as the kept state: that retry succeeds only if memory was freed
+    /// meanwhile (kept states evicted, or held ones let go once their writes finish). Anything else (a missing point, a
+    /// damaged one, no tier, a budget that can never hold it, a refusal with nothing in flight) is not deferred.
+    pub fn deferrable(s: *const Store, err: anyerror) bool {
+        if (err == error.NoRoom) return s.refused_for == .restores_in_flight and s.restoring.items.len > 0;
+        if (std.mem.indexOfScalar(anyerror, &capacity_errors, err) != null) return true;
+        return s.restoring.items.len > 0 and std.mem.indexOfScalar(anyerror, &point_errors, err) == null;
+    }
+
+    /// Progress `r` by at most `budget_ns`; once it is no longer pending `r` is freed. An installed state becomes a
+    /// memory entry that the next lookup of its prompt finds (adopted).
+    pub fn restorePoll(s: *Store, r: *Restore, budget_ns: u64) Restored {
+        const t = s.tier.?;
+        switch (t.vtable.poll(t.ptr, r.job, budget_ns)) {
+            .pending => |p| {
+                r.done = p.done;
+                r.total = p.total;
+                return .pending;
+            },
+            .failed => |err| {
+                s.tier_stats.restores_failed += 1;
+                note("restoring {d} tokens from disk failed ({s}); its prompt prefills", .{ r.point.at, @errorName(err) });
+                s.endRestore(r);
+                return .failed;
+            },
+            .ready => |rd| {
+                const ok = s.adopt(r, rd.saved, rd.bytes, rd.lineage);
+                s.endRestore(r);
+                return if (ok) .adopted else .dropped;
+            },
+        }
+    }
+
+    /// Stop `r` (its last waiter went, or shutdown): the tier releases its reservations; `r` is freed.
+    pub fn restoreCancel(s: *Store, r: *Restore) void {
+        if (s.tier) |t| t.vtable.cancel(t.ptr, r.job);
+        s.tier_stats.restores_cancelled += 1;
+        s.endRestore(r);
+    }
+
+    fn endRestore(s: *Store, r: *Restore) void {
+        if (std.mem.indexOfScalar(*Restore, s.restoring.items, r)) |i| {
+            _ = s.restoring.orderedRemove(i);
+            s.restoring_bytes -= r.bytes;
+        }
+        s.gpa.free(r.key);
+        s.gpa.destroy(r);
+    }
+
+    /// An installed restore as a memory entry, room made as for any keep; false: dropped (no room, or memory had it).
+    /// Its reservation moves from the restores' charge to the kept states'. A memory twin of the same point that is
+    /// no longer usable (the family staled it: KV sharding's placements give a kept state's rows away, an overwrite) is
+    /// what made the lookup go to the tier: it is replaced, never a reason to drop the restore and recompute. The entry
+    /// is no conversation's own state (`own` false, a conversation of its own, as v1's spillRecall reads one back).
+    fn adopt(s: *Store, r: *Restore, saved: Saved, bytes0: u64, lineage: []const Fork) bool {
+        const bytes = if (bytes0 > 0) bytes0 else s.pointBytes(r.point);
+        s.restoring_bytes -= r.bytes; // (zeroed: endRestore then releases nothing more)
+        r.bytes = 0;
+        for (s.entries.items, 0..) |e, i| if (e.at == r.point.at and e.decode_spans.len == 0 and std.mem.eql(u32, e.tokens, r.key)) {
+            if (s.live(e, r.key.len)) return s.unadopted(saved); // a usable copy came meanwhile: it wins
+            s.remove(i); // the stale twin goes (its storage back to the family), the restore takes its place
+            break;
+        };
+        if (!s.makeRoom(bytes, null, r.key)) return s.unadopted(saved);
+        const e = s.gpa.create(Entry) catch return s.unadopted(saved);
+        const tokens = s.gpa.dupe(u32, r.key) catch {
+            s.gpa.destroy(e);
+            return s.unadopted(saved);
+        };
+        const last = s.gpa.dupe(u32, r.key) catch {
+            s.gpa.free(tokens);
+            s.gpa.destroy(e);
+            return s.unadopted(saved);
+        };
+        const lin = s.gpa.dupe(Fork, lineage) catch {
+            s.gpa.free(last);
+            s.gpa.free(tokens);
+            s.gpa.destroy(e);
+            return s.unadopted(saved);
+        };
+        s.clock += 1;
+        e.* = .{ .tokens = tokens, .at = r.point.at, .saved = saved, .bytes = bytes, .born = @intCast(r.key.len), .used = s.clock, .last = last, .shared = r.point.shared, .chat = s.newChat(r.key.len), .own = false, .point = r.point.id, .lineage = lin };
+        s.entries.append(s.gpa, e) catch {
+            e.point = null; // the point stays the tier's; only the memory copy goes
+            s.free(e);
+            s.tier_stats.restores_dropped += 1;
+            return false;
+        };
+        s.held += bytes;
+        s.tier_stats.disk_hits_committed += 1;
+        s.tier_stats.restored_tokens += r.point.at;
+        if (!@import("builtin").is_test) std.log.info("prompt cache: restored {d} tokens from disk", .{r.point.at});
+        return true;
+    }
+
+    fn unadopted(s: *Store, saved: Saved) bool {
+        s.family.vtable.drop(s.family.ptr, saved);
+        s.tier_stats.restores_dropped += 1;
+        return false;
+    }
+
+    /// Writes staged for at most `budget_ns` (engine thread).
+    pub fn pump(s: *Store, budget_ns: u64) void {
+        const t = s.tier orelse return;
+        if (t.vtable.pump) |f| f(t.ptr, budget_ns);
+    }
+
+    /// Whether the tier has restores in flight or writes to stage (the host keeps servicing it).
+    pub fn busy(s: *const Store) bool {
+        const t = s.tier orelse return false;
+        if (s.restoring.items.len > 0) return true;
+        return if (t.vtable.busy) |f| f(t.ptr) else false;
+    }
+
+    /// The tier's clean shutdown, engine thread: every restore stopped, writes drained within `budget_ns`; the points
+    /// left unpublished at the deadline (counted, never published to make the count). v1's is `flush`.
+    pub fn tierFlush(s: *Store, budget_ns: u64) u64 {
+        const t = s.tier orelse return 0;
+        while (s.restoring.items.len > 0) s.restoreCancel(s.restoring.items[s.restoring.items.len - 1]);
+        const left = t.vtable.flush(t.ptr, budget_ns);
+        s.tier_stats.flushes += 1;
+        if (left > 0) {
+            s.tier_stats.flush_timeouts += 1;
+            s.tier_stats.flush_unpublished += left;
+            note("{d} kept states were still unpublished at the flush deadline; a restart misses them", .{left});
+        }
+        return left;
+    }
+
+    /// Durable point `id` is unusable (the family's all-rank abort, or its install failed): the tier drops it.
+    pub fn forgetPoint(s: *Store, id: u64) void {
+        const t = s.tier orelse return;
+        for (s.entries.items) |e| if (e.point == id) {
+            e.point = null;
+        };
+        t.vtable.forget(t.ptr, id);
+    }
+
+    /// Each rank's tier counters, when a tier is set.
+    pub fn tierCounts(s: *const Store) ?RankCounts {
+        const t = s.tier orelse return null;
+        var out: RankCounts = .{};
+        out.n = @intCast(@min(t.vtable.counts(t.ptr, &out.ranks), max_ranks));
+        return out;
+    }
+
+    /// The lineage of a pass that resumes `from` (null: a fresh prefill) and computes its own rows from there: `from`'s
+    /// forked at its position, or a new one (gpa-owned; empty without a tier, whose block names are its only use).
+    pub fn passLineage(s: *Store, from: ?*const Entry) ![]Fork {
+        if (s.tier == null) return &.{};
+        s.next_lineage += 1;
+        const own: Fork = .{ .name = s.next_lineage, .at = if (from) |e| e.at else 0 };
+        const base: []const Fork = if (from) |e| e.lineage else &.{};
+        if (base.len == 0) return s.gpa.dupe(Fork, &.{.{ .name = own.name, .at = 0 }});
+        const out = try s.gpa.alloc(Fork, base.len + 1);
+        @memcpy(out[0..base.len], base);
+        out[base.len] = own;
+        return out;
     }
 
     /// Restore the longest prefix matching tokens and canonical spans, then plan prompt-cache marks.
@@ -375,15 +1013,22 @@ pub const Store = struct {
             } else false;
             if (!exists) need += s.family.vtable.bytes(s.family.ptr, at);
         }
-        while (s.held + need > s.budget) {
+        while (s.held + s.restoring_bytes + need > s.budget) {
             const i = s.victimBut(from, prompt) orelse return;
             s.evict(i, true);
             s.counts.evicted += 1;
         }
     }
 
-    /// Every kept state goes after a weight change, and learned states on disk stop being read: old arithmetic.
+    /// Every kept state goes after a weight change, and learned states on disk stop being read: old arithmetic. Under a
+    /// tier the restores in flight stop and the kept states' points are forgotten, never staged; points whose memory
+    /// copy had already gone stay on disk, so a tier serving changing weights must name them by the weights it wrote.
     pub fn clear(s: *Store) void {
+        while (s.restoring.items.len > 0) s.restoreCancel(s.restoring.items[s.restoring.items.len - 1]);
+        for (s.entries.items) |e| if (e.point) |p| {
+            e.point = null; // (so `free` releases nothing: forget cancels a queued write and ends its reads of e.saved)
+            if (s.tier) |t| t.vtable.forget(t.ptr, p);
+        };
         while (s.entries.items.len > 0) s.remove(s.entries.items.len - 1);
         s.shared_keys.clearRetainingCapacity();
         s.imprint = null;
@@ -456,6 +1101,7 @@ pub const Store = struct {
         s.clock += 1;
         e.used = s.clock;
         s.counts.hits += 1;
+        if (e.point) |p| if (s.tier) |t| if (t.vtable.touch) |f| f(t.ptr, p);
         const last = s.gpa.dupe(u32, prompt) catch return;
         s.gpa.free(e.last);
         e.last = last;
@@ -503,12 +1149,22 @@ pub const Store = struct {
 
     /// `keep` in conversation `chat` (its request's, `join`; 0: the conversation of the state it extends, `chatOf`).
     pub fn keepIn(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span, chat_in: u32) bool {
+        return s.keepWith(prompt, at, owner, starts, spans, .{ .chat = chat_in });
+    }
+
+    /// `keepIn`, recording the state's lineage and the point it forks from; with a tier its write is enqueued here
+    /// (a state whose rows are all prefilled: no decoded span through `at`).
+    pub fn keepWith(s: *Store, prompt: []const u32, at: u32, owner: ?*anyopaque, starts: []const u32, spans: []const modes.Span, info: KeepInfo) bool {
         const n = @as(usize, at) + s.rules.lookahead;
         if (at == 0 or n > prompt.len) return false;
         s.clock += 1;
         const shared = std.mem.indexOfScalar(u64, s.shared_keys.items, sharedKey(prompt[0..n])) != null;
         for (s.entries.items) |e| if (e.at == at and std.mem.eql(u32, e.tokens, prompt[0..n]) and modes.equal(e.decode_spans, spans, at)) {
             e.used = s.clock; // the same state again: no copy
+            if (shared and !e.shared) if (e.point) |p| if (s.tier) |t| if (t.vtable.share) |f| { // now a shared prefix, on disk too
+                f(t.ptr, p);
+                s.tier_stats.shared_promoted += 1;
+            };
             e.shared = e.shared or shared;
             if (shared) learned.learn(s, e, starts);
             return true;
@@ -525,16 +1181,24 @@ pub const Store = struct {
         while (s.entries.items.len > 0) { // room: spare storage this save can take, else new storage inside the budget
             if (s.family.vtable.reuses) |f| if (f(s.family.ptr, at)) break;
             const free_ = s.spare();
-            if (s.held + free_ + bytes <= s.budget) break;
+            if (s.held + s.restoring_bytes + free_ + bytes <= s.budget) break;
             if (free_ > 0) {
-                if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| bytes); // spare that cannot take this state goes before any state
+                if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes -| bytes); // spare that cannot take this state goes before any state
                 if (s.spare() < free_) continue;
             }
             s.evict(s.victimBut(null, prompt).?, true); // its storage may come back spare and take this state
             s.counts.evicted += 1;
         }
-        if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| bytes);
-        const chat = if (chat_in != 0) chat_in else s.chatOf(prompt, at);
+        if (s.entries.items.len == 0) if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.restoring_bytes -| bytes);
+        if (s.restoring_bytes > 0 and s.held + s.restoring_bytes + bytes > s.budget) { // restores in flight hold the rest
+            const reuses = if (s.family.vtable.reuses) |f| f(s.family.ptr, at) else false;
+            if (!reuses) {
+                s.counts.refused += 1;
+                note("kept nothing at {d} tokens: restores in flight hold {d} MiB of the {d} MiB budget", .{ at, s.restoring_bytes >> 20, s.budget >> 20 });
+                return false;
+            }
+        }
+        const chat = if (info.chat != 0) info.chat else s.chatOf(prompt, at);
         const e = s.gpa.create(Entry) catch return s.fail(at, error.OutOfMemory);
         const tokens = s.gpa.dupe(u32, prompt[0..n]) catch {
             s.gpa.destroy(e);
@@ -551,8 +1215,15 @@ pub const Store = struct {
             s.gpa.destroy(e);
             return s.fail(at, err);
         };
+        const lin = s.gpa.dupe(Fork, info.lineage) catch {
+            s.family.vtable.drop(s.family.ptr, saved);
+            s.gpa.free(last);
+            s.gpa.free(tokens);
+            s.gpa.destroy(e);
+            return s.fail(at, error.OutOfMemory);
+        };
         const charged = if (s.family.vtable.charged) |f| f(s.family.ptr, saved) else bytes;
-        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared };
+        e.* = .{ .tokens = tokens, .decode_spans = decoded, .at = at, .saved = saved, .bytes = charged, .born = @intCast(prompt.len), .used = s.clock, .last = last, .shared = shared, .chat = chat, .own = !shared, .lineage = lin };
         owns_decoded = false;
         s.entries.append(s.gpa, e) catch {
             s.free(e);
@@ -560,9 +1231,13 @@ pub const Store = struct {
         };
         s.held += charged;
         s.counts.kept += 1;
+        if (s.tier) |t| if (e.decode_spans.len == 0) { // write at keep: the tier stages the state's bytes between rounds
+            e.point = t.vtable.keep(t.ptr, &.{ .saved = saved, .key = tokens, .at = at, .bytes = charged, .group = s.groupOf(chat), .shared = shared, .parent = info.parent, .fork = info.fork, .lineage = lin });
+            if (e.point != null) s.tier_stats.writes_enqueued += 1;
+        };
         if (shared) learned.learn(s, e, starts);
         s.enforce(e);
-        if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held); // spare storage only inside what the budget leaves
+        if (s.family.vtable.trim) |f| f(s.family.ptr, s.budget -| s.held -| s.restoring_bytes); // spare storage only inside what the budget leaves
         return true;
     }
 
@@ -574,11 +1249,11 @@ pub const Store = struct {
         const m = im.best(prompt, starts, s.rules.planned, if (have) |x| x.at else 0) orelse return have;
         if (!modes.equal(&.{}, spans, m.at)) return have; // the request decodes rows the learned prompt pass prefilled
         const bytes = s.family.vtable.bytes(s.family.ptr, m.at);
-        while (bytes <= s.budget and s.held + s.spare() + bytes > s.budget) {
+        if (s.restoring_bytes + bytes > s.budget) return have; // (restores in flight hold the rest)
+        while (s.held + s.restoring_bytes + s.spare() + bytes > s.budget) {
             s.evict(s.victimBut(have, prompt) orelse return have, true);
             s.counts.evicted += 1;
         }
-        if (bytes > s.budget) return have;
         const e = s.gpa.create(Entry) catch return have;
         e.* = .{ .tokens = &.{}, .at = m.at, .saved = undefined, .bytes = bytes, .born = @intCast(prompt.len), .used = s.clock, .last = &.{}, .shared = true };
         e.tokens = s.gpa.dupe(u32, m.tokens) catch return s.drop(e, have, false);
@@ -599,7 +1274,7 @@ pub const Store = struct {
     /// The spill tier's longest stored state this prompt extends, when it is longer than `have`: read into new storage as an
     /// entry no conversation owns. Else `have`.
     fn spillRecall(s: *Store, prompt: []const u32, have: ?*Entry) ?*Entry {
-        if (!s.policy.spill) return have;
+        if (!s.spills()) return have;
         const find_stored = s.family.vtable.stored orelse return have;
         const load = s.family.vtable.load orelse return have;
         var hit: Stored = .{ .at = 0, .key = 0, .tokens = &.{} };
@@ -628,7 +1303,7 @@ pub const Store = struct {
     /// eviction frees its memory at once.
     fn earlyWrite(s: *Store) void {
         const hw = s.policy.spill_highwater;
-        if (!s.policy.spill or hw <= 0) return;
+        if (!s.spills() or hw <= 0) return;
         if (@as(f64, @floatFromInt(s.held)) <= hw * @as(f64, @floatFromInt(s.budget))) return;
         const f = s.family.vtable.evict orelse return;
         const i = s.capVictim(null, true) orelse return;
@@ -637,9 +1312,10 @@ pub const Store = struct {
         if (!s.superseded(e)) f(s.family.ptr, e.saved, e.tokens, e.at);
     }
 
-    /// A clean stop: every state not stored yet is stored, newest first, until `max_ns` have passed.
+    /// A clean stop: every state not stored yet is stored, newest first, until `max_ns` have passed (v1's disk tier; a
+    /// v2 tier's is `tierFlush`).
     pub fn flush(s: *Store, max_ns: u64) u32 {
-        if (!s.policy.spill) return 0;
+        if (!s.spills()) return 0;
         const f = s.family.vtable.evict orelse return 0;
         var t0: std.c.timespec = undefined;
         _ = std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &t0);
@@ -884,7 +1560,7 @@ pub const Store = struct {
         }.lt);
         k.hits, k.misses, k.evicted, k.restored = .{ s.counts.hits, s.counts.misses, s.counts.evicted, s.counts.restored };
         k.chats_continued, k.chats_continued_prefill_tokens = .{ s.counts.chats_continued, s.counts.chats_continued_prefill_tokens };
-        if (s.policy.spill) if (s.family.vtable.spill_stats) |f| {
+        if (s.spills()) if (s.family.vtable.spill_stats) |f| {
             k.spill_on = true;
             f(s.family.ptr, &k.spill);
         };
@@ -951,6 +1627,7 @@ test {
     _ = @import("prompt_cache_rewind_test.zig");
     _ = @import("prompt_cache_policy_test.zig");
     _ = @import("prompt_cache_chat_test.zig");
+    _ = @import("prompt_cache_tier_test.zig");
     _ = @import("learned_fault_test.zig");
     _ = modes;
 }

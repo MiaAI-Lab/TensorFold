@@ -127,7 +127,11 @@ pub const flags = [_]Flag{
 pub const env = [_][]const u8{ "TENSORFOLD_API_KEY", "TENSORFOLD_NO_LIVE", "TENSORFOLD_SEED_SALT", "TENSORFOLD_REQUEST_LOG", "TENSORFOLD_NO_UPDATE_CHECK", "HF_HOME", "HF_HUB_CACHE", "HF_HUB_OFFLINE" } ++
     (if (cuda_build) [_][]const u8{ "TF_CUDA_DEVICE", "TF_CUDA_SEGMENTS", "TENSORFOLD_CUDA_KERNELS", "TENSORFOLD_MEMORY_RESERVE_GIB", "TENSORFOLD_CUDA_MEMORY_LIMIT_GB" } else [_][]const u8{}) ++
     // the GLM recipe's server switches (recipe.zig; scripts/config.sh exports them)
-    (if (cuda_build) [_][]const u8{ "TF_GLM_EFFORT_TAIL", "TF_GLM_CLEAR_THINKING", "TF_GLM_STREAM_SMOOTH", "TF_GLM_STREAM_SMOOTH_MS", "TF_GLM_LOOP_GUARD", "TF_GLM_MAX_QUEUED", "TF_GLM_KEEP_REASONING", "TF_GLM_KEEP_REASONING_MB", "TF_GLM_ASSISTANT_ENDS", "TF_GLM_PROMPT_STOP" } else [_][]const u8{});
+    (if (cuda_build) [_][]const u8{ "TF_GLM_EFFORT_TAIL", "TF_GLM_CLEAR_THINKING", "TF_GLM_STREAM_SMOOTH", "TF_GLM_STREAM_SMOOTH_MS", "TF_GLM_LOOP_GUARD", "TF_GLM_MAX_QUEUED", "TF_GLM_KEEP_REASONING", "TF_GLM_KEEP_REASONING_MB", "TF_GLM_ASSISTANT_ENDS", "TF_GLM_PROMPT_STOP" } else [_][]const u8{}) ++
+    (if (cuda_build) spill_env else [_][]const u8{});
+
+/// Spill v2's variables past its flags (api.Spill, `spill`): the Python fork's names, then the DeepSeek port's.
+pub const spill_env = [_][]const u8{ "TF_GLM_SPILL_QUOTA", "TF_GLM_SPILL_TURNS", "TF_GLM_SPILL_READ_BLOCKS", "TF_GLM_SPILL_STAGE_MIB", "TF_GLM_SPILL_LOAD_MS", "TF_SPILL_LOAD_WAIT_MS", "TF_SPILL_DEFER_MS", "TF_SPILL_FLUSH_S" };
 
 pub const Args = struct {
     model: []const u8 = "",
@@ -151,9 +155,11 @@ pub const Args = struct {
     snapshot_dir: ?[]const u8 = null, // the spill tier's folder
     spill_gib: f64 = 0, // the spill tier's disk cap a rank (0: off)
     spill_highwater: f64 = 0.70,
+    spill_highwater_given: bool = false, // (v1's early-write mark; the v2 tier ignores it and says so)
     spill_min_tokens: u32 = 8192,
     spill_min_free_gib: f64 = 50,
     spill_flush_s: ?f64 = null, // a clean stop's budget (null: TF_SPILL_FLUSH_S, else 60)
+    spill: api.Spill = .{}, // spill v2's settings, the flags' and the variables' (main sets it: `spill`)
     max_tokens: i64 = 4096,
     temperature: ?f64 = null,
     top_p: ?f64 = null,
@@ -290,6 +296,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         const f = try float(u, a, name, v);
         if (!(f > 0 and f <= 1)) return fail(u, a, "argument --spill-highwater: a fraction in (0, 1]: '{s}'", .{v});
         out.spill_highwater = f;
+        out.spill_highwater_given = true;
     } else if (is(name, "--spill-min-tokens")) {
         out.spill_min_tokens = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --spill-min-tokens: a token count from 0: '{s}'", .{v});
     } else if (is(name, "--spill-min-free-gib")) {
@@ -374,6 +381,58 @@ fn gpuFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage)
     return true;
 }
 
+/// Spill v2's settings: the spill flags, then, when they ask for the disk tier, its variables from `env_in` (null:
+/// none read; main passes a GLM's). Python 0110 read them only with the spill on (`_spill_store`) and refused a
+/// malformed knob at startup: so does this, naming it in `problem`, and with the spill off a stray one is never read.
+/// An unset or empty one keeps its default, and so does 0 for the restore budgets (a 0 ns budget never progresses a
+/// restore). TF_SPILL_FLUSH_S, v1's variable too, keeps v1's reading: anything but a number of seconds is the
+/// default, a negative one 0.
+pub fn spill(a: Allocator, args: Args, env_in: ?*const std.process.Environ.Map, problem: *[]const u8) error{ Invalid, OutOfMemory }!api.Spill {
+    var s: api.Spill = .{ .dir = args.snapshot_dir, .gib = args.spill_gib, .min_free_gib = args.spill_min_free_gib, .min_tokens = args.spill_min_tokens, .highwater = if (args.spill_highwater_given) args.spill_highwater else null };
+    const env_map = if (s.enabled()) env_in else null;
+    if (spillVar(env_map, "TF_GLM_SPILL_QUOTA")) |t| {
+        const q = @import("fields.zig").pyFloat(t) orelse -1;
+        if (!(q >= 0 and q <= 1)) {
+            problem.* = try std.fmt.allocPrint(a, "TF_GLM_SPILL_QUOTA='{s}': a share of --spill-gib from 0 (none) to 1", .{t});
+            return error.Invalid;
+        }
+        s.quota = q;
+    }
+    s.turns = try spillCount(a, env_map, "TF_GLM_SPILL_TURNS", 0, s.turns, problem);
+    s.read_blocks = try spillCount(a, env_map, "TF_GLM_SPILL_READ_BLOCKS", 1, s.read_blocks, problem);
+    s.stage_mib = try spillCount(a, env_map, "TF_GLM_SPILL_STAGE_MIB", 1, s.stage_mib, problem);
+    if (spillVar(env_map, "TF_GLM_SPILL_LOAD_MS")) |t| { // milliseconds, a fraction too (Python read a float)
+        const ms = @import("fields.zig").pyFloat(t) orelse -1;
+        if (!(ms >= 0 and std.math.isFinite(ms))) {
+            problem.* = try std.fmt.allocPrint(a, "TF_GLM_SPILL_LOAD_MS='{s}': a number of milliseconds from 0", .{t});
+            return error.Invalid;
+        }
+        if (ms > 0) s.load_ms = ms;
+    }
+    const wait = try spillCount(a, env_map, "TF_SPILL_LOAD_WAIT_MS", 0, s.load_wait_ms, problem);
+    if (wait > 0) s.load_wait_ms = wait;
+    s.defer_ms = try spillCount(a, env_map, "TF_SPILL_DEFER_MS", 0, s.defer_ms, problem);
+    const flush_s = args.spill_flush_s orelse if (spillVar(env_map, "TF_SPILL_FLUSH_S")) |t| (@import("fields.zig").pyFloat(t) orelse 60) else 60;
+    if (std.math.isFinite(flush_s)) s.flush_ms = @intFromFloat(@min(@max(flush_s, 0) * 1000, std.math.maxInt(u32)));
+    return s;
+}
+
+/// A variable's text, trimmed (null: unset or empty).
+fn spillVar(env_map: ?*const std.process.Environ.Map, name: []const u8) ?[]const u8 {
+    const m = env_map orelse return null;
+    const t = std.mem.trim(u8, m.get(name) orelse return null, " \t\r\n");
+    return if (t.len == 0) null else t;
+}
+
+/// A variable's whole number from `least` (`default` when unset), else error.Invalid with `problem` set.
+fn spillCount(a: Allocator, env_map: ?*const std.process.Environ.Map, name: []const u8, least: u32, default: u32, problem: *[]const u8) error{ Invalid, OutOfMemory }!u32 {
+    const t = spillVar(env_map, name) orelse return default;
+    const n: ?u32 = std.fmt.parseInt(u32, t, 10) catch null;
+    if (n != null and n.? >= least) return n.?;
+    problem.* = try std.fmt.allocPrint(a, "{s}='{s}': a whole number from {d}", .{ name, t, least });
+    return error.Invalid;
+}
+
 /// ``--parallel``: "auto" is up to 8 requests at once; a number caps it.
 pub fn parallel(text: []const u8) ?u32 {
     const t = std.mem.trim(u8, text, " ");
@@ -407,6 +466,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .spill_min_tokens = args.spill_min_tokens,
         .spill_min_free_gib = args.spill_min_free_gib,
         .spill_flush_s = args.spill_flush_s,
+        .spill = args.spill,
         .learn = if (args.learn) args.learn_dir orelse try api.prompt_imprint.defaultRoot(a) else null,
         .learn_gib = args.learn_gib,
         .learn_min_free_gib = args.learn_min_free_gib,
@@ -609,4 +669,74 @@ test "the recipe's start.sh flags: the spill flags are read and vision is accept
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--spill-highwater", "1.5" }, &u));
     const vis = try parse(a, &.{ "m", "--vision", "--vision-urls" }, &u);
     try std.testing.expect(vis.vision and vis.vision_urls);
+}
+
+test "spill v2's settings: the spill flags and its variables, defaults when unset, a malformed knob refused by name, none read with the spill off" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var problem: []const u8 = "";
+    const off = try spill(a, .{}, null, &problem);
+    try std.testing.expect(!off.enabled());
+    try std.testing.expectEqual(api.Spill{}, off);
+    var vars = std.process.Environ.Map.init(a);
+    for ([_][2][]const u8{ .{ "TF_GLM_SPILL_QUOTA", "0.25" }, .{ "TF_GLM_SPILL_TURNS", "0" }, .{ "TF_GLM_SPILL_READ_BLOCKS", " 8 " }, .{ "TF_GLM_SPILL_STAGE_MIB", "512" }, .{ "TF_GLM_SPILL_LOAD_MS", "25" }, .{ "TF_SPILL_LOAD_WAIT_MS", "250" }, .{ "TF_SPILL_DEFER_MS", "0" }, .{ "TF_SPILL_FLUSH_S", "5" } }) |kv| try vars.put(kv[0], kv[1]);
+    const args: Args = .{ .snapshot_dir = "/spill", .spill_gib = 64, .spill_min_tokens = 4096, .spill_min_free_gib = 20, .spill_flush_s = 2.5, .spill_highwater = 0.7, .spill_highwater_given = true };
+    const on = try spill(a, args, &vars, &problem);
+    try std.testing.expect(on.enabled());
+    try std.testing.expectEqualStrings("/spill", on.dir.?);
+    try std.testing.expectEqual(@as(f64, 64), on.gib);
+    try std.testing.expectEqual(@as(f64, 20), on.min_free_gib);
+    try std.testing.expectEqual(@as(u32, 4096), on.min_tokens);
+    try std.testing.expectEqual(@as(f64, 0.25), on.quota);
+    try std.testing.expectEqual(@as(u32, 0), on.turns);
+    try std.testing.expectEqual(@as(u32, 8), on.read_blocks);
+    try std.testing.expectEqual(@as(u32, 512), on.stage_mib);
+    try std.testing.expectEqual(@as(f64, 25), on.load_ms);
+    try std.testing.expectEqual(@as(u32, 250), on.load_wait_ms);
+    try std.testing.expectEqual(@as(u32, 0), on.defer_ms); // 0: never deferred
+    try std.testing.expectEqual(@as(u32, 2500), on.flush_ms); // the flag before the variable
+    try std.testing.expectEqual(@as(?f64, 0.7), on.highwater);
+    const tier: Args = .{ .snapshot_dir = "/spill", .spill_gib = 64 }; // (the variables are read with the spill on)
+    try std.testing.expectEqual(@as(u32, 5000), (try spill(a, tier, &vars, &problem)).flush_ms);
+    try std.testing.expectEqual(@as(?f64, null), (try spill(a, .{ .spill_highwater = 0.7 }, null, &problem)).highwater); // (the default, not given)
+    // 0 for the restore budgets keeps their defaults; a malformed TF_SPILL_FLUSH_S keeps v1's reading (60 s)
+    var zero = std.process.Environ.Map.init(a);
+    try zero.put("TF_GLM_SPILL_LOAD_MS", "0");
+    try zero.put("TF_SPILL_LOAD_WAIT_MS", "0");
+    try zero.put("TF_SPILL_FLUSH_S", "soon");
+    const kept = try spill(a, tier, &zero, &problem);
+    try std.testing.expectEqual(@as(f64, 40), kept.load_ms);
+    try std.testing.expectEqual(@as(u32, 30_000), kept.load_wait_ms);
+    try std.testing.expectEqual(@as(u32, 60_000), kept.flush_ms);
+    // milliseconds of a restore budget may be a fraction, as Python 0110 read them (the recipe checks a number)
+    var frac = std.process.Environ.Map.init(a);
+    try frac.put("TF_GLM_SPILL_LOAD_MS", "2.5");
+    try std.testing.expectEqual(@as(f64, 2.5), (try spill(a, tier, &frac, &problem)).load_ms);
+    const malformed = [_][2][]const u8{ .{ "TF_GLM_SPILL_QUOTA", "1.5" }, .{ "TF_GLM_SPILL_QUOTA", "a quarter" }, .{ "TF_GLM_SPILL_TURNS", "-1" }, .{ "TF_GLM_SPILL_TURNS", "all" }, .{ "TF_GLM_SPILL_READ_BLOCKS", "0" }, .{ "TF_GLM_SPILL_STAGE_MIB", "0" }, .{ "TF_GLM_SPILL_LOAD_MS", "-1" }, .{ "TF_GLM_SPILL_LOAD_MS", "inf" }, .{ "TF_GLM_SPILL_LOAD_MS", "nan" }, .{ "TF_GLM_SPILL_LOAD_MS", "soon" }, .{ "TF_SPILL_DEFER_MS", "x" }, .{ "TF_SPILL_DEFER_MS", "1.5" } };
+    for (malformed) |kv| {
+        var bad = std.process.Environ.Map.init(a);
+        try bad.put(kv[0], kv[1]);
+        problem = "";
+        try std.testing.expectError(error.Invalid, spill(a, tier, &bad, &problem));
+        try std.testing.expect(std.mem.indexOf(u8, problem, kv[0]) != null);
+        // the spill off (no --spill-gib, or no --snapshot-dir): never read, never a reason to refuse the start
+        try std.testing.expectEqual(api.Spill{}, try spill(a, .{}, &bad, &problem));
+        try std.testing.expectEqual(api.Spill{ .gib = 64 }, try spill(a, .{ .spill_gib = 64 }, &bad, &problem));
+    }
+    var empty = std.process.Environ.Map.init(a);
+    try empty.put("TF_GLM_SPILL_QUOTA", "");
+    try std.testing.expectEqual(@as(f64, 0), (try spill(a, tier, &empty, &problem)).quota); // empty: unset
+    // the engine is asked for them whole, beside v1's flat fields
+    const o = try request(a, "d", "t", .{ .snapshot_dir = "/spill", .spill_gib = 64, .spill = on });
+    try std.testing.expectEqual(on, o.spill);
+    try std.testing.expectEqualStrings("/spill", o.spill_dir.?);
+    var out: std.Io.Writer.Allocating = .init(a);
+    try capabilities(&out.writer, .{ .version = "0" });
+    for (spill_env) |name| try std.testing.expectEqual(cuda_build, std.mem.indexOf(u8, out.written(), name) != null);
+    if (cuda_build) {
+        var u: Usage = .{};
+        try std.testing.expect((try parse(a, &.{ "m", "--spill-highwater", "0.5" }, &u)).spill_highwater_given);
+        try std.testing.expect(!(try parse(a, &.{"m"}, &u)).spill_highwater_given);
+    }
 }

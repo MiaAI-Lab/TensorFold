@@ -65,13 +65,20 @@ pub fn main(init: std.process.Init) !u8 {
     // A drafter is named like a model: a directory, or a repo id `tensorfold pull` cached.
     if (args.drafter) |d| args.drafter = try hub.resolve(a, io, init.environ_map, d, &problem) orelse return fail(problem);
     const model_type = modelType(a, io, dir);
+    const glm = std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5");
+    // spill v2's variables (TF_GLM_SPILL_*, TF_SPILL_*), a GLM's with the disk tier asked for (its tier reads them): a
+    // typo fails here, on every rank, before the weights load
+    args.spill = cli.spill(a, args, if (glm) init.environ_map else null, &problem) catch |e| switch (e) {
+        error.Invalid => return fail(problem),
+        error.OutOfMemory => return e,
+    };
     if (args.rank > 0) { // a rank above 0 serves no HTTP and loads no text: it runs rank 0's steps
         if (!try engines.follow(a, gpa, io, dir, model_type, args, &problem)) return fail(problem);
         return 0;
     }
     // the GLM recipe's TF_GLM_* switches: a typo fails here, before the weights load
     var recipe_cfg: recipe.Recipe = .{};
-    if (std.mem.eql(u8, model_type, "glm5_next") or std.mem.eql(u8, model_type, "glm5")) {
+    if (glm) {
         recipe_cfg = recipe.Recipe.parse(a, init.environ_map, &problem) catch |e| switch (e) {
             error.Invalid => return fail(problem),
             error.OutOfMemory => return e,

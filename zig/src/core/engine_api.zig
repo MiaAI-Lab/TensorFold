@@ -210,6 +210,8 @@ pub const Open = struct {
     spill_min_tokens: u32 = 8192,
     spill_min_free_gib: f64 = 50,
     spill_flush_s: ?f64 = null,
+    /// Spill v2's settings (the same flags, its variables); a family that binds a v2 tier configures its lane host with them.
+    spill: Spill = .{},
     /// --learn: where shared prompt states are kept on disk for later sessions and servers (null: off).
     learn: ?[]const u8 = null,
     /// --learn-min-free-gib: filesystem space kept free before any learned-state write.
@@ -237,6 +239,140 @@ pub const Open = struct {
     vision: bool = false,
     /// --vision-backend zig: rank 0's engine loads the vision tower itself
     vision_zig: bool = false,
+};
+
+/// Spill v2's settings (wojo's GLM 0110, as the DeepSeek port's): the spill flags v1 reads too (`Open.spill_*`), the
+/// TF_GLM_SPILL_* knobs and the lane host's service bounds (cli.spill). The family selects v2 (TF_GLM_SPILL_V2) and
+/// binds its tier to the prompt cache (Store.setTier), then the lane host takes these (LaneHost.configure). Every rank
+/// is opened with the same values.
+pub const Spill = struct {
+    /// --snapshot-dir and --spill-gib: this rank's store and what it may hold (0: off).
+    dir: ?[]const u8 = null,
+    gib: f64 = 0,
+    /// --spill-min-free-gib: no write leaves less free on the store's file system.
+    min_free_gib: f64 = 50,
+    /// --spill-min-tokens: shorter kept states are not written.
+    min_tokens: u32 = 8192,
+    /// TF_GLM_SPILL_QUOTA: one conversation's share of the cap before its own old turns and forks go first (0: none).
+    quota: f64 = 0,
+    /// TF_GLM_SPILL_TURNS: the newest states kept on a conversation's path (0: every turn until room is needed).
+    turns: u32 = 4,
+    /// TF_GLM_SPILL_READ_BLOCKS: blocks a restore reads ahead into pinned slots.
+    read_blocks: u32 = 16,
+    /// TF_GLM_SPILL_STAGE_MIB: the pinned ring writes are staged through.
+    stage_mib: u32 = 256,
+    /// TF_GLM_SPILL_LOAD_MS: one service's budget for every restore together, then staged writes (a fraction too).
+    load_ms: f64 = 40,
+    /// TF_SPILL_LOAD_WAIT_MS: how long a request waits parked on a restore before it is admitted without it (time in
+    /// other requests' prompt passes, when nothing is serviced, not counted).
+    load_wait_ms: u32 = 30_000,
+    /// TF_SPILL_DEFER_MS: how long a request whose restore the tier refused for capacity, or for anything but the point
+    /// itself while other restores were in flight, waits to ask again before it is admitted on what memory holds, and
+    /// how long a prompt pass of 8192 tokens or more waits while others are parked on restores (LaneHost.holdPass; a
+    /// request waits one way or the other, never both; 0: neither waits).
+    defer_ms: u32 = 5_000,
+    /// --spill-flush-s, else TF_SPILL_FLUSH_S: a clean shutdown's bound for draining writes.
+    flush_ms: u32 = 60_000,
+    /// --spill-highwater when given: v1's early-write mark, which v2 ignores (LaneHost.configure says so).
+    highwater: ?f64 = null,
+
+    /// The disk tier was asked for.
+    pub fn enabled(s: Spill) bool {
+        return s.dir != null and s.gib > 0;
+    }
+};
+
+/// The prompt cache's counters with a durable tier, for /health and /metrics, read from HTTP threads as one copy
+/// (LaneHost publishes it on its engine thread). Null in Status without a tier. Totals unless in `gauges`.
+pub const CacheStats = struct {
+    memory_hits: u64 = 0,
+    memory_misses: u64 = 0,
+    kept: u64 = 0,
+    evicted: u64 = 0,
+    refused: u64 = 0,
+    failed: u64 = 0,
+    entries: u64 = 0,
+    held_bytes: u64 = 0,
+    disk_lookups: u64 = 0,
+    disk_hits: u64 = 0,
+    disk_hits_committed: u64 = 0,
+    restores_begun: u64 = 0,
+    restores_shared: u64 = 0,
+    restores_failed: u64 = 0,
+    restores_cancelled: u64 = 0,
+    restores_dropped: u64 = 0,
+    restores_refused: u64 = 0,
+    restores_active: u64 = 0,
+    restoring_bytes: u64 = 0,
+    restore_blocks_done: u64 = 0,
+    restore_blocks_total: u64 = 0,
+    restored_tokens: u64 = 0,
+    restore_waits: u64 = 0,
+    restore_wait_timeouts: u64 = 0,
+    restore_wait_ns: u64 = 0,
+    restore_wait_max_ns: u64 = 0,
+    restores_deferred: u64 = 0,
+    restores_deferred_expired: u64 = 0,
+    prefills_held: u64 = 0,
+    prefills_held_expired: u64 = 0,
+    writes_enqueued: u64 = 0,
+    shared_promoted: u64 = 0,
+    flushes: u64 = 0,
+    flush_timeouts: u64 = 0,
+    flush_unpublished: u64 = 0,
+    parked: u64 = 0,
+    chats_continued: u64 = 0,
+    chats_continued_prefill_tokens: u64 = 0,
+    cached_tokens: u64 = 0,
+    computed_tokens: u64 = 0,
+    /// The tier's own counters, each rank's.
+    spill: ?prompt_cache.RankCounts = null,
+
+    pub const gauges = [_][]const u8{ "entries", "held_bytes", "restores_active", "restoring_bytes", "restore_blocks_done", "restore_blocks_total", "parked" };
+
+    /// Each field's /metrics help (a missing one fails the build).
+    pub const help = .{
+        .memory_hits = "Prompt passes that resumed a kept state in memory.",
+        .memory_misses = "Prompt lookups that found no usable kept state.",
+        .kept = "Prompt states kept in memory.",
+        .evicted = "Kept states evicted from memory for room.",
+        .refused = "Prompt states not kept: past the memory budget.",
+        .failed = "Kept states that failed to save or restore.",
+        .entries = "Prompt states kept in memory now.",
+        .held_bytes = "Bytes the kept states hold now.",
+        .disk_lookups = "Lookups that asked the disk tier.",
+        .disk_hits = "Lookups whose durable point was longer than the best usable memory state.",
+        .disk_hits_committed = "Disk restores every rank installed, adopted as kept states.",
+        .restores_begun = "Disk restore jobs started.",
+        .restores_shared = "Requests that joined a disk restore already in flight.",
+        .restores_failed = "Disk restores aborted on every rank (missing, damaged, guarded).",
+        .restores_cancelled = "Disk restores stopped: no request waited for them any more, or shutdown.",
+        .restores_dropped = "Installed disk restores not adopted: no room, or memory already had them.",
+        .restores_refused = "Disk restores not begun: the memory budget could not hold their destination, or the tier was at its capacity (once a request).",
+        .restores_active = "Disk restore jobs in flight.",
+        .restoring_bytes = "Memory the disk restores in flight reserved, charged to the prompt cache's budget.",
+        .restore_blocks_done = "Blocks the restores in flight have copied so far.",
+        .restore_blocks_total = "Blocks the restores in flight copy in all.",
+        .restored_tokens = "Prompt tokens restored from disk.",
+        .restore_waits = "Requests parked on a disk restore.",
+        .restore_wait_timeouts = "Requests admitted without their disk restore after TF_SPILL_LOAD_WAIT_MS.",
+        .restore_wait_ns = "Nanoseconds requests waited for disk restores.",
+        .restore_wait_max_ns = "The longest wait for a disk restore, in nanoseconds.",
+        .restores_deferred = "Requests whose disk restore was refused for capacity, or for anything but the point while other restores were in flight, and asked again instead of prefilling.",
+        .restores_deferred_expired = "Of them, requests admitted on what memory holds without the restore starting: after TF_SPILL_DEFER_MS, or refused again with no restore left in flight.",
+        .prefills_held = "Requests whose long prompt pass (8192 tokens or more) waited while others were parked on disk restores: a whole pass stalls their install.",
+        .prefills_held_expired = "Of them, requests whose pass ran after TF_SPILL_DEFER_MS with others still parked.",
+        .writes_enqueued = "Kept states enqueued for the disk tier at their keep.",
+        .shared_promoted = "Disk points promoted to shared prefixes.",
+        .flushes = "Clean-shutdown flushes of the disk tier.",
+        .flush_timeouts = "Flushes that reached their deadline with points unpublished.",
+        .flush_unpublished = "Points left unpublished at a flush deadline.",
+        .parked = "Requests parked on a disk restore now (reading it, or deferred to ask again), or holding a long pass for others' restores.",
+        .chats_continued = "Streams that continued a conversation without resuming from its own turn state.",
+        .chats_continued_prefill_tokens = "Prompt tokens those streams prefilled.",
+        .cached_tokens = "Prompt tokens passes resumed from kept states.",
+        .computed_tokens = "Prompt tokens passes computed.",
+    };
 };
 
 /// An opened engine; ``close`` stops its thread and frees its backend.
@@ -275,6 +411,8 @@ pub const Status = struct {
     pool_free_tokens: ?u64 = null,
     /// The kept prompt states (/health's kept_prompts, kept_bytes, kept_mix); null without a prompt cache.
     kept: ?prompt_cache.KeptStats = null,
+    /// The prompt cache's counters with its durable tier (spill v2); null without one.
+    cache: ?CacheStats = null,
 };
 
 pub const SubmitError = error{ Closed, Busy, InvalidSpans };
@@ -434,6 +572,7 @@ test {
     _ = @import("lane_host_test.zig");
     _ = @import("lane_host_reuse_test.zig");
     _ = @import("lane_host_warm_test.zig");
+    _ = @import("lane_host_tier_test.zig");
     _ = @import("prompt_cache.zig");
     _ = @import("prompt_radix.zig");
     _ = @import("prompt_imprint.zig");
