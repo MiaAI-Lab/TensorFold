@@ -74,4 +74,6 @@ test {
     _ = @import("slide_teacher.zig");
     _ = @import("slide_pick.zig");
     _ = @import("startup.zig");
+    _ = @import("prepare_gate.zig");
+    _ = @import("prepare_gate_test.zig");
 }

@@ -328,7 +328,7 @@ const Run = struct {
             reply.content = try r.plan.policy.content(r.a, reply.content);
             // the calls' reasoning, for a client that will not send it back (TF_GLM_KEEP_REASONING)
             if (reply.calls != null and std.mem.eql(u8, reply.finish_reason, "tool_calls")) if (r.srv.kept_reasoning) |k|
-                try k.remember(r.a, r.plan.input.messages, reply.calls.?, reply.reasoning);
+                try k.remember(r.plan.input.messages, reply.calls.?, reply.reasoning);
             return reply.calls;
         }
         const parsed = try tool_parse.parse(r.a, reply.content, tools, r.plan.policy.maxCalls());

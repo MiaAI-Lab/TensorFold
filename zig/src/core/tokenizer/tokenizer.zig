@@ -80,6 +80,52 @@ const Trie = struct {
 
 const Segment = struct { start: usize, end: usize, id: ?u32 };
 
+/// A pre-tokenizer's steps run depth first: step d's parts of one piece in arena d, reset before the next piece, and
+/// the model's scratch for one part in the last arena, reset for each part. Every step maps a piece to its own parts
+/// alone, in order (PreTokenizer.apply's loop), so the parts and their order are those of the steps over every piece
+/// at once; only the scratch is one piece's a step. `n` is 0 when the steps do not fit (nested deeper than max_steps).
+const Walk = struct {
+    backing: Allocator,
+    steps: [max_steps]*const steps.PreTokenizer = undefined,
+    n: usize = 0,
+    arenas: [max_steps + 1]?std.heap.ArenaAllocator = @splat(null),
+
+    const max_steps = 16;
+
+    fn deinit(w: *Walk) void {
+        for (&w.arenas) |*x| if (x.*) |*ar| ar.deinit();
+    }
+
+    /// The steps of `p`, its Sequences flattened; none when they are more than max_steps.
+    fn flatten(w: *Walk, p: *const steps.PreTokenizer) void {
+        if (!w.add(p)) w.n = 0;
+    }
+
+    fn add(w: *Walk, p: *const steps.PreTokenizer) bool {
+        if (p.* == .sequence) {
+            for (p.sequence) |*step| if (!w.add(step)) return false;
+            return true;
+        }
+        if (w.n == max_steps) return false;
+        w.steps[w.n] = p;
+        w.n += 1;
+        return true;
+    }
+
+    /// `piece` through steps d.. and the model, its ids appended to `ids` (grown in `ids_a`).
+    fn run(w: *Walk, t: *const Tokenizer, d: usize, piece: steps.Piece, ids: *std.ArrayList(u32), ids_a: Allocator) Error!void {
+        if (w.arenas[d] == null) w.arenas[d] = .init(w.backing);
+        const ar = &w.arenas[d].?;
+        _ = ar.reset(.retain_capacity);
+        var cx = steps.Context{ .a = ar.allocator(), .matcher = .{ .a = ar.allocator() }, .out = ids_a };
+        if (d == w.n) return t.model.tokenize(&cx, &t.vocab, piece.text, ids);
+        var parts: std.ArrayList(steps.Piece) = .empty;
+        try parts.append(cx.a, piece);
+        try w.steps[d].apply(&cx, &parts);
+        for (parts.items) |x| try w.run(t, d + 1, x, ids, ids_a);
+    }
+};
+
 pub const Tokenizer = struct {
     allocator: Allocator,
     arena: ?*std.heap.ArenaAllocator = null,
@@ -113,10 +159,25 @@ pub const Tokenizer = struct {
     }
 
     /// Token ids for `text`, without post-processor tokens; invalid UTF-8 reads as U+FFFD. Caller frees with `a`.
+    /// The call's scratch comes from the page allocator, never from `a`, and is given back when it returns: with an
+    /// arena `a` (a server request's) the scratch of a long prompt would stay with the request (~160 bytes a text
+    /// byte, over a GiB for a prompt of a million tokens). Pre-tokenization walks depth first (Walk), so it holds the
+    /// parts of one piece a step at a time; the ids are those of `apply` over every piece at once.
     pub fn encode(t: *const Tokenizer, a: Allocator, text: []const u8) Error![]u32 {
-        var arena = std.heap.ArenaAllocator.init(a);
+        return t.encodeWith(a, text, .{});
+    }
+
+    /// How encode works: where its scratch comes from, and whether pre-tokenization walks depth first (tests compare
+    /// the two walks and count the scratch).
+    pub const EncodeOptions = struct { scratch: Allocator = std.heap.page_allocator, depth_first: bool = true };
+
+    pub fn encodeWith(t: *const Tokenizer, a: Allocator, text: []const u8, o: EncodeOptions) Error![]u32 {
+        var arena = std.heap.ArenaAllocator.init(o.scratch);
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
+        var walk: Walk = .{ .backing = o.scratch };
+        defer walk.deinit();
+        if (t.pre_tokenizer) |*p| if (o.depth_first) walk.flatten(p);
         var valid = text;
         if (!std.unicode.utf8ValidateSlice(text)) {
             var fixed: std.ArrayList(u8) = .empty;
@@ -125,12 +186,12 @@ pub const Tokenizer = struct {
         }
         var ids: std.ArrayList(u32) = .empty;
         for (try t.splitAdded(&ctx, &t.raw, valid)) |seg| {
-            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, valid[seg.start..seg.end], seg.start == 0, &ids);
+            if (seg.id) |id| try ids.append(ctx.a, id) else if (seg.end > seg.start) try t.encodeText(&ctx, &walk, valid[seg.start..seg.end], seg.start == 0, &ids);
         }
         return a.dupe(u32, ids.items);
     }
 
-    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
+    fn encodeText(t: *const Tokenizer, ctx: *steps.Context, walk: *Walk, text: []const u8, first: bool, ids: *std.ArrayList(u32)) Error!void {
         var zero: usize = if (first) unicode.decodeAt(text, 0).len else 0;
         const normalized = if (t.normalizer) |*n| try n.apply(ctx, text, &zero) else text;
         for (try t.splitAdded(ctx, &t.normalized, normalized)) |seg| {
@@ -139,10 +200,16 @@ pub const Tokenizer = struct {
                 continue;
             }
             if (seg.end == seg.start) continue;
-            var pieces: std.ArrayList(steps.Piece) = .empty;
-            try pieces.append(ctx.a, .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero });
-            if (t.pre_tokenizer) |*p| try p.apply(ctx, &pieces);
-            for (pieces.items) |piece| try t.model.tokenize(ctx, &t.vocab, piece.text, ids);
+            const piece: steps.Piece = .{ .text = normalized[seg.start..seg.end], .first = seg.start < zero };
+            if (t.pre_tokenizer != null and walk.n == 0) {
+                // every piece at once (a pre-tokenizer nested past Walk's steps, or depth_first off)
+                var pieces: std.ArrayList(steps.Piece) = .empty;
+                try pieces.append(ctx.a, piece);
+                try t.pre_tokenizer.?.apply(ctx, &pieces);
+                for (pieces.items) |x| try t.model.tokenize(ctx, &t.vocab, x.text, ids);
+                continue;
+            }
+            try walk.run(t, 0, piece, ids, ctx.a);
         }
     }
 
@@ -181,7 +248,7 @@ pub const Tokenizer = struct {
 
     /// Text for `ids` through the decoder chain; unknown ids are skipped. Caller frees with `a`.
     pub fn decode(t: *const Tokenizer, a: Allocator, ids: []const u32, skip_special_tokens: bool) Error![]u8 {
-        var arena = std.heap.ArenaAllocator.init(a);
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator); // (scratch never kept in `a`: see encode)
         defer arena.deinit();
         var ctx = steps.Context{ .a = arena.allocator(), .matcher = .{ .a = arena.allocator() } };
         var tokens = try std.ArrayList([]const u8).initCapacity(ctx.a, ids.len);
@@ -466,4 +533,164 @@ test "raw token bytes conservatively refuse context-sensitive decoder kinds" {
         t.decoder = decoder;
         try std.testing.expect((try t.tokenBytes(a, 0)) == null);
     }
+}
+
+/// Counts what an allocator holds now and at most (the tests' measure of encode's scratch).
+const Counting = struct {
+    child: Allocator,
+    live: usize = 0,
+    peak: usize = 0,
+
+    fn allocator(c: *Counting) Allocator {
+        return .{ .ptr = c, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+    fn note(c: *Counting, add: usize, sub: usize) void {
+        c.live = c.live + add - sub;
+        c.peak = @max(c.peak, c.live);
+    }
+    fn alloc(ctx: *anyopaque, len: usize, al: std.mem.Alignment, ra: usize) ?[*]u8 {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        const p = c.child.rawAlloc(len, al, ra) orelse return null;
+        c.note(len, 0);
+        return p;
+    }
+    fn resize(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) bool {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        if (!c.child.rawResize(m, al, n, ra)) return false;
+        c.note(n, m.len);
+        return true;
+    }
+    fn remap(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        const p = c.child.rawRemap(m, al, n, ra) orelse return null;
+        c.note(n, m.len);
+        return p;
+    }
+    fn free(ctx: *anyopaque, m: []u8, al: std.mem.Alignment, ra: usize) void {
+        const c: *Counting = @ptrCast(@alignCast(ctx));
+        c.child.rawFree(m, al, ra);
+        c.note(0, m.len);
+    }
+};
+
+/// A byte-level BPE tokenizer with DeepSeek-V3/V4's pre-tokenizer (digits, CJK runs, the word regex, ByteLevel), every
+/// byte in the vocabulary and merges that join each of `words` (with and without its leading space) left to right.
+fn deepseekLike(a: Allocator, words: []const []const u8) !Tokenizer {
+    var out: std.Io.Writer.Allocating = .init(a);
+    defer out.deinit();
+    const w = &out.writer;
+    try w.writeAll(
+        \\{"added_tokens":[{"id":0,"content":"<｜User｜>","special":true,"lstrip":false,"rstrip":false,"normalized":false,"single_word":false}],
+        \\ "normalizer":null,
+        \\ "pre_tokenizer":{"type":"Sequence","pretokenizers":[
+        \\  {"type":"Split","pattern":{"Regex":"\\p{N}{1,3}"},"behavior":"Isolated","invert":false},
+        \\  {"type":"Split","pattern":{"Regex":"[一-龥぀-ゟ゠-ヿ]+"},"behavior":"Isolated","invert":false},
+        \\  {"type":"Split","pattern":{"Regex":"[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"},"behavior":"Isolated","invert":false},
+        \\  {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":true,"use_regex":false}]},
+        \\ "decoder":{"type":"ByteLevel"},
+        \\ "model":{"type":"BPE","dropout":null,"unk_token":null,"fuse_unk":false,"byte_fallback":false,"ignore_merges":false,"vocab":{
+    );
+    var vocab: std.StringArrayHashMapUnmanaged(void) = .empty;
+    defer vocab.deinit(a);
+    var merges: std.ArrayList([2][]const u8) = .empty;
+    defer merges.deinit(a);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    for (0..256) |b| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(steps.byte_chars[b], &buf);
+        try vocab.put(a, try aa.dupe(u8, buf[0..n]), {});
+    }
+    for (words) |word| for ([_][]const u8{ "", " " }) |lead| {
+        const raw = try std.mem.concat(aa, u8, &.{ lead, word });
+        var cur: []const u8 = "";
+        for (raw) |b| {
+            var buf: [4]u8 = undefined;
+            const sym = try aa.dupe(u8, buf[0..try std.unicode.utf8Encode(steps.byte_chars[b], &buf)]);
+            if (cur.len == 0) {
+                cur = sym;
+                continue;
+            }
+            const next = try std.mem.concat(aa, u8, &.{ cur, sym });
+            if (!vocab.contains(next)) {
+                try vocab.put(a, next, {});
+                try merges.append(a, .{ cur, sym });
+            }
+            cur = next;
+        }
+    };
+    for (vocab.keys(), 1..) |k, id| {
+        if (id > 1) try w.writeAll(",");
+        try w.print("{f}:{d}", .{ std.json.fmt(k, .{}), id });
+    }
+    try w.writeAll("},\"merges\":[");
+    for (merges.items, 0..) |m, i| {
+        if (i > 0) try w.writeAll(",");
+        try w.print("[{f},{f}]", .{ std.json.fmt(m[0], .{}), std.json.fmt(m[1], .{}) });
+    }
+    try w.writeAll("]}}");
+    return parse(a, out.written());
+}
+
+/// A long prompt's text: sentences of `words`, numbers, CJK runs, tabs and blank lines, an added token now and then.
+fn longText(a: Allocator, words: []const []const u8, bytes: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var rng = std.Random.DefaultPrng.init(17);
+    const r = rng.random();
+    while (out.items.len < bytes) {
+        const n = 4 + r.uintLessThan(usize, 14);
+        for (0..n) |i| {
+            if (i > 0) try out.append(a, ' ');
+            try out.appendSlice(a, words[r.uintLessThan(usize, words.len)]);
+        }
+        switch (r.uintLessThan(u8, 10)) {
+            0 => try out.print(a, " {d}", .{r.uintLessThan(u32, 1_000_000)}),
+            1 => try out.appendSlice(a, " 日本語のテキスト、"),
+            2 => try out.appendSlice(a, "\t(x+y)=z;"),
+            3 => try out.appendSlice(a, "<｜User｜>"),
+            else => {},
+        }
+        try out.appendSlice(a, if (r.uintLessThan(u8, 6) == 0) ".\n\n" else ". ");
+    }
+    return out.toOwnedSlice(a);
+}
+
+const test_words = [_][]const u8{ "the", "model", "reads", "a", "long", "prompt", "of", "many", "tokens", "and", "keeps", "its", "state", "while", "another", "conversation", "resumes", "from", "memory", "There", "Each", "stream", "decodes" };
+
+test "encode's ids are the breadth-first walk's, and it keeps no scratch in the caller's arena" {
+    const gpa = std.testing.allocator;
+    var t = try deepseekLike(gpa, &test_words);
+    defer t.deinit();
+    const text = try longText(gpa, &test_words, 256 << 10);
+    defer gpa.free(text);
+    // the same ids either walk (and on a few short texts with edge cases)
+    for ([_][]const u8{ text, "", " ", "\n\n\n", "<｜User｜>", "12345 6789", "a  b\t\tc \n d", "\xff\xfe broken", "日本語abc123" }) |s| {
+        const deep = try t.encodeWith(gpa, s, .{});
+        defer gpa.free(deep);
+        const wide = try t.encodeWith(gpa, s, .{ .depth_first = false });
+        defer gpa.free(wide);
+        try std.testing.expectEqualSlices(u32, wide, deep);
+        const back = try t.decode(gpa, deep, false);
+        defer gpa.free(back);
+        if (std.unicode.utf8ValidateSlice(s)) try std.testing.expectEqualStrings(s, back);
+    }
+    // a request arena keeps only the ids: the scratch was the page allocator's
+    var held: Counting = .{ .child = gpa };
+    {
+        var request = std.heap.ArenaAllocator.init(held.allocator());
+        defer request.deinit();
+        const ids = try t.encode(request.allocator(), text);
+        try std.testing.expect(ids.len > text.len / 8);
+        try std.testing.expect(held.peak <= 2 * ids.len * 4 + (64 << 10)); // (an arena's buffer for the one dupe)
+    }
+    // the scratch itself, counted: depth first it is a few bytes a text byte (breadth first: ~100)
+    var deep: Counting = .{ .child = gpa };
+    gpa.free(try t.encodeWith(gpa, text, .{ .scratch = deep.allocator() }));
+    var wide: Counting = .{ .child = gpa };
+    gpa.free(try t.encodeWith(gpa, text, .{ .scratch = wide.allocator(), .depth_first = false }));
+    std.debug.print("scratch for {d} text bytes: depth first {d} B, breadth first {d} B\n", .{ text.len, deep.peak, wide.peak });
+    try std.testing.expectEqual(@as(usize, 0), deep.live);
+    try std.testing.expect(deep.peak * 4 < wide.peak);
+    try std.testing.expect(deep.peak < 40 * text.len);
 }

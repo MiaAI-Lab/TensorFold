@@ -99,8 +99,15 @@ pub fn compile(gpa: Allocator, source: []const u8, diag: ?*Diag) Error!Compiled 
 }
 
 /// Renders with Hugging Face's variables: messages, tools (none when absent), documents, add_generation_prompt, then `context`.
+/// Only the text (and a refusal's message) comes from `gpa`: the render's scratch is the page allocator's, given back
+/// when it returns, so an arena `gpa` (a server request's) keeps nothing else of it (~28 bytes a prompt byte otherwise).
 pub fn render(gpa: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error![]u8 {
-    var arena = std.heap.ArenaAllocator.init(gpa);
+    return renderWith(gpa, std.heap.page_allocator, t, messages, tools, context, add_generation_prompt, diag);
+}
+
+/// render with its scratch from `scratch` (tests count it, as the tokenizer's encodeWith does).
+pub fn renderWith(gpa: Allocator, scratch: Allocator, t: *const Compiled, messages: std.json.Value, tools: std.json.Value, context: std.json.Value, add_generation_prompt: bool, diag: ?*Diag) Error![]u8 {
+    var arena = std.heap.ArenaAllocator.init(scratch);
     defer arena.deinit();
     const a = arena.allocator();
     var out: std.ArrayList(u8) = .empty;
@@ -136,6 +143,30 @@ pub fn renderChat(gpa: Allocator, source: []const u8, messages: std.json.Value, 
     var t = try compile(gpa, source, diag);
     defer t.deinit();
     return render(gpa, &t, messages, tools, context, add_generation_prompt, diag);
+}
+
+test "a render keeps only its text in the caller's arena" {
+    const gpa = std.testing.allocator;
+    var diag: Diag = .{};
+    var t = try compile(gpa, "{% for m in messages %}<{{ m.role }}>{{ m.content | trim }}{% endfor %}{% if add_generation_prompt %}<assistant>{% endif %}", &diag);
+    defer t.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var msgs = std.json.Array.init(a);
+    const body = try a.alloc(u8, 64 << 10);
+    @memset(body, 'x');
+    for (0..64) |i| {
+        var o: std.json.ObjectMap = .empty;
+        try o.put(a, "role", .{ .string = if (i % 2 == 0) "user" else "assistant" });
+        try o.put(a, "content", .{ .string = body });
+        try msgs.append(.{ .object = o });
+    }
+    var request = std.heap.ArenaAllocator.init(gpa);
+    defer request.deinit();
+    const out = try render(request.allocator(), &t, .{ .array = msgs }, .null, .{ .object = .empty }, true, &diag);
+    try std.testing.expectEqual(64 * body.len + 32 * "<user>".len + 33 * "<assistant>".len, out.len);
+    try std.testing.expect(request.queryCapacity() <= 2 * out.len + (64 << 10));
 }
 
 test {

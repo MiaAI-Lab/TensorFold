@@ -10,6 +10,8 @@ pub const Error = error{ UnsupportedNormalizer, UnsupportedPreTokenizer, Unsuppo
 /// Per-call scratch: `a` is an arena freed when the call returns.
 pub const Context = struct {
     a: Allocator,
+    /// What the model's output list grows in, when it is not `a` (encode's depth-first walk: `a` is reset for each part).
+    out: ?Allocator = null,
     matcher: regex.Matcher,
     raw_bytes: bool = false,
     spans: std.ArrayList(Span) = .empty,
@@ -17,6 +19,11 @@ pub const Context = struct {
 };
 
 pub const Span = struct { start: usize, end: usize, matched: bool };
+
+/// The allocator a model's output list grows in (Context.out, else a).
+pub fn outOf(ctx: *const Context) Allocator {
+    return ctx.out orelse ctx.a;
+}
 pub const Piece = struct { text: []const u8, first: bool };
 
 pub fn field(v: Value, key: []const u8) ?Value {

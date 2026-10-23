@@ -96,6 +96,16 @@ pub fn replySpans(srv: *Server, cx: *Cx, prompt: []const u32) errors.Refused![]c
     return spans.items;
 }
 
+/// `input` with GLM's kept reasoning back in its messages (glm_kept.zig), once for all of prepare's renders: theirs
+/// find nothing left to put back, and the prepare gate counts the text they render.
+pub fn withKept(srv: *Server, a: std.mem.Allocator, input: chat.Input) std.mem.Allocator.Error!chat.Input {
+    if (!srv.config.recipe.glm or input.prompt != null or input.media != null) return input;
+    const k = srv.kept_reasoning orelse return input;
+    var out = input;
+    out.messages = try k.restore(a, input.messages);
+    return out;
+}
+
 /// A request's prompt: raw text or ids for a completion, else the chat template's, with its history length.
 pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort: ?[]const u8) errors.Refused!Rendered {
     if (input.prompt) |p| switch (p) {

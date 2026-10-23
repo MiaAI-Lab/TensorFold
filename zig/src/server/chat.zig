@@ -17,6 +17,7 @@ const admission = @import("admission.zig");
 const glm_calls = @import("glm_calls.zig");
 const glm_reply = @import("glm_reply.zig");
 const playout_mod = @import("playout.zig");
+const prepare_gate = @import("prepare_gate.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -172,7 +173,17 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
     if (input.prompt != null) thinking = false;
     if (f.get("clear_thinking")) |v| cx.clear_thinking = v.truthy(); // chat_template_kwargs.clear_thinking, for every render
     const effort = srv.effortFor(if (f.get("reasoning_effort")) |e| (if (e == .string) e.string else null) else null);
-    const rendered = try prompt_mod.prepare(srv, cx, input, thinking, effort);
+    // the renders and tokenizations take memory in proportion to the text (prompt and history, and the rewind probe
+    // with the prompt cache on); under the memory floor they wait for the ones in flight (prepare_gate), and hold the
+    // reservation until prepare returns, in arrival order; past the gate's waiter bound a request is refused as one past
+    // the lanes is (429 under the recipe). GLM's kept reasoning goes back first, so the reservation counts it.
+    const sent = try prompt_mod.withKept(srv, a, input);
+    const ticket = srv.gate.enter(io, srv.gate.need(promptBytes(sent)), gone) catch |e| switch (e) {
+        error.Cancelled => return error.Cancelled,
+        error.Full => return cx.fail(.capacity, "{s}", .{prepare_gate.full_message}),
+    };
+    defer srv.gate.leave(io, ticket);
+    const rendered = try prompt_mod.prepare(srv, cx, sent, thinking, effort);
     if (gone.check()) return error.Cancelled;
     if (rendered.ids.len == 0) return cx.refuse("rendered prompt is empty");
     const window: i64 = srv.info.context_window;
@@ -191,7 +202,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         }
         limit = @min(limit, room);
     }
-    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, input.messages, input.tools, rendered.ids, thinking, effort);
+    const system_len: usize = if (input.prompt != null or rendered.media != null) 0 else prompt_mod.systemPrefixLen(srv, cx, sent.messages, input.tools, rendered.ids, thinking, effort);
     var shared: std.ArrayList(u32) = .empty;
     if (system_len > 0) for ([_]i64{ @as(i64, @intCast(system_len)) - 2048, @as(i64, @intCast(system_len)) - 512, @intCast(system_len) }) |cut| {
         if (cut >= 512) try shared.append(a, @intCast(cut));
@@ -326,6 +337,17 @@ fn logEnded(id: []const u8, e: Failure, message: []const u8, prompt: usize, toke
 pub fn run(srv: *Server, cx: *Cx, input: Input, sink: ?Sink, gone: anytype) Failure!Reply {
     if (srv.config.compact_at == null) return generate(srv, cx, try prepare(srv, cx, input, gone), sink, gone);
     return @import("compact.zig").run(srv, cx, input, sink, gone);
+}
+
+/// The text a request's prepare renders and tokenizes, in bytes (its reservation's measure).
+pub fn promptBytes(input: Input) usize {
+    var n = prepare_gate.textBytes(input.messages);
+    for (input.tools) |t| n +|= prepare_gate.textBytes(t);
+    if (input.prompt) |p| switch (p) {
+        .text => |t| n +|= t.len,
+        .ids => |toks| n +|= 4 * toks.len,
+    };
+    return n;
 }
 
 /// Give back a foreground request's preparing count: at its submit, or when it is never generated.
