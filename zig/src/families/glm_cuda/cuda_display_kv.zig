@@ -96,6 +96,19 @@ pub fn zeroRanges(s: Span, total: usize) ![2]Range {
     if (s.ordinary + s.display != total) return error.DisplaySpanSize;
     return .{ .{ .ptr = s.ptr, .len = s.ordinary }, .{ .ptr = s.ptr + s.ordinary, .len = s.display } };
 }
+/// One piece of a device copy: `len` bytes at `off` from the start of both its source and its destination.
+pub const Piece = struct { off: usize, len: usize };
+/// A device copy of `n` bytes from `src` to `dst`, cut where either range crosses `cut`, a DRM span's ordinary/display
+/// boundary: the driver's memcpy refuses a range across two cuMemHostRegister ranges, as its memset does. In order,
+/// unused pieces empty at the end.
+pub fn copyPieces(cut: u64, dst: u64, src: u64, n: usize) [3]Piece {
+    var at: [2]usize = .{ n, n };
+    if (dst < cut and cut < dst + n) at[0] = cut - dst;
+    if (src < cut and cut < src + n) at[1] = cut - src;
+    if (at[1] < at[0]) std.mem.swap(usize, &at[0], &at[1]);
+    if (at[1] == at[0]) at[1] = n;
+    return .{ .{ .off = 0, .len = at[0] }, .{ .off = at[0], .len = at[1] - at[0] }, .{ .off = at[1], .len = n - at[1] } };
+}
 fn mapped(address: usize, size: usize, prot: c_int, flags: c_int, fd: c_int, offset: u64) !usize {
     const p = mmap(if (address == 0) null else @ptrFromInt(address), size, prot, flags, fd, @intCast(offset)) orelse return error.DisplayMmap;
     const at = @intFromPtr(p);
@@ -360,4 +373,20 @@ test "a DRM span whose two registrations do not hold the planes is refused, in r
     const drm: Span = .{ .ptr = 0x10_0000_0000, .base = 0x7f00_0000_0000, .ordinary = 3 << 20, .display = 1792 << 20, .d = undefined };
     try std.testing.expectError(error.DisplaySpanSize, zeroRanges(drm, (3 << 20) + (1792 << 20) + 4096));
     try std.testing.expectError(error.DisplaySpanSize, zeroRanges(drm, (3 << 20) + (1792 << 20) - 4096));
+}
+
+test "a device copy is cut where its source or destination crosses the ordinary/display registrations" {
+    const cut: u64 = 0x10_0030_0000;
+    const P = Piece;
+    // neither side reaches the boundary, or one ends exactly on it: one piece
+    try std.testing.expectEqual([3]P{ .{ .off = 0, .len = 4096 }, .{ .off = 4096, .len = 0 }, .{ .off = 4096, .len = 0 } }, copyPieces(cut, 0x20_0000_0000, 0x10_0000_0000, 4096));
+    try std.testing.expectEqual([3]P{ .{ .off = 0, .len = 4096 }, .{ .off = 4096, .len = 0 }, .{ .off = 4096, .len = 0 } }, copyPieces(cut, cut - 4096, 0x20_0000_0000, 4096));
+    try std.testing.expectEqual([3]P{ .{ .off = 0, .len = 4096 }, .{ .off = 4096, .len = 0 }, .{ .off = 4096, .len = 0 } }, copyPieces(cut, cut, 0x20_0000_0000, 4096));
+    // a kept state saved from rows that cross: the source is cut
+    try std.testing.expectEqual([3]P{ .{ .off = 0, .len = 1000 }, .{ .off = 1000, .len = 3096 }, .{ .off = 4096, .len = 0 } }, copyPieces(cut, 0x20_0000_0000, cut - 1000, 4096));
+    // restored into rows that cross: the destination is cut
+    try std.testing.expectEqual([3]P{ .{ .off = 0, .len = 1000 }, .{ .off = 1000, .len = 3096 }, .{ .off = 4096, .len = 0 } }, copyPieces(cut, cut - 1000, 0x20_0000_0000, 4096));
+    // both cross, at different offsets: three pieces in order; at the same offset: two
+    try std.testing.expectEqual([3]P{ .{ .off = 0, .len = 1000 }, .{ .off = 1000, .len = 2000 }, .{ .off = 3000, .len = 1096 } }, copyPieces(cut, cut - 3000, cut - 1000, 4096));
+    try std.testing.expectEqual([3]P{ .{ .off = 0, .len = 1000 }, .{ .off = 1000, .len = 3096 }, .{ .off = 4096, .len = 0 } }, copyPieces(cut, cut - 1000, cut - 1000, 4096));
 }

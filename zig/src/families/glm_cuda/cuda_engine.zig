@@ -626,7 +626,11 @@ pub const Engine = struct {
 
     fn copyBytes(ptr: *anyopaque, dst: u64, src: u64, n: usize) anyerror!void {
         const e: *Engine = @ptrCast(@alignCast(ptr));
-        try e.stream.d.check(e.stream.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, e.stream.handle), "cuMemcpyDtoDAsync");
+        // a DRM display span is two host registrations, and rows of a latent plane can lie on both sides of the cut
+        const cut: u64 = if (e.caches.span) |v| (if (v.base != 0) v.ptr + v.ordinary else 0) else 0;
+        if (cut == 0) return e.stream.d.check(e.stream.d.api.cuMemcpyDtoDAsync_v2(dst, src, n, e.stream.handle), "cuMemcpyDtoDAsync");
+        for (display.copyPieces(cut, dst, src, n)) |p| if (p.len > 0)
+            try e.stream.d.check(e.stream.d.api.cuMemcpyDtoDAsync_v2(dst + p.off, src + p.off, p.len, e.stream.handle), "cuMemcpyDtoDAsync");
     }
 
     fn copier(e: *Engine) snapshot.Copier {
