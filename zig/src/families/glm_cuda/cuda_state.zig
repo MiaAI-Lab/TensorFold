@@ -112,12 +112,12 @@ pub const Caches = struct {
         var a = try Arena.init(d, &sizes);
         errdefer a.deinit();
         var c: Caches = .{ .arena = undefined, .rows = rows, .streams = streams, .ring = ring, .latent = undefined, .pooled = undefined, .keys = undefined, .gates = undefined };
+        if (span) |v| for (try display.zeroRanges(v, count * plane)) |r| {
+            const part: cuda.DeviceBuffer = .{ .d = d, .ptr = r.ptr, .len = r.len };
+            try part.fill8(0, null);
+        };
         for (0..11) |i| {
             c.latent[i] = if (i < count) span.?.ptr + i * plane else a.take(sizes[4 * i]);
-            if (i < count) {
-                const plane_view: cuda.DeviceBuffer = .{ .d = d, .ptr = c.latent[i], .len = plane };
-                try plane_view.fill8(0, null);
-            }
             c.pooled[i] = a.take(sizes[4 * i + 1]);
             c.keys[i] = a.take(sizes[4 * i + 2]);
             c.gates[i] = a.take(sizes[4 * i + 3]);

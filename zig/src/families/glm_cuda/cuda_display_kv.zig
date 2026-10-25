@@ -86,6 +86,16 @@ pub const Span = struct {
         s.owns_claim = false;
     }
 };
+/// One host registration of a span, to zero on its own.
+pub const Range = struct { ptr: u64, len: usize };
+/// What to zero once a span is mapped. A latent plane can straddle the ordinary and the display registration, and
+/// the driver's memset refuses a range across two cuMemHostRegister ranges (CUDA_ERROR_INVALID_VALUE), so a DRM span
+/// is zeroed one registration at a time. dispram's span is one allocation (no base): one range of `total` bytes.
+pub fn zeroRanges(s: Span, total: usize) ![2]Range {
+    if (s.base == 0) return .{ .{ .ptr = s.ptr, .len = total }, .{ .ptr = s.ptr + total, .len = 0 } };
+    if (s.ordinary + s.display != total) return error.DisplaySpanSize;
+    return .{ .{ .ptr = s.ptr, .len = s.ordinary }, .{ .ptr = s.ptr + s.ordinary, .len = s.display } };
+}
 fn mapped(address: usize, size: usize, prot: c_int, flags: c_int, fd: c_int, offset: u64) !usize {
     const p = mmap(if (address == 0) null else @ptrFromInt(address), size, prot, flags, fd, @intCast(offset)) orelse return error.DisplayMmap;
     const at = @intFromPtr(p);
@@ -327,4 +337,27 @@ test "a connected output on the configured card refuses display memory" {
     try headless(std.testing.allocator, io, path, "/dev/dri/card1");
     try tmp.dir.writeFile(io, .{ .sub_path = "card0-HDMI-A-1/status", .data = "disconnected\n" });
     try headless(std.testing.allocator, io, path, "/dev/dri/card0");
+}
+
+test "a mapped span is zeroed one host registration at a time, never across the ordinary/display boundary" {
+    const ordinary: usize = 3 << 20;
+    const shown: usize = 1792 << 20;
+    const drm: Span = .{ .ptr = 0x10_0000_0000, .base = 0x7f00_0000_0000, .ordinary = ordinary, .display = shown, .d = undefined };
+    const r = try zeroRanges(drm, ordinary + shown);
+    try std.testing.expectEqual(Range{ .ptr = 0x10_0000_0000, .len = ordinary }, r[0]);
+    try std.testing.expectEqual(Range{ .ptr = 0x10_0000_0000 + ordinary, .len = shown }, r[1]);
+    // the whole display span when nothing ordinary sits below it
+    const only: Span = .{ .ptr = 0x10_0000_0000, .base = 0x7f00_0000_0000, .display = shown, .d = undefined };
+    try std.testing.expectEqual(@as(usize, 0), (try zeroRanges(only, shown))[0].len);
+    try std.testing.expectEqual(Range{ .ptr = 0x10_0000_0000, .len = shown }, (try zeroRanges(only, shown))[1]);
+    // dispram hands back one allocation (no base): one range over every plane
+    const one: Span = .{ .ptr = 0x20_0000_0000, .d = undefined };
+    try std.testing.expectEqual(Range{ .ptr = 0x20_0000_0000, .len = 4 << 20 }, (try zeroRanges(one, 4 << 20))[0]);
+    try std.testing.expectEqual(@as(usize, 0), (try zeroRanges(one, 4 << 20))[1].len);
+}
+
+test "a DRM span whose two registrations do not hold the planes is refused, in release builds too" {
+    const drm: Span = .{ .ptr = 0x10_0000_0000, .base = 0x7f00_0000_0000, .ordinary = 3 << 20, .display = 1792 << 20, .d = undefined };
+    try std.testing.expectError(error.DisplaySpanSize, zeroRanges(drm, (3 << 20) + (1792 << 20) + 4096));
+    try std.testing.expectError(error.DisplaySpanSize, zeroRanges(drm, (3 << 20) + (1792 << 20) - 4096));
 }
